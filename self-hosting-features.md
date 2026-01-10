@@ -3,6 +3,8 @@
 This document tracks language features required for self-hosting the cot compiler.
 Features are extracted from the .cot wireframe files in `src/`.
 
+**Last Updated:** 2026-01-10
+
 ## Legend
 
 - **Implemented**: Working in Zig implementation, tested
@@ -23,7 +25,7 @@ These features are used extensively in all .cot files and must work first.
 | `i8, i16, i32, i64, u8, u16, u32, u64` | Implemented | All | Primitive integer types |
 | `f32, f64` | Implemented | types.cot | Floating point |
 | `bool` | Implemented | All | Boolean type |
-| `string` | Partial | All | Need string operations |
+| `string` | Implemented | All | String type with len, comparison |
 | `void` | Implemented | All | Void type |
 | `var` declarations | Implemented | All | Mutable variables |
 | `const` declarations | Implemented | All | Immutable constants |
@@ -44,7 +46,7 @@ These features are used extensively in all .cot files and must work first.
 | Feature | Status | Used In | Notes |
 |---------|--------|---------|-------|
 | Simple enum | Implemented | All | `enum Color { red, green, blue }` |
-| Enum with backing type | Partial | token.cot, errors.cot | `enum Token: u8 { ... }` |
+| Enum with backing type | **Gap** | token.cot, errors.cot | `enum Token: u8 { ... }` |
 | Enum with explicit values | **Gap** | errors.cot | `E100 = 100` |
 | `@intFromEnum(e)` | **Gap** | errors.cot | Convert enum to int |
 | `@enumFromInt(T, i)` | **Gap** | - | Convert int to enum |
@@ -65,9 +67,9 @@ These features are used extensively in all .cot files and must work first.
 |---------|--------|---------|-------|
 | Fixed array `[N]T` | Implemented | - | Static arrays |
 | Array literal | Implemented | - | `[1, 2, 3]` |
-| Slice `[]T` | Partial | ast.cot | Slice type |
+| Slice `[]T` | Implemented | ast.cot | Slice type and iteration |
 | Index `arr[i]` | Implemented | All | Static and dynamic |
-| `len(arr)` | **Gap** | All | Built-in length |
+| `len(arr)` | Implemented | All | Built-in length for arrays/slices/strings |
 
 ### Optional Types
 
@@ -89,22 +91,22 @@ These features are used extensively in all .cot files and must work first.
 
 | Feature | Status | Used In | Notes |
 |---------|--------|---------|-------|
-| If/else | Partial | All | Parsing done, codegen partial |
-| While loop | Partial | All | Parsing done, codegen partial |
-| For-in loop | **Gap** | ir.cot, checker.cot | `for item in items { }` |
+| If/else | Implemented | All | Full if/else/else-if support |
+| While loop | Implemented | All | Full while loop support |
+| For-in loop | Implemented | ir.cot, checker.cot | `for item in items { }` |
 | For with index | **Gap** | scanner.cot | `for item, i in items { }` |
-| Break | Partial | - | Parsing done |
-| Continue | Partial | - | Parsing done |
+| Break | Partial | - | Parsing done, codegen TBD |
+| Continue | Partial | - | Parsing done, codegen TBD |
 | Return | Implemented | All | Working |
 
 ### Switch Expressions
 
 | Feature | Status | Used In | Notes |
 |---------|--------|---------|-------|
-| Switch expression | **Gap** | All | `var x = switch y { ... }` |
-| Switch statement | **Gap** | parser.cot | `switch x { ... }` |
+| Switch expression | Implemented | All | `var x = switch y { ... }` |
+| Switch statement | Implemented | parser.cot | `switch x { ... }` |
 | Multiple cases | **Gap** | parser.cot | `.plus, .minus => ...` |
-| Else case | **Gap** | All | `else => default` |
+| Else case | Implemented | All | `else => default` |
 | Range patterns | **Gap** | - | Not used in wireframes |
 
 ---
@@ -183,21 +185,21 @@ These features are used extensively in all .cot files and must work first.
 
 | Feature | Status | Used In | Notes |
 |---------|--------|---------|-------|
-| Arithmetic `+ - * / %` | Implemented | All | Basic math |
-| Comparison `== != < > <= >=` | Implemented | All | Comparisons |
+| Arithmetic `+ - * / %` | Implemented | All | All basic math ops |
+| Comparison `== != < > <= >=` | Implemented | All | All comparisons |
 | Logical `and or not` | Partial | All | Keywords |
 | Bitwise `& \| ^ ~ << >>` | Partial | - | Bit ops |
 | Compound assign `+= -= *=` | **Gap** | errors.cot, scanner.cot | `count += 1` |
 | String concat `+` | **Gap** | - | `"a" + "b"` |
-| String comparison | **Gap** | scanner.cot | `text == keyword` |
+| String comparison | Implemented | scanner.cot | `text == keyword`, `text != keyword` |
 
 ### Built-ins
 
 | Feature | Status | Used In | Notes |
 |---------|--------|---------|-------|
-| `len(x)` | **Gap** | All | Length of array/slice/string |
-| `println(x)` | **Gap** | ir.cot | Print with newline |
-| `print(x)` | **Gap** | ir.cot | Print without newline |
+| `len(x)` | Implemented | All | Length of array/slice/string |
+| `println(x)` | Implemented | ir.cot | Print with newline (via libc write) |
+| `print(x)` | Implemented | ir.cot | Print without newline (via libc write) |
 | `@sizeof(T)` | **Gap** | - | Not used in wireframes |
 | `@maxInt(T)` | **Gap** | ast.cot, ir.cot | Max value for int type |
 | `@minInt(T)` | **Gap** | - | Min value for int type |
@@ -218,9 +220,9 @@ These features are used extensively in all .cot files and must work first.
 
 Some features depend on others. Suggested implementation order:
 
-### Tier 1 (Foundation)
-1. Type aliases (`type X = Y`)
-2. `len()` built-in
+### Tier 1 (Foundation) - Partially Complete
+1. ~~`len()` built-in~~ - **Done**
+2. Type aliases (`type X = Y`)
 3. `@maxInt(T)` built-in
 4. Compound assignment (`+=`, etc.)
 
@@ -234,7 +236,7 @@ Some features depend on others. Suggested implementation order:
 1. `List<T>` built-in
 2. `Map<K,V>` built-in
 3. `new` heap allocation
-4. For-in iteration
+4. ~~For-in iteration~~ - **Done**
 
 ### Tier 4 (Functions)
 1. Function types (`fn(T) R`)
@@ -247,11 +249,11 @@ Some features depend on others. Suggested implementation order:
 3. `try` propagation
 4. `catch` handling
 
-### Tier 6 (Finishing)
+### Tier 6 (Finishing) - Partially Complete
 1. String interpolation
 2. Import system
 3. `defer`
-4. `print`/`println`
+4. ~~`print`/`println`~~ - **Done**
 
 ---
 
@@ -259,15 +261,40 @@ Some features depend on others. Suggested implementation order:
 
 | File | LOC | Key Dependencies | Ready? |
 |------|-----|------------------|--------|
-| token.cot | 171 | Enum w/ backing type | Mostly |
+| token.cot | 171 | Enum w/ backing type, @intFromEnum | Mostly |
 | source.cot | 120 | @maxInt, @min, @max | Close |
-| scanner.cot | 401 | String ops, for-in, switch | No |
+| scanner.cot | 401 | String ops, for-index, switch | Closer |
 | ast.cot | 513 | Tagged unions, type alias | No |
 | types.cot | 458 | Tagged unions, switch | No |
 | ir.cot | 664 | Tagged unions, List<T>, Map | No |
 | errors.cot | 198 | Enum values, fn types, interpolation | No |
 | parser.cot | 1289 | Tagged unions, ??, .?, switch | No |
 | checker.cot | 963 | Everything | No |
+
+---
+
+## Recently Implemented (2026-01)
+
+The following features were implemented in recent development sessions:
+
+### Control Flow
+- **Switch expressions/statements**: Full switch support with else clause
+- **For-in loops**: Iteration over arrays and slices
+- **If/else**: Full conditional support (was marked Partial)
+- **While loops**: Full while loop support (was marked Partial)
+
+### Built-ins
+- **len()**: Works on arrays, slices, and strings
+- **print/println**: Output via libc `write()` syscall
+
+### Operators
+- **String comparison**: `==` and `!=` for string equality
+- **Subtraction, multiplication, division**: Full arithmetic support
+
+### Codegen
+- **ARM64 (macOS)**: Full Mach-O object file generation with relocations
+- **x86_64 (Linux)**: Full ELF object file generation with relocations
+- 36 tests passing on both architectures
 
 ---
 
@@ -299,3 +326,11 @@ Every .cot file uses switch expressions for pattern matching:
 - AST node dispatch everywhere
 
 The switch must work as an expression (returns value) with payload capture.
+
+### Remaining Critical Gaps for Self-Hosting
+
+1. **Tagged unions** - The single most important missing feature
+2. **Enum with backing type** - `enum Token: u8 { ... }`
+3. **@intFromEnum** - Convert enum to int for switch
+4. **Map<K,V>** - Symbol tables and lookup
+5. **Methods** - `fn method(self: *T)` pattern
