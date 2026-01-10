@@ -1999,6 +1999,27 @@ pub const Lowerer = struct {
             }
         }
 
+        // Check if this is an enum variant access (e.g., Token.kw_fn)
+        if (base_node == .expr and base_node.expr == .identifier) {
+            const type_name = base_node.expr.identifier.name;
+            // Look up the type by name
+            if (self.type_reg.lookupByName(type_name)) |type_idx| {
+                const ty = self.type_reg.get(type_idx);
+                if (ty == .enum_type) {
+                    const et = ty.enum_type;
+                    // Look up the variant by name
+                    for (et.variants) |variant| {
+                        if (std.mem.eql(u8, variant.name, field.field)) {
+                            // Return the variant's value as a const_int
+                            const const_node = ir.Node.init(.const_int, et.backing_type, Span.fromPos(Pos.zero))
+                                .withAux(variant.value);
+                            return try fb.emit(const_node);
+                        }
+                    }
+                }
+            }
+        }
+
         // Fallback: emit basic field op
         const base = try self.lowerExpr(field.base);
         const node = ir.Node.init(.field, field_type_idx, Span.fromPos(Pos.zero))
