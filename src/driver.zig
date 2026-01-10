@@ -903,8 +903,10 @@ pub const Driver = struct {
             return value_id;
         }
 
-        // Handle addr_field - struct field access
-        // args[0] = local index (as NodeIndex), aux = field offset
+        // Handle addr_field - load field from local at offset
+        // Despite the name "addr_field", this is actually "load field from local"
+        // args[0] = local index (raw), aux = field offset
+        // Use .field op with local index in args[0]
         if (node.op == .addr_field) {
             const value_id = try func.newValue(.field, node.type_idx, block);
             var value = func.getValue(value_id);
@@ -918,15 +920,24 @@ pub const Driver = struct {
             return value_id;
         }
 
-        // Handle field - direct field access (used by len() on slices)
-        // args[0] = local index (as NodeIndex), aux = field offset
+        // Handle field - direct field access
+        // args[0] can be either:
+        //   - a local index (for direct slice.len access)
+        //   - an IR node index (for nested field access like span.start.offset)
+        // We differentiate by checking if args[0] is in the ir_to_ssa map
         if (node.op == .field) {
             const value_id = try func.newValue(.field, node.type_idx, block);
             var value = func.getValue(value_id);
-            // Store local_idx in args_storage[0] as a raw value (not SSA ref)
-            // and field_offset in aux_int
             if (node.args_len > 0) {
-                value.args_storage[0] = node.args()[0];  // local index
+                const ir_arg = node.args()[0];
+                // Check if this is an IR node reference that needs SSA conversion
+                if (ir_to_ssa.get(@intCast(ir_arg))) |ssa_arg| {
+                    // args[0] is an IR node index, convert to SSA value ID
+                    value.args_storage[0] = ssa_arg;
+                } else {
+                    // args[0] is a raw local index, keep as is
+                    value.args_storage[0] = ir_arg;
+                }
                 value.args_len = 1;
             }
             value.aux_int = node.aux;  // field offset
@@ -2275,20 +2286,45 @@ pub const Driver = struct {
             .branch, .jump => {
                 // These are handled by generateX86ValueWithPatching
             },
-            .field => {
-                // Field access: load from stack offset
-                // args[0] = local index, aux_int = field offset
+            .addr => {
+                // Compute address of local field: lea rax, [rbp + local_offset + field_offset]
+                // args[0] = local index (raw), aux_int = field offset
                 const args = value.args();
                 if (args.len > 0) {
                     const local_idx = args[0];
                     const field_offset: i32 = @intCast(value.aux_int);
-
-                    // Use computed stack offset from frame layout
                     const local_offset: i32 = func.locals[@intCast(local_idx)].offset;
-
-                    // Load from [rbp + local_offset + field_offset]
                     const total_offset: i32 = local_offset + field_offset;
-                    try x86_64.movRegMem(buf, .rax, .rbp, total_offset);
+                    try x86_64.leaRegMem(buf, .rax, .rbp, total_offset);
+                }
+            },
+            .field => {
+                // Field access: load from address
+                // Two cases:
+                // 1. args[0] is a local index (for direct slice.len) - check if < locals.len
+                // 2. args[0] is an SSA value ID (for nested access) - address in register
+                const args = value.args();
+                if (args.len > 0) {
+                    const maybe_local_or_ssa = args[0];
+                    const field_offset: i32 = @intCast(value.aux_int);
+
+                    // Check if this is a direct local access or SSA value reference
+                    // If the value is a valid local index, treat as direct local access
+                    if (maybe_local_or_ssa < func.locals.len) {
+                        // Direct local field access
+                        const local_offset: i32 = func.locals[@intCast(maybe_local_or_ssa)].offset;
+                        const total_offset: i32 = local_offset + field_offset;
+                        try x86_64.movRegMem(buf, .rax, .rbp, total_offset);
+                    } else {
+                        // SSA value reference - the address was computed by a prior .addr op
+                        // The address should already be in rax from the prior value
+                        // Load from [rax + field_offset]
+                        if (field_offset != 0) {
+                            try x86_64.movRegMem(buf, .rax, .rax, field_offset);
+                        } else {
+                            try x86_64.movRegMem(buf, .rax, .rax, 0);
+                        }
+                    }
                 }
             },
             .ptr_field => {
@@ -3538,6 +3574,9 @@ pub const Driver = struct {
                             const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
                             try aarch64.ldrRegImm(buf, .x8, .sp, offset_scaled);
                         }
+                    } else if (left.op == .field) {
+                        // Field result is in x0, move to x8
+                        try aarch64.movRegReg(buf, .x8, .x0);
                     }
 
                     // Compare with right operand
@@ -3758,26 +3797,50 @@ pub const Driver = struct {
                     }
                 }
             },
-            .field => {
-                // Field access: load from stack offset
-                // args[0] = local index, aux_int = field offset
+            .addr => {
+                // Compute address of local field: add x0, sp, #(local_offset + field_offset)
+                // args[0] = local index (raw), aux_int = field offset
                 const args = value.args();
                 if (args.len > 0) {
                     const local_idx = args[0];
                     const field_offset: i32 = @intCast(value.aux_int);
-
-                    // Convert x86-style negative offset to ARM64 positive sp-relative offset
                     const x86_offset: i32 = func.locals[@intCast(local_idx)].offset;
                     const local_offset: i32 = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
-
-                    // Load from [sp + local_offset + field_offset]
                     const total_offset: i32 = local_offset + field_offset;
+                    // add x0, sp, #offset
+                    if (total_offset >= 0) {
+                        try aarch64.addRegImm12(buf, .x0, .sp, @intCast(total_offset));
+                    }
+                }
+            },
+            .field => {
+                // Field access: load from address
+                // Two cases:
+                // 1. args[0] is a local index (for direct slice.len) - check if < locals.len
+                // 2. args[0] is an SSA value ID (for nested access) - address in x0
+                const args = value.args();
+                if (args.len > 0) {
+                    const maybe_local_or_ssa = args[0];
+                    const field_offset: i32 = @intCast(value.aux_int);
 
-                    // LDR x0, [sp, #offset] - load into x0 for return
-                    // offset must be 8-byte aligned and fit in 12-bit scaled immediate
-                    if (total_offset >= 0 and @mod(total_offset, 8) == 0) {
-                        const offset_scaled: u12 = @intCast(@divExact(total_offset, 8));
-                        try aarch64.ldrRegImm(buf, .x0, .sp, offset_scaled);
+                    if (maybe_local_or_ssa < func.locals.len) {
+                        // Direct local field access
+                        const x86_offset: i32 = func.locals[@intCast(maybe_local_or_ssa)].offset;
+                        const local_offset: i32 = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
+                        const total_offset: i32 = local_offset + field_offset;
+                        if (total_offset >= 0 and @mod(total_offset, 8) == 0) {
+                            const offset_scaled: u12 = @intCast(@divExact(total_offset, 8));
+                            try aarch64.ldrRegImm(buf, .x0, .sp, offset_scaled);
+                        }
+                    } else {
+                        // SSA value reference - address was computed by prior .addr op and is in x0
+                        // Load from [x0 + field_offset]
+                        if (field_offset >= 0 and @mod(field_offset, 8) == 0) {
+                            const offset_scaled: u12 = @intCast(@divExact(field_offset, 8));
+                            try aarch64.ldrRegImm(buf, .x0, .x0, offset_scaled);
+                        } else if (field_offset == 0) {
+                            try aarch64.ldrRegImm(buf, .x0, .x0, 0);
+                        }
                     }
                 }
             },

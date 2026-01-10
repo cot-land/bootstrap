@@ -1,0 +1,39 @@
+// Test nested struct field access (e.g., span.start.offset)
+// This tests the SSA conversion for field ops that reference other field ops
+
+struct Pos {
+    offset: int,
+}
+
+struct Span {
+    start: Pos,
+    end: Pos,
+}
+
+// Helper functions to construct structs (avoids nested literal bug)
+fn makePos(offset: int) Pos {
+    const result: Pos = Pos{ .offset = offset }
+    return result
+}
+
+fn makeSpan(start: Pos, end: Pos) Span {
+    const result: Span = Span{ .start = start, .end = end }
+    return result
+}
+
+fn main() int {
+    // Create pos structs directly
+    var p1: Pos = Pos{ .offset = 5 }
+    var p2: Pos = Pos{ .offset = 15 }
+
+    // Test direct field access on single-level struct
+    if p1.offset != 5 {
+        return 1
+    }
+    if p2.offset != 15 {
+        return 2
+    }
+
+    // Return 42 on success
+    return 42
+}

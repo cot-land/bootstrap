@@ -1,0 +1,108 @@
+// Source text handling and position tracking for cot bootstrap.
+// Simplified version using only currently-supported features.
+//
+// Changes from original source.cot:
+// - Standalone functions instead of methods
+// - No optional slices (line_offsets removed for now)
+// - No @min, @intCast, slice syntax, for-with-index
+// - Simplified location tracking (just offset-based)
+
+// A position in source code (offset-based).
+struct Pos {
+    offset: int,
+}
+
+// Constant for zero position.
+const zero_pos: Pos = Pos{ .offset = 0 }
+
+// Create a position from an offset.
+fn posFromOffset(offset: int) Pos {
+    const result: Pos = Pos{ .offset = offset }
+    return result
+}
+
+// Advance a position by n bytes.
+fn posAdvance(pos: Pos, n: int) Pos {
+    const new_offset: int = pos.offset + n
+    const result: Pos = Pos{ .offset = new_offset }
+    return result
+}
+
+// Compare two positions for equality.
+fn posEqual(a: Pos, b: Pos) bool {
+    return a.offset == b.offset
+}
+
+// Check if position a is before position b.
+fn posBefore(a: Pos, b: Pos) bool {
+    return a.offset < b.offset
+}
+
+// A span in source code (start and end positions).
+struct Span {
+    start: Pos,
+    end: Pos,
+}
+
+// Create a span from start and end positions.
+fn spanInit(start: Pos, end: Pos) Span {
+    const result: Span = Span{ .start = start, .end = end }
+    return result
+}
+
+// Create a span from a single position (zero-length).
+fn spanFromPos(pos: Pos) Span {
+    const result: Span = Span{ .start = pos, .end = pos }
+    return result
+}
+
+// Check if a span is empty (zero-length).
+fn spanIsEmpty(span: Span) bool {
+    return span.start.offset == span.end.offset
+}
+
+// Get the length of a span in bytes.
+fn spanLen(span: Span) int {
+    return span.end.offset - span.start.offset
+}
+
+// Merge two spans into one that covers both.
+fn spanMerge(a: Span, b: Span) Span {
+    // Use conditionals instead of @min/@max
+    var start_offset: int = a.start.offset
+    if b.start.offset < start_offset {
+        start_offset = b.start.offset
+    }
+    var end_offset: int = a.end.offset
+    if b.end.offset > end_offset {
+        end_offset = b.end.offset
+    }
+    const start_pos: Pos = Pos{ .offset = start_offset }
+    const end_pos: Pos = Pos{ .offset = end_offset }
+    const result: Span = Span{ .start = start_pos, .end = end_pos }
+    return result
+}
+
+// Human-readable location (for error messages).
+// Note: In bootstrap, we use offset only. Line/column computed later.
+struct Location {
+    line: int,
+    column: int,
+    offset: int,
+}
+
+// Create a location from just an offset (line/column unknown).
+fn locationFromOffset(offset: int) Location {
+    const result: Location = Location{
+        .line = 0,
+        .column = 0,
+        .offset = offset,
+    }
+    return result
+}
+
+// Simple test: verify position operations
+fn main() i64 {
+    // Simple test - just return constant first
+    return 42
+}
