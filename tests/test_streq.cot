@@ -1,0 +1,6 @@
+fn main() int {
+    if "hello" == "hello" {
+        return 42;
+    }
+    return 0;
+}

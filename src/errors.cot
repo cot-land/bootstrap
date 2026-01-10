@@ -1,0 +1,181 @@
+// Error handling infrastructure.
+//
+// Maps to Go's error pattern from cmd/compile/internal/syntax/syntax.go
+// This is the target implementation for self-hosting.
+
+// =============================================================================
+// LANGUAGE FEATURES USED:
+// =============================================================================
+// 1. Enums with explicit values (ErrorCode: u16 { E100 = 100 })
+// 2. Switch expressions
+// 3. Optional fields in structs (?ErrorCode)
+// 4. If capture syntax (if x |val| {})
+// 5. String interpolation ("${expr}")
+// 6. Function pointer types (fn(Error) void)
+// 7. Compound assignment (+=)
+// 8. Type aliases (type X = Y)
+// 9. @intFromEnum builtin
+// =============================================================================
+
+import "source"
+
+// Compile-time trace flag for debug output.
+const trace: bool = false
+
+// An error at a specific source location.
+struct Error {
+    span: Span,
+    msg: string,
+    code: ?ErrorCode,
+}
+
+// Error codes for categorizing errors.
+// Useful for tooling, IDE integration, and documentation references.
+enum ErrorCode: u16 {
+    // Scanner errors (1xx)
+    E100 = 100,  // unterminated string literal
+    E101 = 101,  // unterminated character literal
+    E102 = 102,  // invalid escape sequence
+    E103 = 103,  // invalid number literal
+    E104 = 104,  // unexpected character
+
+    // Parser errors (2xx)
+    E200 = 200,  // unexpected token
+    E201 = 201,  // expected expression
+    E202 = 202,  // expected type
+    E203 = 203,  // expected identifier
+    E204 = 204,  // expected '{'
+    E205 = 205,  // expected '}'
+    E206 = 206,  // expected '('
+    E207 = 207,  // expected ')'
+    E208 = 208,  // expected ';' or newline
+
+    // Type errors (3xx)
+    E300 = 300,  // type mismatch
+    E301 = 301,  // undefined identifier
+    E302 = 302,  // redefined identifier
+    E303 = 303,  // invalid operation
+}
+
+// Get description for an error code.
+fn description(self: ErrorCode) string {
+    return switch self {
+        .E100 => "unterminated string literal",
+        .E101 => "unterminated character literal",
+        .E102 => "invalid escape sequence",
+        .E103 => "invalid number literal",
+        .E104 => "unexpected character",
+        .E200 => "unexpected token",
+        .E201 => "expected expression",
+        .E202 => "expected type",
+        .E203 => "expected identifier",
+        .E204 => "expected '{'",
+        .E205 => "expected '}'",
+        .E206 => "expected '('",
+        .E207 => "expected ')'",
+        .E208 => "expected ';' or newline",
+        .E300 => "type mismatch",
+        .E301 => "undefined identifier",
+        .E302 => "redefined identifier",
+        .E303 => "invalid operation",
+    }
+}
+
+// Callback type for error handling.
+type ErrorHandler = fn(Error) void
+
+// Collects and reports errors during compilation.
+struct ErrorReporter {
+    src: *Source,
+    handler: ?ErrorHandler,
+    first: ?Error,
+    count: u32,
+}
+
+// Initialize an error reporter.
+fn init(src: *Source, handler: ?ErrorHandler) ErrorReporter {
+    return ErrorReporter{
+        .src = src,
+        .handler = handler,
+        .first = null,
+        .count = 0,
+    }
+}
+
+// Report an error at a position.
+fn errorAt(self: *ErrorReporter, pos: Pos, msg: string) {
+    self.errorAtSpan(Span.fromPos(pos), msg, null)
+}
+
+// Report an error with an error code.
+fn errorWithCode(self: *ErrorReporter, pos: Pos, code: ErrorCode, msg: string) {
+    self.errorAtSpan(Span.fromPos(pos), msg, code)
+}
+
+// Report an error at a span.
+fn errorAtSpan(self: *ErrorReporter, span: Span, msg: string, code: ?ErrorCode) {
+    var err = Error{
+        .span = span,
+        .msg = msg,
+        .code = code,
+    }
+
+    if self.first == null {
+        self.first = err
+    }
+    self.count += 1
+
+    if self.handler |h| {
+        h(err)
+    } else {
+        self.printError(err)
+    }
+}
+
+// Print an error with source context.
+fn printError(self: *ErrorReporter, err: Error) {
+    var loc = self.src.location(err.span.start)
+
+    if err.code |code| {
+        println("${self.src.filename}:${loc.line}:${loc.column}: error[E${@intFromEnum(code)}]: ${err.msg}")
+    } else {
+        println("${self.src.filename}:${loc.line}:${loc.column}: error: ${err.msg}")
+    }
+
+    // Show the source line
+    var line = self.src.getLine(err.span.start)
+    println("    ${line}")
+
+    // Show the caret indicator
+    var col = loc.column
+    if col > 0 {
+        print("    ")
+        var i: u32 = 0
+        while i < col - 1 {
+            if i < len(line) and line[i] == '\t' {
+                print("\t")
+            } else {
+                print(" ")
+            }
+            i += 1
+        }
+        println("^")
+    }
+}
+
+// Check if any errors were reported.
+fn hasErrors(self: *ErrorReporter) bool {
+    return self.count > 0
+}
+
+// Get the first error.
+fn firstError(self: *ErrorReporter) ?Error {
+    return self.first
+}
+
+// Print a trace message if trace mode is enabled.
+fn traceMsg(msg: string) {
+    if trace {
+        println("[trace] ${msg}")
+    }
+}

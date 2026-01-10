@@ -1,0 +1,7 @@
+fn add_one(x: int) int {
+    return x + 1;
+}
+
+fn main() int {
+    return add_one(41);
+}

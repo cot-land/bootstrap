@@ -1,0 +1,513 @@
+// Lexical scanner for cot.
+//
+// Maps to Go's cmd/compile/internal/syntax/scanner.go
+// This is the target implementation for self-hosting.
+
+// =============================================================================
+// LANGUAGE FEATURES USED:
+// =============================================================================
+// 1. Import statements (import "token")
+// 2. Pointer fields in structs (err: ?*ErrorReporter)
+// 3. Optional unwrap with .? operator (self.ch.?)
+// 4. If/while with capture (if self.ch |c| { }, while self.ch |c| { })
+// 5. Boolean operators (c == ' ' or c == '\t')
+// 6. Methods on structs (fn init(src: *Source) Scanner)
+// 7. Switch expressions
+// =============================================================================
+
+import "token"
+import "source"
+import "errors"
+
+// A scanned token with position and text.
+struct TokenInfo {
+    tok: Token,
+    span: Span,
+    text: string,  // For identifiers and literals; empty for keywords/operators
+}
+
+// Scanner tokenizes source code.
+struct Scanner {
+    src: *Source,
+    pos: Pos,
+    ch: ?byte,              // Current character (or null if at end)
+    err: ?*ErrorReporter,   // Error reporter (optional)
+}
+
+// Initialize scanner with source.
+fn init(src: *Source) Scanner {
+    return initWithErrors(src, null)
+}
+
+// Initialize scanner with source and error reporter.
+fn initWithErrors(src: *Source, err: ?*ErrorReporter) Scanner {
+    var s = Scanner{
+        .src = src,
+        .pos = Pos.zero,
+        .ch = null,
+        .err = err,
+    }
+    s.ch = src.at(s.pos)
+    return s
+}
+
+// Report an error at a position.
+fn errorAt(self: *Scanner, pos: Pos, code: ErrorCode, msg: string) {
+    if self.err |reporter| {
+        reporter.errorWithCode(pos, code, msg)
+    }
+}
+
+// Scan and return the next token.
+fn next(self: *Scanner) TokenInfo {
+    self.skipWhitespaceAndComments()
+
+    var start = self.pos
+
+    // Check for end of file
+    if self.ch == null {
+        return TokenInfo{
+            .tok = .eof,
+            .span = Span.fromPos(start),
+            .text = "",
+        }
+    }
+
+    var c = self.ch.?
+
+    // Identifier or keyword
+    if isAlpha(c) or c == '_' {
+        return self.scanIdentifier(start)
+    }
+
+    // Number
+    if isDigit(c) {
+        return self.scanNumber(start)
+    }
+
+    // String literal
+    if c == '"' {
+        return self.scanString(start)
+    }
+
+    // Character literal
+    if c == '\'' {
+        return self.scanChar(start)
+    }
+
+    // Operators and delimiters
+    return self.scanOperator(start)
+}
+
+// Skip whitespace and comments.
+fn skipWhitespaceAndComments(self: *Scanner) {
+    while self.ch |c| {
+        if c == ' ' or c == '\t' or c == '\n' or c == '\r' {
+            self.advance()
+        } else if c == '/' {
+            if self.peek(1) == '/' {
+                self.skipLineComment()
+            } else if self.peek(1) == '*' {
+                self.skipBlockComment()
+            } else {
+                break
+            }
+        } else {
+            break
+        }
+    }
+}
+
+fn skipLineComment(self: *Scanner) {
+    // Skip //
+    self.advance()
+    self.advance()
+    // Skip until newline or EOF
+    while self.ch |c| {
+        if c == '\n' {
+            self.advance()
+            break
+        }
+        self.advance()
+    }
+}
+
+fn skipBlockComment(self: *Scanner) {
+    // Skip /*
+    self.advance()
+    self.advance()
+    // Skip until */
+    while self.ch != null {
+        if self.ch == '*' and self.peek(1) == '/' {
+            self.advance()
+            self.advance()
+            break
+        }
+        self.advance()
+    }
+}
+
+// Scan an identifier or keyword.
+fn scanIdentifier(self: *Scanner, start: Pos) TokenInfo {
+    while self.ch |c| {
+        if isAlphaNumeric(c) or c == '_' {
+            self.advance()
+        } else {
+            break
+        }
+    }
+
+    var text = self.src.content[start.offset..self.pos.offset]
+
+    // Check if it's a keyword
+    if keywords.get(text) |kw| {
+        return TokenInfo{
+            .tok = kw,
+            .span = Span.init(start, self.pos),
+            .text = "",
+        }
+    }
+
+    return TokenInfo{
+        .tok = .identifier,
+        .span = Span.init(start, self.pos),
+        .text = text,
+    }
+}
+
+// Scan a number literal (integer or float).
+fn scanNumber(self: *Scanner, start: Pos) TokenInfo {
+    var is_float = false
+
+    // Handle hex, octal, binary prefixes
+    if self.ch == '0' {
+        self.advance()
+        if self.ch |c| {
+            if c == 'x' or c == 'X' {
+                self.advance()
+                self.scanHexDigits()
+                return self.makeNumberToken(start, false)
+            } else if c == 'o' or c == 'O' {
+                self.advance()
+                self.scanOctalDigits()
+                return self.makeNumberToken(start, false)
+            } else if c == 'b' or c == 'B' {
+                self.advance()
+                self.scanBinaryDigits()
+                return self.makeNumberToken(start, false)
+            }
+        }
+    }
+
+    // Decimal digits
+    self.scanDecimalDigits()
+
+    // Fractional part - check for .. range operator
+    if self.ch == '.' and self.peek(1) != '.' {
+        is_float = true
+        self.advance()
+        self.scanDecimalDigits()
+    }
+
+    // Exponent
+    if self.ch |c| {
+        if c == 'e' or c == 'E' {
+            is_float = true
+            self.advance()
+            if self.ch == '+' or self.ch == '-' {
+                self.advance()
+            }
+            self.scanDecimalDigits()
+        }
+    }
+
+    return self.makeNumberToken(start, is_float)
+}
+
+fn makeNumberToken(self: *Scanner, start: Pos, is_float: bool) TokenInfo {
+    var text = self.src.content[start.offset..self.pos.offset]
+    return TokenInfo{
+        .tok = if is_float { .float_literal } else { .int_literal },
+        .span = Span.init(start, self.pos),
+        .text = text,
+    }
+}
+
+fn scanDecimalDigits(self: *Scanner) {
+    while self.ch |c| {
+        if isDigit(c) or c == '_' {
+            self.advance()
+        } else {
+            break
+        }
+    }
+}
+
+fn scanHexDigits(self: *Scanner) {
+    while self.ch |c| {
+        if isHexDigit(c) or c == '_' {
+            self.advance()
+        } else {
+            break
+        }
+    }
+}
+
+fn scanOctalDigits(self: *Scanner) {
+    while self.ch |c| {
+        if (c >= '0' and c <= '7') or c == '_' {
+            self.advance()
+        } else {
+            break
+        }
+    }
+}
+
+fn scanBinaryDigits(self: *Scanner) {
+    while self.ch |c| {
+        if c == '0' or c == '1' or c == '_' {
+            self.advance()
+        } else {
+            break
+        }
+    }
+}
+
+// Scan a string literal.
+fn scanString(self: *Scanner, start: Pos) TokenInfo {
+    self.advance()  // consume opening "
+
+    var terminated = false
+    while self.ch |c| {
+        if c == '"' {
+            self.advance()
+            terminated = true
+            break
+        } else if c == '\\' {
+            self.advance()  // skip backslash
+            if self.ch != null {
+                self.advance()  // skip escaped char
+            }
+        } else if c == '\n' {
+            // Unterminated string - newline before closing quote
+            break
+        } else {
+            self.advance()
+        }
+    }
+
+    if not terminated {
+        self.errorAt(start, .E100, "string literal not terminated")
+    }
+
+    var text = self.src.content[start.offset..self.pos.offset]
+    return TokenInfo{
+        .tok = .string_literal,
+        .span = Span.init(start, self.pos),
+        .text = text,
+    }
+}
+
+// Scan a character literal.
+fn scanChar(self: *Scanner, start: Pos) TokenInfo {
+    self.advance()  // consume opening '
+
+    if self.ch == '\\' {
+        self.advance()
+        if self.ch != null {
+            self.advance()
+        }
+    } else if self.ch != null and self.ch != '\'' {
+        self.advance()
+    }
+
+    var terminated = false
+    if self.ch == '\'' {
+        self.advance()
+        terminated = true
+    }
+
+    if not terminated {
+        self.errorAt(start, .E101, "character literal not terminated")
+    }
+
+    var text = self.src.content[start.offset..self.pos.offset]
+    return TokenInfo{
+        .tok = .char_literal,
+        .span = Span.init(start, self.pos),
+        .text = text,
+    }
+}
+
+// Scan operators and delimiters.
+fn scanOperator(self: *Scanner, start: Pos) TokenInfo {
+    var c = self.ch.?
+    self.advance()
+
+    var tok = switch c {
+        '(' => .lparen,
+        ')' => .rparen,
+        '[' => .lbracket,
+        ']' => .rbracket,
+        '{' => .lbrace,
+        '}' => .rbrace,
+        ',' => .comma,
+        ';' => .semicolon,
+        ':' => .colon,
+        '~' => .tilde,
+        '@' => .at,
+
+        '+' => if self.ch == '=' {
+            self.advance()
+            .plus_equal
+        } else {
+            .plus
+        },
+
+        '-' => if self.ch == '=' {
+            self.advance()
+            .minus_equal
+        } else if self.ch == '>' {
+            self.advance()
+            .arrow
+        } else {
+            .minus
+        },
+
+        '*' => if self.ch == '=' {
+            self.advance()
+            .star_equal
+        } else {
+            .star
+        },
+
+        '/' => if self.ch == '=' {
+            self.advance()
+            .slash_equal
+        } else {
+            .slash
+        },
+
+        '%' => if self.ch == '=' {
+            self.advance()
+            .percent_equal
+        } else {
+            .percent
+        },
+
+        '&' => if self.ch == '=' {
+            self.advance()
+            .ampersand_equal
+        } else {
+            .ampersand
+        },
+
+        '|' => if self.ch == '=' {
+            self.advance()
+            .pipe_equal
+        } else {
+            .pipe
+        },
+
+        '^' => if self.ch == '=' {
+            self.advance()
+            .caret_equal
+        } else {
+            .caret
+        },
+
+        '=' => if self.ch == '=' {
+            self.advance()
+            .equal_equal
+        } else {
+            .equal
+        },
+
+        '!' => if self.ch == '=' {
+            self.advance()
+            .bang_equal
+        } else {
+            .bang
+        },
+
+        '<' => if self.ch == '=' {
+            self.advance()
+            .less_equal
+        } else if self.ch == '<' {
+            self.advance()
+            .less_less
+        } else {
+            .less
+        },
+
+        '>' => if self.ch == '=' {
+            self.advance()
+            .greater_equal
+        } else if self.ch == '>' {
+            self.advance()
+            .greater_greater
+        } else {
+            .greater
+        },
+
+        '.' => if self.ch == '.' {
+            self.advance()
+            .dot_dot
+        } else if self.ch == '*' {
+            self.advance()
+            .dot_star
+        } else {
+            .dot
+        },
+
+        '?' => if self.ch == '?' {
+            self.advance()
+            .question_question
+        } else if self.ch == '.' {
+            self.advance()
+            .question_dot
+        } else {
+            .question
+        },
+
+        else => .invalid,
+    }
+
+    if tok == .invalid {
+        self.errorAt(start, .E104, "unexpected character")
+    }
+
+    return TokenInfo{
+        .tok = tok,
+        .span = Span.init(start, self.pos),
+        .text = "",
+    }
+}
+
+// Advance to next character.
+fn advance(self: *Scanner) {
+    self.pos = self.pos.advance(1)
+    self.ch = self.src.at(self.pos)
+}
+
+// Peek ahead n characters.
+fn peek(self: *Scanner, n: u32) ?byte {
+    return self.src.at(self.pos.advance(n))
+}
+
+// Character classification helpers
+fn isAlpha(c: byte) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z')
+}
+
+fn isDigit(c: byte) bool {
+    return c >= '0' and c <= '9'
+}
+
+fn isHexDigit(c: byte) bool {
+    return isDigit(c) or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F')
+}
+
+fn isAlphaNumeric(c: byte) bool {
+    return isAlpha(c) or isDigit(c)
+}

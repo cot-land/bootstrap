@@ -1,3 +1,27 @@
+# Zig build artifacts
 .zig-cache/
 zig-out/
+
+# Object files
 *.o
+
+# Compiled binaries
+test
+test_out
+ignored
+test_slice
+test_slice_len
+test_slice_len2
+
+# Editor/IDE
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# Temporary test artifacts
+*.tmp

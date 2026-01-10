@@ -1,0 +1,5 @@
+fn main() int {
+    var arr = [10, 20, 30, 40, 50];
+    var i = 4;
+    return arr[i];
+}

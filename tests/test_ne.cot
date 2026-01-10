@@ -1,0 +1,7 @@
+fn main() int {
+    if (1 != 2) {
+        return 42;
+    } else {
+        return 0;
+    }
+}

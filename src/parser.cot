@@ -1,0 +1,1275 @@
+// Recursive descent parser for cot.
+//
+// Maps to Go's cmd/compile/internal/syntax/parser.go
+// Uses precedence climbing for binary expressions.
+
+// =============================================================================
+// LANGUAGE FEATURES USED:
+// =============================================================================
+// 1. Tagged unions - for AST node construction
+// 2. Switch expressions - for token dispatch
+// 3. Optional types and capture - if expr |val| { }
+// 4. Methods on structs (fn init(scan: *Scanner) Parser)
+// 5. Compound assignment - count += 1
+// 6. List<T> generic
+// =============================================================================
+
+import "token"
+import "source"
+import "scanner"
+import "errors"
+import "ast"
+
+// Parser state.
+struct Parser {
+    scanner: *Scanner,
+    tok: TokenInfo,
+    ast: *Ast,
+    err: *ErrorReporter,
+}
+
+// Initialize parser.
+fn init(scan: *Scanner, tree: *Ast, reporter: *ErrorReporter) Parser {
+    var p = Parser{
+        .scanner = scan,
+        .tok = scan.next(),  // Prime with first token
+        .ast = tree,
+        .err = reporter,
+    }
+    return p
+}
+
+// ========================================================================
+// Token handling
+// ========================================================================
+
+// Advance to next token.
+fn advance(self: *Parser) {
+    self.tok = self.scanner.next()
+}
+
+// Check if current token matches.
+fn check(self: *Parser, t: Token) bool {
+    return self.tok.tok == t
+}
+
+// Consume token if it matches, return true if consumed.
+fn match(self: *Parser, t: Token) bool {
+    if self.check(t) {
+        self.advance()
+        return true
+    }
+    return false
+}
+
+// Expect a token, report error if not found.
+fn expect(self: *Parser, t: Token) bool {
+    if self.check(t) {
+        self.advance()
+        return true
+    }
+    self.errorExpected(t)
+    return false
+}
+
+// Report "expected X" error.
+fn errorExpected(self: *Parser, t: Token) {
+    var msg = switch t {
+        .identifier => "expected identifier",
+        .lparen => "expected '('",
+        .rparen => "expected ')'",
+        .lbrace => "expected '{'",
+        .rbrace => "expected '}'",
+        .lbracket => "expected '['",
+        .rbracket => "expected ']'",
+        .semicolon => "expected ';'",
+        .colon => "expected ':'",
+        .equal => "expected '='",
+        .comma => "expected ','",
+        else => "unexpected token",
+    }
+    self.err.errorAt(self.tok.span.start, msg)
+}
+
+// Report a syntax error.
+fn syntaxError(self: *Parser, msg: string) {
+    self.err.errorWithCode(self.tok.span.start, .E200, msg)
+}
+
+// Get current position.
+fn pos(self: *Parser) Pos {
+    return self.tok.span.start
+}
+
+// ========================================================================
+// File parsing
+// ========================================================================
+
+// Parse a complete file.
+fn parseFile(self: *Parser) {
+    var decls = new List<NodeIndex>
+
+    while not self.check(.eof) {
+        if self.parseDecl() |decl_idx| {
+            decls.push(decl_idx)
+        } else {
+            // Error recovery: skip to next declaration
+            self.advance()
+        }
+    }
+
+    self.ast.file = File{
+        .filename = self.scanner.src.filename,
+        .decls = decls.toSlice(),
+        .span = Span.init(Pos.zero, self.tok.span.end),
+    }
+}
+
+// ========================================================================
+// Declaration parsing
+// ========================================================================
+
+// Parse a declaration.
+fn parseDecl(self: *Parser) ?NodeIndex {
+    return switch self.tok.tok {
+        .kw_fn => self.parseFnDecl(),
+        .kw_var, .kw_let => self.parseVarDecl(),
+        .kw_const => self.parseConstDecl(),
+        .kw_struct => self.parseStructDecl(),
+        else => {
+            self.syntaxError("expected declaration")
+            return null
+        },
+    }
+}
+
+// Parse function declaration: fn name(params) type { body }
+fn parseFnDecl(self: *Parser) ?NodeIndex {
+    var start = self.pos()
+    self.advance()  // consume 'fn'
+
+    // Function name
+    if not self.check(.identifier) {
+        self.err.errorWithCode(self.pos(), .E203, "expected function name")
+        return null
+    }
+    var name = self.tok.text
+    self.advance()
+
+    // Parameters
+    if not self.expect(.lparen) {
+        return null
+    }
+    var params = self.parseFieldList(.rparen)
+    if not self.expect(.rparen) {
+        return null
+    }
+
+    // Return type (optional)
+    var return_type: ?NodeIndex = null
+    if not self.check(.lbrace) and not self.check(.eof) {
+        return_type = self.parseType()
+    }
+
+    // Body (optional for forward declarations)
+    var body: ?NodeIndex = null
+    if self.check(.lbrace) {
+        body = self.parseBlock()
+    }
+
+    return self.ast.addNode(Node{
+        .decl = Decl{
+            .fn_decl = FnDecl{
+                .name = name,
+                .params = params,
+                .return_type = return_type,
+                .body = body,
+                .span = Span.init(start, self.tok.span.start),
+            },
+        },
+    })
+}
+
+// Parse var/let declaration: var name: type = value
+fn parseVarDecl(self: *Parser) ?NodeIndex {
+    var start = self.pos()
+    self.advance()  // consume 'var' or 'let'
+
+    if not self.check(.identifier) {
+        self.err.errorWithCode(self.pos(), .E203, "expected variable name")
+        return null
+    }
+    var name = self.tok.text
+    self.advance()
+
+    // Type annotation (optional)
+    var type_expr: ?NodeIndex = null
+    if self.match(.colon) {
+        type_expr = self.parseType()
+    }
+
+    // Initializer (optional)
+    var value: ?NodeIndex = null
+    if self.match(.equal) {
+        value = self.parseExpr()
+    }
+
+    return self.ast.addNode(Node{
+        .decl = Decl{
+            .var_decl = VarDecl{
+                .name = name,
+                .type_expr = type_expr,
+                .value = value,
+                .span = Span.init(start, self.tok.span.start),
+            },
+        },
+    })
+}
+
+// Parse const declaration: const name: type = value
+fn parseConstDecl(self: *Parser) ?NodeIndex {
+    var start = self.pos()
+    self.advance()  // consume 'const'
+
+    if not self.check(.identifier) {
+        self.err.errorWithCode(self.pos(), .E203, "expected constant name")
+        return null
+    }
+    var name = self.tok.text
+    self.advance()
+
+    // Type annotation (optional)
+    var type_expr: ?NodeIndex = null
+    if self.match(.colon) {
+        type_expr = self.parseType()
+    }
+
+    // Initializer (required for const)
+    if not self.expect(.equal) {
+        return null
+    }
+    var value = self.parseExpr()
+    if value == null {
+        self.err.errorWithCode(self.pos(), .E201, "expected expression")
+        return null
+    }
+
+    return self.ast.addNode(Node{
+        .decl = Decl{
+            .const_decl = ConstDecl{
+                .name = name,
+                .type_expr = type_expr,
+                .value = value.?,
+                .span = Span.init(start, self.tok.span.start),
+            },
+        },
+    })
+}
+
+// Parse struct declaration: struct Name { fields }
+fn parseStructDecl(self: *Parser) ?NodeIndex {
+    var start = self.pos()
+    self.advance()  // consume 'struct'
+
+    if not self.check(.identifier) {
+        self.err.errorWithCode(self.pos(), .E203, "expected struct name")
+        return null
+    }
+    var name = self.tok.text
+    self.advance()
+
+    if not self.expect(.lbrace) {
+        return null
+    }
+    var fields = self.parseFieldList(.rbrace)
+    if not self.expect(.rbrace) {
+        return null
+    }
+
+    return self.ast.addNode(Node{
+        .decl = Decl{
+            .struct_decl = StructDecl{
+                .name = name,
+                .fields = fields,
+                .span = Span.init(start, self.tok.span.start),
+            },
+        },
+    })
+}
+
+// Parse enum declaration: enum Name { variants }
+fn parseEnumDecl(self: *Parser) ?NodeIndex {
+    var start = self.pos()
+    self.advance()  // consume 'enum'
+
+    if not self.check(.identifier) {
+        self.err.errorWithCode(self.pos(), .E203, "expected enum name")
+        return null
+    }
+    var name = self.tok.text
+    self.advance()
+
+    if not self.expect(.lbrace) {
+        return null
+    }
+
+    var variants = new List<EnumVariant>
+
+    while not self.check(.rbrace) and not self.check(.eof) {
+        if not self.check(.identifier) {
+            self.syntaxError("expected variant name")
+            break
+        }
+        var variant_name = self.tok.text
+        var variant_start = self.pos()
+        self.advance()
+
+        var value: ?NodeIndex = null
+        if self.match(.equal) {
+            value = self.parseExpr()
+        }
+
+        variants.push(EnumVariant{
+            .name = variant_name,
+            .value = value,
+            .span = Span.init(variant_start, self.tok.span.start),
+        })
+
+        if not self.match(.comma) {
+            break
+        }
+    }
+
+    if not self.expect(.rbrace) {
+        return null
+    }
+
+    return self.ast.addNode(Node{
+        .decl = Decl{
+            .enum_decl = EnumDecl{
+                .name = name,
+                .variants = variants.toSlice(),
+                .span = Span.init(start, self.tok.span.start),
+            },
+        },
+    })
+}
+
+// Parse field list (for struct fields and function parameters).
+fn parseFieldList(self: *Parser, end: Token) []Field {
+    var fields = new List<Field>
+
+    while not self.check(end) and not self.check(.eof) {
+        if not self.check(.identifier) {
+            break
+        }
+
+        var field_name = self.tok.text
+        var field_start = self.pos()
+        self.advance()
+
+        if not self.expect(.colon) {
+            break
+        }
+
+        var type_idx = self.parseType()
+        if type_idx == null {
+            break
+        }
+
+        fields.push(Field{
+            .name = field_name,
+            .type_expr = type_idx.?,
+            .span = Span.init(field_start, self.tok.span.start),
+        })
+
+        if not self.match(.comma) {
+            break
+        }
+    }
+
+    return fields.toSlice()
+}
+
+// ========================================================================
+// Type parsing
+// ========================================================================
+
+// Parse a type expression.
+fn parseType(self: *Parser) ?NodeIndex {
+    var start = self.pos()
+
+    // Optional type: ?T
+    if self.match(.question) {
+        var inner = self.parseType()
+        if inner == null {
+            return null
+        }
+        return self.ast.addNode(Node{
+            .expr = Expr{
+                .type_expr = TypeExpr{
+                    .kind = TypeKind{ .optional = inner.? },
+                    .span = Span.init(start, self.tok.span.start),
+                },
+            },
+        })
+    }
+
+    // Pointer type: *T
+    if self.match(.star) {
+        var inner = self.parseType()
+        if inner == null {
+            return null
+        }
+        return self.ast.addNode(Node{
+            .expr = Expr{
+                .type_expr = TypeExpr{
+                    .kind = TypeKind{ .pointer = inner.? },
+                    .span = Span.init(start, self.tok.span.start),
+                },
+            },
+        })
+    }
+
+    // Slice type: []T or Array type: [N]T
+    if self.match(.lbracket) {
+        if self.match(.rbracket) {
+            // Slice: []T
+            var elem = self.parseType()
+            if elem == null {
+                return null
+            }
+            return self.ast.addNode(Node{
+                .expr = Expr{
+                    .type_expr = TypeExpr{
+                        .kind = TypeKind{ .slice = elem.? },
+                        .span = Span.init(start, self.tok.span.start),
+                    },
+                },
+            })
+        } else {
+            // Array: [N]T
+            var size = self.parseExpr()
+            if size == null {
+                return null
+            }
+            if not self.expect(.rbracket) {
+                return null
+            }
+            var elem = self.parseType()
+            if elem == null {
+                return null
+            }
+            return self.ast.addNode(Node{
+                .expr = Expr{
+                    .type_expr = TypeExpr{
+                        .kind = TypeKind{ .array = TypeArray{ .size = size.?, .elem = elem.? } },
+                        .span = Span.init(start, self.tok.span.start),
+                    },
+                },
+            })
+        }
+    }
+
+    // Named type: identifier or type keyword
+    if self.check(.identifier) or isTypeKeyword(self.tok.tok) {
+        var name = self.tok.text
+        if not self.check(.identifier) {
+            name = self.tok.tok.toString()
+        }
+        self.advance()
+        return self.ast.addNode(Node{
+            .expr = Expr{
+                .type_expr = TypeExpr{
+                    .kind = TypeKind{ .named = name },
+                    .span = Span.init(start, self.tok.span.start),
+                },
+            },
+        })
+    }
+
+    self.err.errorWithCode(self.pos(), .E202, "expected type")
+    return null
+}
+
+// ========================================================================
+// Expression parsing (precedence climbing)
+// ========================================================================
+
+// Parse an expression.
+fn parseExpr(self: *Parser) ?NodeIndex {
+    return self.parseBinaryExpr(0)
+}
+
+// Parse binary expression with precedence climbing.
+fn parseBinaryExpr(self: *Parser, min_prec: u8) ?NodeIndex {
+    var left = self.parseUnaryExpr()
+    if left == null {
+        return null
+    }
+
+    while true {
+        var op = self.tok.tok
+        var prec = binaryPrecedence(op)
+
+        if prec == .none or @intFromEnum(prec) <= min_prec {
+            break
+        }
+
+        var op_start = self.pos()
+        self.advance()
+
+        var right = self.parseBinaryExpr(@intFromEnum(prec))
+        if right == null {
+            self.err.errorWithCode(self.pos(), .E201, "expected expression")
+            return null
+        }
+
+        left = self.ast.addNode(Node{
+            .expr = Expr{
+                .binary = Binary{
+                    .op = op,
+                    .left = left.?,
+                    .right = right.?,
+                    .span = Span.init(op_start, self.tok.span.start),
+                },
+            },
+        })
+    }
+
+    return left
+}
+
+// Parse unary expression.
+fn parseUnaryExpr(self: *Parser) ?NodeIndex {
+    var start = self.pos()
+
+    // Unary operators: -, !, not
+    if self.tok.tok == .minus or self.tok.tok == .bang or self.tok.tok == .kw_not {
+        var op = self.tok.tok
+        self.advance()
+        var operand = self.parseUnaryExpr()
+        if operand == null {
+            return null
+        }
+        return self.ast.addNode(Node{
+            .expr = Expr{
+                .unary = Unary{
+                    .op = op,
+                    .operand = operand.?,
+                    .span = Span.init(start, self.tok.span.start),
+                },
+            },
+        })
+    }
+
+    return self.parsePrimaryExpr()
+}
+
+// Parse primary expression (operand + postfix).
+fn parsePrimaryExpr(self: *Parser) ?NodeIndex {
+    var expr = self.parseOperand()
+    if expr == null {
+        return null
+    }
+
+    // Postfix operators: ., [], ()
+    while true {
+        if self.match(.dot) {
+            // Field access: expr.field
+            if not self.check(.identifier) {
+                self.err.errorWithCode(self.pos(), .E203, "expected field name")
+                return null
+            }
+            var field = self.tok.text
+            var field_end = self.tok.span.end
+            self.advance()
+
+            var expr_span = self.ast.getNode(expr.?).span()
+            expr = self.ast.addNode(Node{
+                .expr = Expr{
+                    .field_access = FieldAccess{
+                        .base = expr.?,
+                        .field = field,
+                        .span = Span.init(expr_span.start, field_end),
+                    },
+                },
+            })
+        } else if self.match(.lbracket) {
+            // Index: expr[index]
+            var index = self.parseExpr()
+            if index == null {
+                return null
+            }
+            var end = self.tok.span.end
+            if not self.expect(.rbracket) {
+                return null
+            }
+
+            var expr_span = self.ast.getNode(expr.?).span()
+            expr = self.ast.addNode(Node{
+                .expr = Expr{
+                    .index = Index{
+                        .base = expr.?,
+                        .index = index.?,
+                        .span = Span.init(expr_span.start, end),
+                    },
+                },
+            })
+        } else if self.match(.lparen) {
+            // Call: expr(args)
+            var args = new List<NodeIndex>
+
+            while not self.check(.rparen) and not self.check(.eof) {
+                var arg = self.parseExpr()
+                if arg == null {
+                    break
+                }
+                args.push(arg.?)
+                if not self.match(.comma) {
+                    break
+                }
+            }
+
+            var end = self.tok.span.end
+            if not self.expect(.rparen) {
+                return null
+            }
+
+            var expr_span = self.ast.getNode(expr.?).span()
+            expr = self.ast.addNode(Node{
+                .expr = Expr{
+                    .call = Call{
+                        .callee = expr.?,
+                        .args = args.toSlice(),
+                        .span = Span.init(expr_span.start, end),
+                    },
+                },
+            })
+        } else if self.match(.lbrace) {
+            // Struct literal: Type{ .field = value, ... }
+            var node = self.ast.getNode(expr.?)
+            var type_name = switch node {
+                .expr |e| => switch e {
+                    .identifier |id| => id.name,
+                    else => {
+                        self.err.errorWithCode(self.pos(), .E201, "struct literal requires type name")
+                        return null
+                    },
+                },
+                else => {
+                    self.err.errorWithCode(self.pos(), .E201, "struct literal requires type name")
+                    return null
+                },
+            }
+
+            var fields = new List<FieldInit>
+
+            while not self.check(.rbrace) and not self.check(.eof) {
+                // Parse .field = value
+                if not self.expect(.dot) {
+                    return null
+                }
+                if not self.check(.identifier) {
+                    self.err.errorWithCode(self.pos(), .E203, "expected field name")
+                    return null
+                }
+                var field_name = self.tok.text
+                var field_start = self.tok.span.start
+                self.advance()
+
+                if not self.expect(.equal) {
+                    return null
+                }
+
+                var value = self.parseExpr()
+                if value == null {
+                    return null
+                }
+                var field_end = self.ast.getNode(value.?).span().end
+
+                fields.push(FieldInit{
+                    .name = field_name,
+                    .value = value.?,
+                    .span = Span.init(field_start, field_end),
+                })
+
+                if not self.match(.comma) {
+                    break
+                }
+            }
+
+            var end = self.tok.span.end
+            if not self.expect(.rbrace) {
+                return null
+            }
+
+            var expr_span = self.ast.getNode(expr.?).span()
+            expr = self.ast.addNode(Node{
+                .expr = Expr{
+                    .struct_init = StructInit{
+                        .type_name = type_name,
+                        .fields = fields.toSlice(),
+                        .span = Span.init(expr_span.start, end),
+                    },
+                },
+            })
+        } else {
+            break
+        }
+    }
+
+    return expr
+}
+
+// Parse operand (literals, identifiers, parenthesized expressions).
+fn parseOperand(self: *Parser) ?NodeIndex {
+    var start = self.pos()
+
+    return switch self.tok.tok {
+        .identifier => {
+            var name = self.tok.text
+            self.advance()
+            return self.ast.addNode(Node{
+                .expr = Expr{
+                    .identifier = Identifier{
+                        .name = name,
+                        .span = Span.init(start, self.tok.span.start),
+                    },
+                },
+            })
+        },
+        .int_literal => {
+            var value = self.tok.text
+            self.advance()
+            return self.ast.addNode(Node{
+                .expr = Expr{
+                    .literal = Literal{
+                        .kind = .int,
+                        .value = value,
+                        .span = Span.init(start, self.tok.span.start),
+                    },
+                },
+            })
+        },
+        .float_literal => {
+            var value = self.tok.text
+            self.advance()
+            return self.ast.addNode(Node{
+                .expr = Expr{
+                    .literal = Literal{
+                        .kind = .float,
+                        .value = value,
+                        .span = Span.init(start, self.tok.span.start),
+                    },
+                },
+            })
+        },
+        .string_literal => {
+            var value = self.tok.text
+            self.advance()
+            return self.ast.addNode(Node{
+                .expr = Expr{
+                    .literal = Literal{
+                        .kind = .string,
+                        .value = value,
+                        .span = Span.init(start, self.tok.span.start),
+                    },
+                },
+            })
+        },
+        .char_literal => {
+            var value = self.tok.text
+            self.advance()
+            return self.ast.addNode(Node{
+                .expr = Expr{
+                    .literal = Literal{
+                        .kind = .char,
+                        .value = value,
+                        .span = Span.init(start, self.tok.span.start),
+                    },
+                },
+            })
+        },
+        .kw_true => {
+            self.advance()
+            return self.ast.addNode(Node{
+                .expr = Expr{
+                    .literal = Literal{
+                        .kind = .true_lit,
+                        .value = "true",
+                        .span = Span.init(start, self.tok.span.start),
+                    },
+                },
+            })
+        },
+        .kw_false => {
+            self.advance()
+            return self.ast.addNode(Node{
+                .expr = Expr{
+                    .literal = Literal{
+                        .kind = .false_lit,
+                        .value = "false",
+                        .span = Span.init(start, self.tok.span.start),
+                    },
+                },
+            })
+        },
+        .kw_null => {
+            self.advance()
+            return self.ast.addNode(Node{
+                .expr = Expr{
+                    .literal = Literal{
+                        .kind = .null_lit,
+                        .value = "null",
+                        .span = Span.init(start, self.tok.span.start),
+                    },
+                },
+            })
+        },
+        .lparen => {
+            self.advance()
+            var inner = self.parseExpr()
+            if inner == null {
+                return null
+            }
+            var end = self.tok.span.end
+            if not self.expect(.rparen) {
+                return null
+            }
+            return self.ast.addNode(Node{
+                .expr = Expr{
+                    .paren = Paren{
+                        .inner = inner.?,
+                        .span = Span.init(start, end),
+                    },
+                },
+            })
+        },
+        .kw_if => {
+            return self.parseIfExpr()
+        },
+        .lbrace => {
+            return self.parseBlock()
+        },
+        .lbracket => {
+            // Array literal: [elem1, elem2, ...]
+            self.advance()  // consume '['
+
+            var elements = new List<NodeIndex>
+
+            // Parse comma-separated elements
+            while not self.check(.rbracket) and not self.check(.eof) {
+                var elem = self.parseExpr()
+                if elem == null {
+                    break
+                }
+                elements.push(elem.?)
+                if not self.match(.comma) {
+                    break
+                }
+            }
+
+            var end = self.tok.span.end
+            if not self.expect(.rbracket) {
+                return null
+            }
+
+            return self.ast.addNode(Node{
+                .expr = Expr{
+                    .array_literal = ArrayLiteral{
+                        .elements = elements.toSlice(),
+                        .span = Span.init(start, end),
+                    },
+                },
+            })
+        },
+        else => {
+            self.err.errorWithCode(self.pos(), .E201, "expected expression")
+            return null
+        },
+    }
+}
+
+// Parse if expression: if cond { then } else { else }
+fn parseIfExpr(self: *Parser) ?NodeIndex {
+    var start = self.pos()
+    self.advance()  // consume 'if'
+
+    var condition = self.parseExpr()
+    if condition == null {
+        return null
+    }
+
+    if not self.check(.lbrace) {
+        self.err.errorWithCode(self.pos(), .E204, "expected '{' after if condition")
+        return null
+    }
+    var then_branch = self.parseBlock()
+    if then_branch == null {
+        return null
+    }
+
+    var else_branch: ?NodeIndex = null
+    if self.match(.kw_else) {
+        if self.check(.kw_if) {
+            else_branch = self.parseIfExpr()
+        } else if self.check(.lbrace) {
+            else_branch = self.parseBlock()
+        } else {
+            self.syntaxError("expected '{' or 'if' after 'else'")
+            return null
+        }
+    }
+
+    return self.ast.addNode(Node{
+        .expr = Expr{
+            .if_expr = IfExpr{
+                .condition = condition.?,
+                .then_branch = then_branch.?,
+                .else_branch = else_branch,
+                .span = Span.init(start, self.tok.span.start),
+            },
+        },
+    })
+}
+
+// ========================================================================
+// Statement parsing
+// ========================================================================
+
+// Parse a block: { statements }
+fn parseBlock(self: *Parser) ?NodeIndex {
+    var start = self.pos()
+    if not self.expect(.lbrace) {
+        return null
+    }
+
+    var stmts = new List<NodeIndex>
+
+    while not self.check(.rbrace) and not self.check(.eof) {
+        if self.parseStmt() |stmt_idx| {
+            stmts.push(stmt_idx)
+        } else {
+            // Error recovery: skip token
+            self.advance()
+        }
+    }
+
+    var end = self.tok.span.end
+    if not self.expect(.rbrace) {
+        return null
+    }
+
+    return self.ast.addNode(Node{
+        .expr = Expr{
+            .block = Block{
+                .stmts = stmts.toSlice(),
+                .expr = null_node,
+                .span = Span.init(start, end),
+            },
+        },
+    })
+}
+
+// Parse a statement.
+fn parseStmt(self: *Parser) ?NodeIndex {
+    var start = self.pos()
+
+    return switch self.tok.tok {
+        .kw_return => {
+            self.advance()
+            var value: ?NodeIndex = null
+            if not self.check(.rbrace) and not self.check(.semicolon) {
+                value = self.parseExpr()
+            }
+            _ = self.match(.semicolon)
+            return self.ast.addNode(Node{
+                .stmt = Stmt{
+                    .return_stmt = ReturnStmt{
+                        .value = value,
+                        .span = Span.init(start, self.tok.span.start),
+                    },
+                },
+            })
+        },
+        .kw_var, .kw_let => self.parseVarStmt(false),
+        .kw_const => self.parseVarStmt(true),
+        .kw_if => self.parseIfStmt(),
+        .kw_while => self.parseWhileStmt(),
+        .kw_for => self.parseForStmt(),
+        .kw_break => {
+            self.advance()
+            _ = self.match(.semicolon)
+            return self.ast.addNode(Node{
+                .stmt = Stmt{
+                    .break_stmt = BreakStmt{
+                        .span = Span.init(start, self.tok.span.start),
+                    },
+                },
+            })
+        },
+        .kw_continue => {
+            self.advance()
+            _ = self.match(.semicolon)
+            return self.ast.addNode(Node{
+                .stmt = Stmt{
+                    .continue_stmt = ContinueStmt{
+                        .span = Span.init(start, self.tok.span.start),
+                    },
+                },
+            })
+        },
+        else => {
+            // Expression statement or assignment
+            var expr = self.parseExpr()
+            if expr == null {
+                return null
+            }
+
+            // Check for assignment
+            if self.tok.tok == .equal or isCompoundAssign(self.tok.tok) {
+                var op: ?Token = null
+                if self.tok.tok != .equal {
+                    op = self.tok.tok
+                }
+                self.advance()
+                var value = self.parseExpr()
+                if value == null {
+                    return null
+                }
+                _ = self.match(.semicolon)
+                return self.ast.addNode(Node{
+                    .stmt = Stmt{
+                        .assign_stmt = AssignStmt{
+                            .target = expr.?,
+                            .op = op,
+                            .value = value.?,
+                            .span = Span.init(start, self.tok.span.start),
+                        },
+                    },
+                })
+            }
+
+            _ = self.match(.semicolon)
+            return self.ast.addNode(Node{
+                .stmt = Stmt{
+                    .expr_stmt = ExprStmt{
+                        .expr = expr.?,
+                        .span = Span.init(start, self.tok.span.start),
+                    },
+                },
+            })
+        },
+    }
+}
+
+// Parse var/let/const statement.
+fn parseVarStmt(self: *Parser, is_const: bool) ?NodeIndex {
+    var start = self.pos()
+    self.advance()  // consume var/let/const
+
+    if not self.check(.identifier) {
+        self.err.errorWithCode(self.pos(), .E203, "expected variable name")
+        return null
+    }
+    var name = self.tok.text
+    self.advance()
+
+    var type_expr: ?NodeIndex = null
+    if self.match(.colon) {
+        type_expr = self.parseType()
+    }
+
+    var value: ?NodeIndex = null
+    if self.match(.equal) {
+        value = self.parseExpr()
+    }
+
+    _ = self.match(.semicolon)
+
+    return self.ast.addNode(Node{
+        .stmt = Stmt{
+            .var_stmt = VarStmt{
+                .name = name,
+                .type_expr = type_expr,
+                .value = value,
+                .is_const = is_const,
+                .span = Span.init(start, self.tok.span.start),
+            },
+        },
+    })
+}
+
+// Parse if statement.
+fn parseIfStmt(self: *Parser) ?NodeIndex {
+    var start = self.pos()
+    self.advance()  // consume 'if'
+
+    var condition = self.parseExpr()
+    if condition == null {
+        return null
+    }
+
+    if not self.check(.lbrace) {
+        self.err.errorWithCode(self.pos(), .E204, "expected '{' after if condition")
+        return null
+    }
+    var then_branch = self.parseBlockStmt()
+    if then_branch == null {
+        return null
+    }
+
+    var else_branch: ?NodeIndex = null
+    if self.match(.kw_else) {
+        if self.check(.kw_if) {
+            else_branch = self.parseIfStmt()
+        } else if self.check(.lbrace) {
+            else_branch = self.parseBlockStmt()
+        } else {
+            self.syntaxError("expected '{' or 'if' after 'else'")
+            return null
+        }
+    }
+
+    return self.ast.addNode(Node{
+        .stmt = Stmt{
+            .if_stmt = IfStmt{
+                .condition = condition.?,
+                .then_branch = then_branch.?,
+                .else_branch = else_branch,
+                .span = Span.init(start, self.tok.span.start),
+            },
+        },
+    })
+}
+
+// Parse while statement.
+fn parseWhileStmt(self: *Parser) ?NodeIndex {
+    var start = self.pos()
+    self.advance()  // consume 'while'
+
+    var condition = self.parseExpr()
+    if condition == null {
+        return null
+    }
+
+    if not self.check(.lbrace) {
+        self.err.errorWithCode(self.pos(), .E204, "expected '{' after while condition")
+        return null
+    }
+    var body = self.parseBlockStmt()
+    if body == null {
+        return null
+    }
+
+    return self.ast.addNode(Node{
+        .stmt = Stmt{
+            .while_stmt = WhileStmt{
+                .condition = condition.?,
+                .body = body.?,
+                .span = Span.init(start, self.tok.span.start),
+            },
+        },
+    })
+}
+
+// Parse for statement: for x in iter { body }
+fn parseForStmt(self: *Parser) ?NodeIndex {
+    var start = self.pos()
+    self.advance()  // consume 'for'
+
+    if not self.check(.identifier) {
+        self.err.errorWithCode(self.pos(), .E203, "expected loop variable")
+        return null
+    }
+    var binding = self.tok.text
+    self.advance()
+
+    if not self.expect(.kw_in) {
+        self.syntaxError("expected 'in' in for loop")
+        return null
+    }
+
+    var iterable = self.parseExpr()
+    if iterable == null {
+        return null
+    }
+
+    if not self.check(.lbrace) {
+        self.err.errorWithCode(self.pos(), .E204, "expected '{' after for clause")
+        return null
+    }
+    var body = self.parseBlockStmt()
+    if body == null {
+        return null
+    }
+
+    return self.ast.addNode(Node{
+        .stmt = Stmt{
+            .for_stmt = ForStmt{
+                .binding = binding,
+                .iterable = iterable.?,
+                .body = body.?,
+                .span = Span.init(start, self.tok.span.start),
+            },
+        },
+    })
+}
+
+// Parse block as statement.
+fn parseBlockStmt(self: *Parser) ?NodeIndex {
+    var start = self.pos()
+    if not self.expect(.lbrace) {
+        return null
+    }
+
+    var stmts = new List<NodeIndex>
+
+    while not self.check(.rbrace) and not self.check(.eof) {
+        if self.parseStmt() |stmt_idx| {
+            stmts.push(stmt_idx)
+        } else {
+            self.advance()
+        }
+    }
+
+    var end = self.tok.span.end
+    if not self.expect(.rbrace) {
+        return null
+    }
+
+    return self.ast.addNode(Node{
+        .stmt = Stmt{
+            .block_stmt = BlockStmt{
+                .stmts = stmts.toSlice(),
+                .span = Span.init(start, end),
+            },
+        },
+    })
+}
+
+// ========================================================================
+// Helper functions
+// ========================================================================
+
+// Check if token is a type keyword (int, string, etc.)
+fn isTypeKeyword(t: Token) bool {
+    return switch t {
+        .kw_int, .kw_float, .kw_bool, .kw_string, .kw_byte => true,
+        .kw_decimal, .kw_alpha => true,
+        .kw_i8, .kw_i16, .kw_i32, .kw_i64 => true,
+        .kw_u8, .kw_u16, .kw_u32, .kw_u64 => true,
+        .kw_f32, .kw_f64 => true,
+        else => false,
+    }
+}
+
+// Check if token is a compound assignment operator.
+fn isCompoundAssign(t: Token) bool {
+    return switch t {
+        .plus_equal, .minus_equal, .star_equal, .slash_equal, .percent_equal => true,
+        .ampersand_equal, .pipe_equal, .caret_equal => true,
+        else => false,
+    }
+}

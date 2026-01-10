@@ -1,0 +1,503 @@
+// Abstract Syntax Tree node definitions.
+//
+// Maps to Go's cmd/compile/internal/syntax/nodes.go
+// Uses tagged unions instead of Go interfaces.
+
+// =============================================================================
+// LANGUAGE FEATURES USED:
+// =============================================================================
+// 1. Tagged unions (union Decl { fn_decl: FnDecl, ... })
+// 2. Switch on tagged union with payload capture
+// 3. Enums (LiteralKind, TypeKind)
+// 4. Structs with optional fields (return_type: ?NodeIndex)
+// 5. Type aliases (type NodeIndex = u32)
+// 6. @maxInt builtin
+// 7. Methods on unions (fn span(self: Decl) Span)
+// 8. List<T> generic
+// =============================================================================
+
+import "source"
+import "token"
+
+// ============================================================================
+// Core Types
+// ============================================================================
+
+// Index into an expression/statement/declaration pool.
+// Using indices instead of pointers allows arena allocation and compact storage.
+type NodeIndex = u32
+const null_node: NodeIndex = @maxInt(u32)
+
+// List of node indices (for parameter lists, statement lists, etc.)
+type NodeList = []NodeIndex
+
+// ============================================================================
+// File (top-level)
+// ============================================================================
+
+// A source file containing declarations.
+struct File {
+    filename: string,
+    decls: []NodeIndex,
+    span: Span,
+}
+
+// ============================================================================
+// Declarations
+// ============================================================================
+
+union Decl {
+    fn_decl: FnDecl,
+    var_decl: VarDecl,
+    const_decl: ConstDecl,
+    struct_decl: StructDecl,
+    enum_decl: EnumDecl,
+    bad_decl: BadDecl,
+}
+
+// Get the span of any declaration
+fn span(self: Decl) Span {
+    return switch self {
+        .fn_decl |d| => d.span,
+        .var_decl |d| => d.span,
+        .const_decl |d| => d.span,
+        .struct_decl |d| => d.span,
+        .enum_decl |d| => d.span,
+        .bad_decl |d| => d.span,
+    }
+}
+
+// fn name(params) return_type { body }
+struct FnDecl {
+    name: string,
+    params: []Field,
+    return_type: ?NodeIndex,  // null = void
+    body: ?NodeIndex,         // null = forward declaration
+    span: Span,
+}
+
+// var name: type = value
+// let name: type = value (alias for var)
+struct VarDecl {
+    name: string,
+    type_expr: ?NodeIndex,    // null = inferred
+    value: ?NodeIndex,        // null = uninitialized
+    span: Span,
+}
+
+// const name: type = value
+struct ConstDecl {
+    name: string,
+    type_expr: ?NodeIndex,
+    value: NodeIndex,         // const must have value
+    span: Span,
+}
+
+// struct { fields }
+struct StructDecl {
+    name: string,
+    fields: []Field,
+    span: Span,
+}
+
+// enum { variants }
+struct EnumDecl {
+    name: string,
+    variants: []EnumVariant,
+    span: Span,
+}
+
+// Placeholder for malformed declaration
+struct BadDecl {
+    span: Span,
+}
+
+// Field in struct or function parameter
+struct Field {
+    name: string,
+    type_expr: NodeIndex,
+    span: Span,
+}
+
+// Enum variant
+struct EnumVariant {
+    name: string,
+    value: ?NodeIndex,        // explicit value
+    span: Span,
+}
+
+// ============================================================================
+// Expressions
+// ============================================================================
+
+union Expr {
+    identifier: Identifier,
+    literal: Literal,
+    binary: Binary,
+    unary: Unary,
+    call: Call,
+    index: Index,
+    field_access: FieldAccess,
+    array_literal: ArrayLiteral,
+    paren: Paren,
+    if_expr: IfExpr,
+    block: Block,
+    struct_init: StructInit,
+    type_expr: TypeExpr,
+    bad_expr: BadExpr,
+}
+
+// Get the span of any expression
+fn span(self: Expr) Span {
+    return switch self {
+        .identifier |e| => e.span,
+        .literal |e| => e.span,
+        .binary |e| => e.span,
+        .unary |e| => e.span,
+        .call |e| => e.span,
+        .index |e| => e.span,
+        .field_access |e| => e.span,
+        .array_literal |e| => e.span,
+        .paren |e| => e.span,
+        .if_expr |e| => e.span,
+        .block |e| => e.span,
+        .struct_init |e| => e.span,
+        .type_expr |e| => e.span,
+        .bad_expr |e| => e.span,
+    }
+}
+
+// Variable or type name
+struct Identifier {
+    name: string,
+    span: Span,
+}
+
+// Literal value (int, float, string, char, bool)
+struct Literal {
+    kind: LiteralKind,
+    value: string,            // raw text
+    span: Span,
+}
+
+enum LiteralKind {
+    int,
+    float,
+    string,
+    char,
+    true_lit,
+    false_lit,
+    null_lit,
+}
+
+// Binary operation (x op y)
+struct Binary {
+    op: Token,
+    left: NodeIndex,
+    right: NodeIndex,
+    span: Span,
+}
+
+// Unary operation (op x)
+struct Unary {
+    op: Token,
+    operand: NodeIndex,
+    span: Span,
+}
+
+// Function call (callee(args))
+struct Call {
+    callee: NodeIndex,
+    args: []NodeIndex,
+    span: Span,
+}
+
+// Index expression (base[index])
+struct Index {
+    base: NodeIndex,
+    index: NodeIndex,
+    span: Span,
+}
+
+// Field access (base.field)
+struct FieldAccess {
+    base: NodeIndex,
+    field: string,
+    span: Span,
+}
+
+// Array literal ([elem1, elem2, ...])
+struct ArrayLiteral {
+    elements: []NodeIndex,
+    span: Span,
+}
+
+// Parenthesized expression
+struct Paren {
+    inner: NodeIndex,
+    span: Span,
+}
+
+// If expression (if cond then_expr else else_expr)
+struct IfExpr {
+    condition: NodeIndex,
+    then_branch: NodeIndex,
+    else_branch: ?NodeIndex,
+    span: Span,
+}
+
+// Block expression { stmts; expr }
+struct Block {
+    stmts: []NodeIndex,
+    expr: NodeIndex,          // Final expression (value of block), or null_node
+    span: Span,
+}
+
+// Struct initialization: Point{.x = 10, .y = 20}
+struct StructInit {
+    type_name: string,        // Type name (e.g., "Point"), or empty for anonymous
+    fields: []FieldInit,
+    span: Span,
+}
+
+// Field initializer: .field = value
+struct FieldInit {
+    name: string,
+    value: NodeIndex,
+    span: Span,
+}
+
+// Placeholder for malformed expression
+struct BadExpr {
+    span: Span,
+}
+
+// ============================================================================
+// Type Expressions
+// ============================================================================
+
+struct TypeExpr {
+    kind: TypeKind,
+    span: Span,
+}
+
+union TypeKind {
+    // Named type (int, string, MyStruct, etc.)
+    named: string,
+    // Pointer type (*T)
+    pointer: NodeIndex,
+    // Optional type (?T)
+    optional: NodeIndex,
+    // Slice type ([]T)
+    slice: NodeIndex,
+    // Array type ([N]T)
+    array: TypeArray,
+    // Function type (fn(params) ret)
+    function: TypeFunction,
+}
+
+struct TypeArray {
+    size: NodeIndex,          // size expression
+    elem: NodeIndex,
+}
+
+struct TypeFunction {
+    params: []NodeIndex,
+    return_type: ?NodeIndex,
+}
+
+// ============================================================================
+// Statements
+// ============================================================================
+
+union Stmt {
+    expr_stmt: ExprStmt,
+    return_stmt: ReturnStmt,
+    var_stmt: VarStmt,
+    assign_stmt: AssignStmt,
+    if_stmt: IfStmt,
+    while_stmt: WhileStmt,
+    for_stmt: ForStmt,
+    block_stmt: BlockStmt,
+    break_stmt: BreakStmt,
+    continue_stmt: ContinueStmt,
+    bad_stmt: BadStmt,
+}
+
+// Get the span of any statement
+fn span(self: Stmt) Span {
+    return switch self {
+        .expr_stmt |s| => s.span,
+        .return_stmt |s| => s.span,
+        .var_stmt |s| => s.span,
+        .assign_stmt |s| => s.span,
+        .if_stmt |s| => s.span,
+        .while_stmt |s| => s.span,
+        .for_stmt |s| => s.span,
+        .block_stmt |s| => s.span,
+        .break_stmt |s| => s.span,
+        .continue_stmt |s| => s.span,
+        .bad_stmt |s| => s.span,
+    }
+}
+
+// Expression statement
+struct ExprStmt {
+    expr: NodeIndex,
+    span: Span,
+}
+
+// return expr
+struct ReturnStmt {
+    value: ?NodeIndex,
+    span: Span,
+}
+
+// var/let name: type = value (local variable)
+struct VarStmt {
+    name: string,
+    type_expr: ?NodeIndex,
+    value: ?NodeIndex,
+    is_const: bool,
+    span: Span,
+}
+
+// name = value, name += value, etc.
+struct AssignStmt {
+    target: NodeIndex,
+    op: ?Token,               // null = simple assign, else compound (+=, -=, etc.)
+    value: NodeIndex,
+    span: Span,
+}
+
+// if condition { then } else { else }
+struct IfStmt {
+    condition: NodeIndex,
+    then_branch: NodeIndex,   // block
+    else_branch: ?NodeIndex,  // block or another if_stmt
+    span: Span,
+}
+
+// while condition { body }
+struct WhileStmt {
+    condition: NodeIndex,
+    body: NodeIndex,
+    span: Span,
+}
+
+// for item in iterable { body }
+struct ForStmt {
+    binding: string,
+    iterable: NodeIndex,
+    body: NodeIndex,
+    span: Span,
+}
+
+// { statements }
+struct BlockStmt {
+    stmts: []NodeIndex,
+    span: Span,
+}
+
+// break
+struct BreakStmt {
+    span: Span,
+}
+
+// continue
+struct ContinueStmt {
+    span: Span,
+}
+
+// Placeholder for malformed statement
+struct BadStmt {
+    span: Span,
+}
+
+// ============================================================================
+// Node Storage (Arena-based)
+// ============================================================================
+
+// Unified node that can be any AST element.
+// This is what gets stored in the node pool.
+union Node {
+    decl: Decl,
+    expr: Expr,
+    stmt: Stmt,
+}
+
+// Get the span of any node
+fn span(self: Node) Span {
+    return switch self {
+        .decl |d| => d.span(),
+        .expr |e| => e.span(),
+        .stmt |s| => s.span(),
+    }
+}
+
+// Storage for all AST nodes.
+// Uses arena allocation for fast allocation and bulk deallocation.
+struct Ast {
+    nodes: List<Node>,
+    file: ?File,
+}
+
+// Initialize an empty AST
+fn init() Ast {
+    return Ast{
+        .nodes = new List<Node>,
+        .file = null,
+    }
+}
+
+// Add a node and return its index.
+fn addNode(self: *Ast, node: Node) NodeIndex {
+    var idx = @intCast(NodeIndex, len(self.nodes))
+    self.nodes.push(node)
+    return idx
+}
+
+// Get a node by index.
+fn getNode(self: *Ast, idx: NodeIndex) Node {
+    if idx == null_node {
+        // Return a bad node for null indices
+        return Node{ .expr = Expr{ .bad_expr = BadExpr{ .span = Span.fromPos(Pos.zero) } } }
+    }
+    return self.nodes[idx]
+}
+
+// Get a node as an expression.
+fn getExpr(self: *Ast, idx: NodeIndex) ?Expr {
+    if idx == null_node {
+        return null
+    }
+    var node = self.nodes[idx]
+    return switch node {
+        .expr |e| => e,
+        else => null,
+    }
+}
+
+// Get a node as a statement.
+fn getStmt(self: *Ast, idx: NodeIndex) ?Stmt {
+    if idx == null_node {
+        return null
+    }
+    var node = self.nodes[idx]
+    return switch node {
+        .stmt |s| => s,
+        else => null,
+    }
+}
+
+// Get a node as a declaration.
+fn getDecl(self: *Ast, idx: NodeIndex) ?Decl {
+    if idx == null_node {
+        return null
+    }
+    var node = self.nodes[idx]
+    return switch node {
+        .decl |d| => d,
+        else => null,
+    }
+}

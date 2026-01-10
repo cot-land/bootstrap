@@ -1,0 +1,5 @@
+fn main() i64 {
+    var arr = [10, 20, 30, 40, 50];
+    var s = arr[1:4];
+    return len(s);
+}

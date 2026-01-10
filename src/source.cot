@@ -1,0 +1,185 @@
+// Source text handling and position tracking.
+//
+// Maps to Go's cmd/compile/internal/syntax/source.go and cmd/internal/src/pos.go
+// This is the target implementation for self-hosting.
+
+// =============================================================================
+// LANGUAGE FEATURES USED:
+// =============================================================================
+// 1. Structs with fields
+// 2. Const struct values
+// 3. Optional types (?[]u32)
+// 4. @min builtin for clamping
+// 5. @intCast for integer conversions
+// 6. Slice syntax (content[s..e])
+// 7. For-in iteration
+// 8. While loops
+// 9. Null coalescing (??)
+// 10. len() builtin
+// 11. String interpolation
+// 12. Array indexing
+// =============================================================================
+
+// A position in source code (offset-based).
+// Compact representation - line/column computed on demand.
+struct Pos {
+    offset: u32,
+}
+
+// Constant for zero position.
+const zero: Pos = Pos{ .offset = 0 }
+
+// Advance a position by n bytes.
+fn advance(self: Pos, n: u32) Pos {
+    return Pos{ .offset = self.offset + n }
+}
+
+// A span in source code (start and end positions).
+// Used for AST nodes and error messages.
+struct Span {
+    start: Pos,
+    end: Pos,
+}
+
+// Create a span from start and end positions.
+fn init(start: Pos, end: Pos) Span {
+    return Span{ .start = start, .end = end }
+}
+
+// Create a span from a single position (zero-length).
+fn fromPos(pos: Pos) Span {
+    return Span{ .start = pos, .end = pos }
+}
+
+// Human-readable location (for error messages).
+struct Location {
+    line: u32,      // 1-based
+    column: u32,    // 1-based
+    offset: u32,    // 0-based byte offset
+}
+
+// Source holds the content of a source file.
+struct Source {
+    filename: string,       // File name (for error messages)
+    content: string,        // Source content (UTF-8)
+    line_offsets: ?[]u32,   // Byte offsets of line starts (computed lazily)
+}
+
+// Initialize a source from content.
+// Note: cot uses ARC, so no explicit allocator needed.
+fn sourceInit(filename: string, content: string) Source {
+    return Source{
+        .filename = filename,
+        .content = content,
+        .line_offsets = null,
+    }
+}
+
+// Get the byte at a position, or null if past end.
+fn at(self: *Source, pos: Pos) ?byte {
+    if pos.offset >= len(self.content) {
+        return null
+    }
+    return self.content[pos.offset]
+}
+
+// Get a slice of source content.
+fn slice(self: *Source, start: Pos, end: Pos) string {
+    var s = @min(start.offset, len(self.content))
+    var e = @min(end.offset, len(self.content))
+    return self.content[s..e]
+}
+
+// Get the text for a span.
+fn spanText(self: *Source, span: Span) string {
+    return self.slice(span.start, span.end)
+}
+
+// Convert a position to a human-readable location.
+fn location(self: *Source, pos: Pos) Location {
+    self.ensureLineOffsets()
+
+    var offsets = self.line_offsets ?? return Location{
+        .line = 1,
+        .column = 1,
+        .offset = pos.offset,
+    }
+    var offset = pos.offset
+
+    // Binary search for the line containing this offset
+    var line: u32 = 0
+    var lo: int = 0
+    var hi: int = len(offsets)
+
+    while lo < hi {
+        var mid = lo + (hi - lo) / 2
+        if offsets[mid] <= offset {
+            line = @intCast(u32, mid)
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+
+    var line_start = offsets[line]
+    var column = offset - line_start
+
+    return Location{
+        .line = line + 1,       // 1-based
+        .column = column + 1,   // 1-based
+        .offset = offset,
+    }
+}
+
+// Compute line offsets if not already done.
+fn ensureLineOffsets(self: *Source) {
+    if self.line_offsets != null {
+        return
+    }
+
+    // Count newlines first
+    var count: int = 1  // Line 1 starts at offset 0
+    for c in self.content {
+        if c == '\n' {
+            count += 1
+        }
+    }
+
+    // Allocate and fill
+    var offsets = new [count]u32
+    offsets[0] = 0
+    var idx: int = 1
+
+    for c, i in self.content {
+        if c == '\n' {
+            offsets[idx] = @intCast(u32, i + 1)
+            idx += 1
+        }
+    }
+
+    self.line_offsets = offsets
+}
+
+// Get the line containing a position (for error context).
+fn getLine(self: *Source, pos: Pos) string {
+    self.ensureLineOffsets()
+    var loc = self.location(pos)
+
+    var offsets = self.line_offsets ?? return ""
+
+    var line_idx = loc.line - 1
+    var start = offsets[line_idx]
+
+    var end_offset = start
+    while end_offset < len(self.content) and self.content[end_offset] != '\n' {
+        end_offset += 1
+    }
+
+    return self.content[start..end_offset]
+}
+
+// Format an error message with source location.
+fn formatError(self: *Source, pos: Pos, msg: string) {
+    var loc = self.location(pos)
+    println("${self.filename}:${loc.line}:${loc.column}: error: ${msg}")
+}

@@ -1,0 +1,18 @@
+# Docker image for x86_64 testing of cot compiler
+# Pre-installs all dependencies for fast test runs
+
+FROM --platform=linux/amd64 debian:bookworm-slim
+
+# Install build dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        gcc \
+        libc6-dev \
+        binutils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /cot
+
+# Default command shows help
+CMD ["echo", "Usage: docker run -v $(pwd):/cot cot-x86_64 ./run_tests_x86_64.sh"]
