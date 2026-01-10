@@ -40,6 +40,54 @@ const BranchPatch = struct {
 };
 
 // ============================================================================
+// Frame Layout Constants - CRITICAL FOR PREVENTING MEMORY CORRUPTION
+// ============================================================================
+//
+// These constants define the stack frame layout for each architecture.
+// NEVER use magic numbers for stack offsets - always use these constants.
+//
+// AArch64 Stack Layout (after prologue with calls):
+//   [sp + 0]                    = saved x29 (frame pointer)
+//   [sp + 8]                    = saved x30 (link register / return address)
+//   [sp + AARCH64_SAVED_REGS]   = start of local variables
+//   [sp + frame_size + 16]      = end of locals (original sp before sub)
+//
+// x86_64 Stack Layout (after prologue):
+//   [rbp + 0]                   = saved rbp (old frame pointer)
+//   [rbp + 8]                   = return address (pushed by call)
+//   [rbp - 8]                   = first local variable
+//   [rbp - frame_size]          = end of locals
+//
+pub const FrameLayout = struct {
+    // AArch64: fp (x29) + lr (x30) = 16 bytes saved by stp instruction
+    pub const AARCH64_SAVED_REGS: i32 = 16;
+
+    // x86_64: rbp is saved, return address is at rbp+8
+    // Locals are at negative offsets from rbp, no adjustment needed
+    pub const X86_64_SAVED_REGS: i32 = 0;
+
+    /// Convert x86-style negative offset to AArch64 positive sp-relative offset.
+    /// This accounts for:
+    /// 1. The frame_size (allocated stack space)
+    /// 2. The saved registers (fp + lr = 16 bytes)
+    ///
+    /// Example: local at x86 offset -8 with frame_size 16:
+    ///   result = 16 + (-8) + 16 = 24
+    ///   This places the local at [sp + 24], safely past saved regs at [sp + 0..15]
+    pub fn aarch64LocalOffset(x86_offset: i32, frame_size: u32) i32 {
+        const result = @as(i32, @intCast(frame_size)) + x86_offset + AARCH64_SAVED_REGS;
+        // Safety assertion: offset must not overlap with saved registers
+        std.debug.assert(result >= AARCH64_SAVED_REGS);
+        return result;
+    }
+
+    /// Get x86_64 local offset (no conversion needed, locals are at negative offsets from rbp)
+    pub fn x86_64LocalOffset(x86_offset: i32) i32 {
+        return x86_offset;
+    }
+};
+
+// ============================================================================
 // Compilation Options (Zig pattern: single config struct)
 // ============================================================================
 
@@ -625,7 +673,7 @@ pub const Driver = struct {
         // Handle binary operations and comparisons - need to track operands
         if (node.op == .add or node.op == .sub or node.op == .mul or node.op == .div or
             node.op == .eq or node.op == .ne or node.op == .lt or node.op == .le or
-            node.op == .gt or node.op == .ge)
+            node.op == .gt or node.op == .ge or node.op == .@"or" or node.op == .@"and")
         {
             const ssa_op: ssa.Op = switch (node.op) {
                 .add => .add,
@@ -638,6 +686,8 @@ pub const Driver = struct {
                 .le => .le,
                 .gt => .gt,
                 .ge => .ge,
+                .@"or" => .@"or",
+                .@"and" => .@"and",
                 else => .add,
             };
             const value_id = try func.newValue(ssa_op, node.type_idx, block);
@@ -885,6 +935,89 @@ pub const Driver = struct {
             return value_id;
         }
 
+        // Handle map_new - no args, creates new map
+        if (node.op == .map_new) {
+            const value_id = try func.newValue(.map_new, node.type_idx, block);
+            return value_id;
+        }
+
+        // Handle map_set - args[0]=handle, args[1]=key_ptr, args[2]=key_len, args[3]=value
+        if (node.op == .map_set) {
+            const value_id = try func.newValue(.map_set, node.type_idx, block);
+            var value = func.getValue(value_id);
+            var arg_count: u8 = 0;
+            for (node.args()) |ir_arg_idx| {
+                if (ir_to_ssa.get(ir_arg_idx)) |ssa_arg_id| {
+                    if (arg_count < 3) {
+                        value.args_storage[arg_count] = ssa_arg_id;
+                        arg_count += 1;
+                    }
+                }
+            }
+            value.args_len = arg_count;
+            return value_id;
+        }
+
+        // Handle map_get - args[0]=handle, args[1]=key_ptr, args[2]=key_len
+        if (node.op == .map_get) {
+            const value_id = try func.newValue(.map_get, node.type_idx, block);
+            var value = func.getValue(value_id);
+            var arg_count: u8 = 0;
+            for (node.args()) |ir_arg_idx| {
+                if (ir_to_ssa.get(ir_arg_idx)) |ssa_arg_id| {
+                    if (arg_count < 3) {
+                        value.args_storage[arg_count] = ssa_arg_id;
+                        arg_count += 1;
+                    }
+                }
+            }
+            value.args_len = arg_count;
+            return value_id;
+        }
+
+        // Handle map_has - args[0]=handle, args[1]=key_ptr, args[2]=key_len
+        if (node.op == .map_has) {
+            const value_id = try func.newValue(.map_has, node.type_idx, block);
+            var value = func.getValue(value_id);
+            var arg_count: u8 = 0;
+            for (node.args()) |ir_arg_idx| {
+                if (ir_to_ssa.get(ir_arg_idx)) |ssa_arg_id| {
+                    if (arg_count < 3) {
+                        value.args_storage[arg_count] = ssa_arg_id;
+                        arg_count += 1;
+                    }
+                }
+            }
+            value.args_len = arg_count;
+            return value_id;
+        }
+
+        // Handle map_size - args[0]=handle
+        if (node.op == .map_size) {
+            const value_id = try func.newValue(.map_size, node.type_idx, block);
+            var value = func.getValue(value_id);
+            if (node.args_len > 0) {
+                if (ir_to_ssa.get(node.args()[0])) |ssa_val| {
+                    value.args_storage[0] = ssa_val;
+                    value.args_len = 1;
+                }
+            }
+            return value_id;
+        }
+
+        // Handle map_free - args[0]=handle
+        if (node.op == .map_free) {
+            const value_id = try func.newValue(.map_free, node.type_idx, block);
+            var value = func.getValue(value_id);
+            if (node.args_len > 0) {
+                if (ir_to_ssa.get(node.args()[0])) |ssa_val| {
+                    value.args_storage[0] = ssa_val;
+                    value.args_len = 1;
+                }
+            }
+            return value_id;
+        }
+
         // Convert IR op to SSA op
         const ssa_op: ssa.Op = switch (node.op) {
             .const_int => .const_int,
@@ -909,6 +1042,7 @@ pub const Driver = struct {
             .neg => .neg,
             .not => .not,
             .load => .load,
+            .local => .load, // Local variable load becomes SSA load
             .store => .store,
             .jump => .jump,
             .branch => .branch,
@@ -917,6 +1051,13 @@ pub const Driver = struct {
             .union_init => .union_init,
             .union_tag => .union_tag,
             .union_payload => .union_payload,
+            // Map operations (pass through to SSA)
+            .map_new => .map_new,
+            .map_set => .map_set,
+            .map_get => .map_get,
+            .map_has => .map_has,
+            .map_size => .map_size,
+            .map_free => .map_free,
             else => .copy, // Default fallback
         };
 
@@ -929,6 +1070,15 @@ pub const Driver = struct {
         value.aux_str = node.aux_str;  // For const_string
 
         return value_id;
+    }
+
+    /// Get the stack offset for a local variable from SSA function locals
+    fn getLocalOffset(self: *Driver, func: *const ssa.Func, local_idx: u32) i32 {
+        _ = self;
+        if (local_idx < func.locals.len) {
+            return func.locals[local_idx].offset;
+        }
+        return 0;
     }
 
     fn generateCode(self: *Driver, ssa_funcs: *std.ArrayList(ssa.Func)) ![]const u8 {
@@ -960,7 +1110,48 @@ pub const Driver = struct {
         // Track if we need a newline symbol for println
         var needs_newline = false;
 
-        // Collect print/println calls and add their strings to rodata
+        // Helper function to add a string to rodata
+        const addStringToRodata = struct {
+            fn add(
+                allocator: std.mem.Allocator,
+                rodata: *@TypeOf(rodata_section),
+                offsets: *std.StringHashMap(u32),
+                obj_ref: *object.ObjectFile,
+                sect_idx: usize,
+                str_val: *const ssa.Value,
+            ) !void {
+                if (str_val.op != .const_string) return;
+                const str_content = str_val.aux_str;
+                // Strip quotes
+                const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
+                    str_content[1 .. str_content.len - 1]
+                else
+                    str_content;
+
+                // Create symbol name
+                const sym_name = try std.fmt.allocPrint(allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
+
+                // Add to rodata with symbol if not present
+                if (!offsets.contains(sym_name)) {
+                    const offset: u32 = @intCast(rodata.*.size());
+                    try rodata.*.append(allocator, stripped);
+                    try rodata.*.append(allocator, &[_]u8{0});
+                    try offsets.put(sym_name, offset);
+
+                    // Add symbol for the string
+                    _ = try obj_ref.addSymbol(.{
+                        .name = sym_name,
+                        .kind = .data,
+                        .section = @intCast(sect_idx),
+                        .offset = offset,
+                        .size = @intCast(stripped.len + 1),
+                        .global = false,
+                    });
+                }
+            }
+        }.add;
+
+        // Collect string literals from print/println and map operations
         for (ssa_funcs.items) |*func| {
             for (func.blocks.items) |block| {
                 for (block.values.items) |value_id| {
@@ -976,35 +1167,34 @@ pub const Driver = struct {
                         const call_args = value.args();
                         if (call_args.len > 0) {
                             const arg_val = func.getValue(call_args[0]);
-                            if (arg_val.op == .const_string) {
-                                const str_content = arg_val.aux_str;
-                                // Strip quotes
-                                const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
-                                    str_content[1 .. str_content.len - 1]
-                                else
-                                    str_content;
+                            try addStringToRodata(self.allocator, &rodata_section, &string_offsets, &obj, rodata_idx, arg_val);
+                        }
+                    }
 
-                                // Create symbol name
-                                const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
+                    // Add strings used by map_set (args[1] is the key string)
+                    if (value.op == .map_set) {
+                        const map_args = value.args();
+                        if (map_args.len > 1) {
+                            const key_val = func.getValue(map_args[1]);
+                            try addStringToRodata(self.allocator, &rodata_section, &string_offsets, &obj, rodata_idx, key_val);
+                        }
+                    }
 
-                                // Add to rodata with symbol if not present
-                                if (!string_offsets.contains(sym_name)) {
-                                    const offset: u32 = @intCast(rodata_section.size());
-                                    try rodata_section.append(self.allocator, stripped);
-                                    try rodata_section.append(self.allocator, &[_]u8{0});
-                                    try string_offsets.put(sym_name, offset);
+                    // Add strings used by map_get (args[1] is the key string)
+                    if (value.op == .map_get) {
+                        const map_args = value.args();
+                        if (map_args.len > 1) {
+                            const key_val = func.getValue(map_args[1]);
+                            try addStringToRodata(self.allocator, &rodata_section, &string_offsets, &obj, rodata_idx, key_val);
+                        }
+                    }
 
-                                    // Add symbol for the string
-                                    _ = try obj.addSymbol(.{
-                                        .name = sym_name,
-                                        .kind = .data,
-                                        .section = rodata_idx,
-                                        .offset = offset,
-                                        .size = @intCast(stripped.len + 1),
-                                        .global = false,
-                                    });
-                                }
-                            }
+                    // Add strings used by map_has (args[1] is the key string)
+                    if (value.op == .map_has) {
+                        const map_args = value.args();
+                        if (map_args.len > 1) {
+                            const key_val = func.getValue(map_args[1]);
+                            try addStringToRodata(self.allocator, &rodata_section, &string_offsets, &obj, rodata_idx, key_val);
                         }
                     }
                 }
@@ -1154,7 +1344,10 @@ pub const Driver = struct {
                     // Check if function makes calls (needs to save link register)
                     var has_calls = false;
                     for (func.values.items) |value| {
-                        if (value.op == .call) {
+                        if (value.op == .call or value.op == .map_new or value.op == .map_set or
+                            value.op == .map_get or value.op == .map_has or value.op == .map_size or
+                            value.op == .map_free)
+                        {
                             has_calls = true;
                             break;
                         }
@@ -1549,10 +1742,11 @@ pub const Driver = struct {
             },
             .select => {
                 // Conditional select: args[0] = cond, args[1] = then, args[2] = else
-                // The condition (eq/ne/lt/etc) has already set flags
-                // Load else value into rax, then value into r8, cmove to select
+                // The condition (eq/ne/lt/etc or or) has already set flags
+                // Load else value into rax, then value into r8, cmov to select
                 const args = value.args();
                 if (args.len >= 3) {
+                    const cond_val = func.getValue(args[0]);
                     const else_val = func.getValue(args[2]);
                     const then_val = func.getValue(args[1]);
 
@@ -1575,8 +1769,15 @@ pub const Driver = struct {
                         try x86_64.movRegMem(buf, .r8, .rbp, local_offset);
                     }
 
-                    // cmove: if equal (ZF=1), move r8 to rax
-                    try x86_64.cmoveRegReg(buf, .rax, .r8);
+                    // Use appropriate cmov based on condition type
+                    // For 'or': result in r10, cmp r10, 0 sets ZF=0 if any true
+                    //   So we use cmovne to select "then" when at least one was true
+                    // For 'eq' and other comparisons: cmove (if ZF=1)
+                    if (cond_val.op == .@"or") {
+                        try x86_64.cmovneRegReg(buf, .rax, .r8);
+                    } else {
+                        try x86_64.cmoveRegReg(buf, .rax, .r8);
+                    }
                 }
             },
             .branch, .jump => {
@@ -1762,7 +1963,8 @@ pub const Driver = struct {
                             }
                         } else if (val.op == .add or val.op == .sub or val.op == .mul or val.op == .div or
                             val.op == .load or val.op == .call or val.op == .field or val.op == .index or
-                            val.op == .slice_index or val.op == .union_payload)
+                            val.op == .slice_index or val.op == .union_payload or
+                            val.op == .map_new or val.op == .map_get or val.op == .map_has or val.op == .map_size)
                         {
                             // Operations that leave result in rax - store directly
                             use_rax_directly = true;
@@ -1836,12 +2038,275 @@ pub const Driver = struct {
                     }
                 }
             },
+            .@"or" => {
+                // Logical OR: combine two comparison results
+                // Strategy: capture each comparison result as 0/1, then OR them
+                const args = value.args();
+                if (args.len >= 2) {
+                    const left = func.getValue(args[0]);
+                    const right = func.getValue(args[1]);
+
+                    // Get left comparison result into r10
+                    if (left.op == .eq or left.op == .ne or left.op == .lt or
+                        left.op == .le or left.op == .gt or left.op == .ge)
+                    {
+                        // Re-generate the comparison
+                        try self.generateX86Comparison(buf, func, left.*);
+                        // r10 = 0, r11 = 1, then cmove/cmovne based on condition
+                        try x86_64.xorRegReg(buf, .r10, .r10); // r10 = 0
+                        try x86_64.movRegImm64(buf, .r11, 1); // r11 = 1
+                        // Use appropriate cmov for the comparison type
+                        // For eq: cmove (if ZF=1)
+                        // For now, all our comparisons use eq for the condition
+                        try x86_64.cmoveRegReg(buf, .r10, .r11);
+                    } else if (left.op == .@"or") {
+                        // Left is already an OR - its result should be in r10
+                        // Just keep it
+                    }
+
+                    // Get right comparison result into r11
+                    if (right.op == .eq or right.op == .ne or right.op == .lt or
+                        right.op == .le or right.op == .gt or right.op == .ge)
+                    {
+                        // Re-generate the comparison
+                        try self.generateX86Comparison(buf, func, right.*);
+                        // r11 = 0, r12 = 1, then cmove
+                        try x86_64.xorRegReg(buf, .r11, .r11); // r11 = 0
+                        try x86_64.movRegImm64(buf, .r12, 1); // r12 = 1
+                        try x86_64.cmoveRegReg(buf, .r11, .r12);
+                    } else if (right.op == .@"or") {
+                        // Right is already an OR - recurse handled its result in r10
+                        // Move to r11
+                        try x86_64.movRegReg(buf, .r11, .r10);
+                    }
+
+                    // Combine: or r10, r11
+                    try x86_64.orRegReg(buf, .r10, .r11);
+
+                    // Set flags for subsequent select: cmp r10, 0
+                    // If r10 > 0, at least one was true (ZF = 0)
+                    // If r10 == 0, both false (ZF = 1)
+                    try x86_64.cmpRegImm32(buf, .r10, 0);
+                }
+            },
+            // Map operations - call runtime library functions
+            .map_new => {
+                // Call cot_map_new() - no arguments, returns handle in rax
+                const map_new_name = if (self.options.target.os == .macos) "_cot_map_new" else "cot_map_new";
+                try x86_64.callSymbol(buf, map_new_name);
+                // Result is in rax
+            },
+            .map_set => {
+                // Call cot_map_set(handle, key_ptr, key_len, value) - 4 args
+                // System V AMD64 ABI: rdi=handle, rsi=key_ptr, rdx=key_len, rcx=value
+                // Lowerer emits: args[0]=handle, args[1]=key, args[2]=value
+                const args = value.args();
+
+                // Load handle from local into rdi
+                if (args.len > 0) {
+                    const handle_val = func.getValue(args[0]);
+                    if (handle_val.op == .load or handle_val.op == .copy) {
+                        // Load from stack slot
+                        const local_idx: u32 = @intCast(handle_val.aux_int);
+                        const offset = self.getLocalOffset(func, local_idx);
+                        try x86_64.movRegMem(buf, .rdi, .rbp, offset);
+                    } else if (handle_val.op == .const_int) {
+                        try x86_64.movRegImm64(buf, .rdi, handle_val.aux_int);
+                    }
+                }
+
+                // Load key_ptr and key_len from key string
+                if (args.len > 1) {
+                    const key_val = func.getValue(args[1]);
+                    if (key_val.op == .const_string) {
+                        const str_content = key_val.aux_str;
+                        const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
+                            str_content[1 .. str_content.len - 1]
+                        else
+                            str_content;
+                        const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
+                        // rsi = key_ptr
+                        try x86_64.leaRipSymbol(buf, .rsi, sym_name);
+                        // rdx = key_len
+                        try x86_64.movRegImm64(buf, .rdx, @intCast(stripped.len));
+                    }
+                }
+
+                // Load value into rcx
+                if (args.len > 2) {
+                    const val_val = func.getValue(args[2]);
+                    if (val_val.op == .const_int) {
+                        try x86_64.movRegImm64(buf, .rcx, val_val.aux_int);
+                    } else if (val_val.op == .load or val_val.op == .copy) {
+                        const local_idx: u32 = @intCast(val_val.aux_int);
+                        const offset = self.getLocalOffset(func, local_idx);
+                        try x86_64.movRegMem(buf, .rcx, .rbp, offset);
+                    }
+                }
+
+                const map_set_name = if (self.options.target.os == .macos) "_cot_map_set" else "cot_map_set";
+                try x86_64.callSymbol(buf, map_set_name);
+                // Result is in rax
+            },
+            .map_get => {
+                // Call cot_map_get(handle, key_ptr, key_len) - 3 args
+                // System V AMD64 ABI: rdi=handle, rsi=key_ptr, rdx=key_len
+                // Lowerer emits: args[0]=handle, args[1]=key
+                const args = value.args();
+
+                // Load handle from local into rdi
+                if (args.len > 0) {
+                    const handle_val = func.getValue(args[0]);
+                    if (handle_val.op == .load or handle_val.op == .copy) {
+                        const local_idx: u32 = @intCast(handle_val.aux_int);
+                        const offset = self.getLocalOffset(func, local_idx);
+                        try x86_64.movRegMem(buf, .rdi, .rbp, offset);
+                    } else if (handle_val.op == .const_int) {
+                        try x86_64.movRegImm64(buf, .rdi, handle_val.aux_int);
+                    }
+                }
+
+                // Load key_ptr and key_len from key string
+                if (args.len > 1) {
+                    const key_val = func.getValue(args[1]);
+                    if (key_val.op == .const_string) {
+                        const str_content = key_val.aux_str;
+                        const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
+                            str_content[1 .. str_content.len - 1]
+                        else
+                            str_content;
+                        const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
+                        // rsi = key_ptr
+                        try x86_64.leaRipSymbol(buf, .rsi, sym_name);
+                        // rdx = key_len
+                        try x86_64.movRegImm64(buf, .rdx, @intCast(stripped.len));
+                    }
+                }
+
+                const map_get_name = if (self.options.target.os == .macos) "_cot_map_get" else "cot_map_get";
+                try x86_64.callSymbol(buf, map_get_name);
+                // Result is in rax
+            },
+            .map_has => {
+                // Call cot_map_has(handle, key_ptr, key_len) - 3 args
+                // System V AMD64 ABI: rdi=handle, rsi=key_ptr, rdx=key_len
+                // Lowerer emits: args[0]=handle, args[1]=key
+                const args = value.args();
+
+                // Load handle from local into rdi
+                if (args.len > 0) {
+                    const handle_val = func.getValue(args[0]);
+                    if (handle_val.op == .load or handle_val.op == .copy) {
+                        const local_idx: u32 = @intCast(handle_val.aux_int);
+                        const offset = self.getLocalOffset(func, local_idx);
+                        try x86_64.movRegMem(buf, .rdi, .rbp, offset);
+                    } else if (handle_val.op == .const_int) {
+                        try x86_64.movRegImm64(buf, .rdi, handle_val.aux_int);
+                    }
+                }
+
+                // Load key_ptr and key_len from key string
+                if (args.len > 1) {
+                    const key_val = func.getValue(args[1]);
+                    if (key_val.op == .const_string) {
+                        const str_content = key_val.aux_str;
+                        const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
+                            str_content[1 .. str_content.len - 1]
+                        else
+                            str_content;
+                        const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
+                        // rsi = key_ptr
+                        try x86_64.leaRipSymbol(buf, .rsi, sym_name);
+                        // rdx = key_len
+                        try x86_64.movRegImm64(buf, .rdx, @intCast(stripped.len));
+                    }
+                }
+
+                const map_has_name = if (self.options.target.os == .macos) "_cot_map_has" else "cot_map_has";
+                try x86_64.callSymbol(buf, map_has_name);
+                // Result is in rax
+            },
+            .map_size => {
+                // Call cot_map_size(handle) - 1 arg
+                // Lowerer emits: args[0]=handle
+                const args = value.args();
+                if (args.len > 0) {
+                    const handle_val = func.getValue(args[0]);
+                    if (handle_val.op == .load or handle_val.op == .copy) {
+                        const local_idx: u32 = @intCast(handle_val.aux_int);
+                        const offset = self.getLocalOffset(func, local_idx);
+                        try x86_64.movRegMem(buf, .rdi, .rbp, offset);
+                    } else if (handle_val.op == .const_int) {
+                        try x86_64.movRegImm64(buf, .rdi, handle_val.aux_int);
+                    }
+                }
+                const map_size_name = if (self.options.target.os == .macos) "_cot_map_size" else "cot_map_size";
+                try x86_64.callSymbol(buf, map_size_name);
+                // Result is in rax
+            },
+            .map_free => {
+                // Call cot_map_free(handle) - 1 arg, no return
+                // Lowerer emits: args[0]=handle
+                const args = value.args();
+                if (args.len > 0) {
+                    const handle_val = func.getValue(args[0]);
+                    if (handle_val.op == .load or handle_val.op == .copy) {
+                        const local_idx: u32 = @intCast(handle_val.aux_int);
+                        const offset = self.getLocalOffset(func, local_idx);
+                        try x86_64.movRegMem(buf, .rdi, .rbp, offset);
+                    } else if (handle_val.op == .const_int) {
+                        try x86_64.movRegImm64(buf, .rdi, handle_val.aux_int);
+                    }
+                }
+                const map_free_name = if (self.options.target.os == .macos) "_cot_map_free" else "cot_map_free";
+                try x86_64.callSymbol(buf, map_free_name);
+            },
             else => {
                 // Warn about unhandled ops in debug mode
                 if (self.options.debug_codegen) {
                     std.debug.print("  [WARN] Unhandled x86_64 SSA op: {s}\n", .{@tagName(value.op)});
                 }
             },
+        }
+    }
+
+    /// Generate x86_64 code for a comparison operation (helper for or/and)
+    fn generateX86Comparison(self: *Driver, buf: *be.CodeBuffer, func: *ssa.Func, cmp_value: ssa.Value) !void {
+        _ = self;
+        const arg_regs = [_]x86_64.Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
+        const cmp_args = cmp_value.args();
+        if (cmp_args.len >= 2) {
+            const left = func.getValue(cmp_args[0]);
+            const right = func.getValue(cmp_args[1]);
+
+            // Load left operand into r8
+            if (left.op == .const_int) {
+                try x86_64.movRegImm64(buf, .r8, left.aux_int);
+            } else if (left.op == .arg) {
+                const idx: u32 = @intCast(left.aux_int);
+                if (idx < arg_regs.len) {
+                    try x86_64.movRegReg(buf, .r8, arg_regs[idx]);
+                }
+            } else if (left.op == .load) {
+                const local_idx: usize = @intCast(left.aux_int);
+                const local_offset: i32 = func.locals[local_idx].offset;
+                try x86_64.movRegMem(buf, .r8, .rbp, local_offset);
+            }
+
+            // Compare with right operand
+            if (right.op == .const_int) {
+                try x86_64.cmpRegImm32(buf, .r8, @intCast(right.aux_int));
+            } else if (right.op == .arg) {
+                const idx: u32 = @intCast(right.aux_int);
+                if (idx < arg_regs.len) {
+                    try x86_64.cmpRegReg(buf, .r8, arg_regs[idx]);
+                }
+            } else if (right.op == .load) {
+                const local_idx: usize = @intCast(right.aux_int);
+                const local_offset: i32 = func.locals[local_idx].offset;
+                try x86_64.movRegMem(buf, .r9, .rbp, local_offset);
+                try x86_64.cmpRegReg(buf, .r8, .r9);
+            }
         }
     }
 
@@ -2026,9 +2491,10 @@ pub const Driver = struct {
         const arg_regs = [_]aarch64.Reg{ .x0, .x1, .x2, .x3, .x4, .x5, .x6, .x7 };
 
         switch (value.op) {
-            .const_int, .const_bool, .const_string, .arg => {
+            .const_int, .const_bool, .const_string, .arg, .load => {
                 // These are handled as operands when used by other ops.
                 // Don't generate standalone code for them.
+                // .load values are consumed inline when referenced by add, ret, map_*, etc.
             },
             .add => {
                 // Binary add: look up both operands
@@ -2049,7 +2515,7 @@ pub const Driver = struct {
                         // Load from local variable into x0
                         const local_idx: usize = @intCast(left.aux_int);
                         const x86_offset: i32 = func.locals[local_idx].offset;
-                        const local_offset: i32 = @as(i32, @intCast(func.frame_size)) + x86_offset;
+                        const local_offset: i32 = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
                         if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
                             const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
                             try aarch64.ldrRegImm(buf, .x0, .sp, offset_scaled);
@@ -2070,7 +2536,7 @@ pub const Driver = struct {
                         // Load from local variable into x9 and add
                         const local_idx: usize = @intCast(right.aux_int);
                         const x86_offset: i32 = func.locals[local_idx].offset;
-                        const local_offset: i32 = @as(i32, @intCast(func.frame_size)) + x86_offset;
+                        const local_offset: i32 = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
                         if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
                             const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
                             try aarch64.ldrRegImm(buf, .x9, .sp, offset_scaled);
@@ -2216,7 +2682,7 @@ pub const Driver = struct {
                         // Load from local variable into x0
                         const local_idx: usize = @intCast(ret_val.aux_int);
                         const x86_offset: i32 = func.locals[local_idx].offset;
-                        const local_offset: i32 = @as(i32, @intCast(func.frame_size)) + x86_offset;
+                        const local_offset: i32 = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
                         if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
                             const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
                             try aarch64.ldrRegImm(buf, .x0, .sp, offset_scaled);
@@ -2254,7 +2720,7 @@ pub const Driver = struct {
                         // Load from local variable into x8
                         const local_idx: usize = @intCast(left.aux_int);
                         const x86_offset: i32 = func.locals[local_idx].offset;
-                        const local_offset: i32 = @as(i32, @intCast(func.frame_size)) + x86_offset;
+                        const local_offset: i32 = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
                         if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
                             const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
                             try aarch64.ldrRegImm(buf, .x8, .sp, offset_scaled);
@@ -2275,7 +2741,7 @@ pub const Driver = struct {
                         // Load from local variable into x9 and compare
                         const local_idx: usize = @intCast(right.aux_int);
                         const x86_offset: i32 = func.locals[local_idx].offset;
-                        const local_offset: i32 = @as(i32, @intCast(func.frame_size)) + x86_offset;
+                        const local_offset: i32 = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
                         if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
                             const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
                             try aarch64.ldrRegImm(buf, .x9, .sp, offset_scaled);
@@ -2291,10 +2757,11 @@ pub const Driver = struct {
             },
             .select => {
                 // Conditional select: args[0] = cond, args[1] = then, args[2] = else
-                // The condition (eq/ne/lt/etc) has already set flags
-                // Use CSEL: csel x0, x8 (then), x9 (else), eq
+                // The condition (eq/ne/lt/etc or or) has already set flags
+                // Use CSEL: csel x0, x8 (then), x9 (else), cond
                 const args = value.args();
                 if (args.len >= 3) {
+                    const cond_val = func.getValue(args[0]);
                     const else_val = func.getValue(args[2]);
                     const then_val = func.getValue(args[1]);
 
@@ -2304,7 +2771,7 @@ pub const Driver = struct {
                     } else if (else_val.op == .load) {
                         const local_idx: usize = @intCast(else_val.aux_int);
                         const x86_offset: i32 = func.locals[local_idx].offset;
-                        const local_offset: i32 = @as(i32, @intCast(func.frame_size)) + x86_offset;
+                        const local_offset: i32 = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
                         if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
                             const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
                             try aarch64.ldrRegImm(buf, .x9, .sp, offset_scaled);
@@ -2320,15 +2787,28 @@ pub const Driver = struct {
                     } else if (then_val.op == .load) {
                         const local_idx: usize = @intCast(then_val.aux_int);
                         const x86_offset: i32 = func.locals[local_idx].offset;
-                        const local_offset: i32 = @as(i32, @intCast(func.frame_size)) + x86_offset;
+                        const local_offset: i32 = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
                         if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
                             const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
                             try aarch64.ldrRegImm(buf, .x8, .sp, offset_scaled);
                         }
                     }
 
-                    // CSEL x0, x8, x9, eq: if equal, x0 = x8 (then), else x0 = x9 (else)
-                    try aarch64.csel(buf, .x0, .x8, .x9, .eq);
+                    // Determine condition for csel based on the condition operation
+                    // For 'or': result is in x10, cmp x10, #0 sets ZF=0 if any true
+                    //   So we use .ne to select "then" when at least one was true
+                    // For 'eq' and other comparisons: use the corresponding condition
+                    const cond: aarch64.Cond = switch (cond_val.op) {
+                        .@"or" => .ne, // x10 != 0 means at least one was true
+                        .eq => .eq,
+                        .ne => .ne,
+                        .lt => .lt,
+                        .le => .le,
+                        .gt => .gt,
+                        .ge => .ge,
+                        else => .eq,
+                    };
+                    try aarch64.csel(buf, .x0, .x8, .x9, cond);
                 }
             },
             .branch => {
@@ -2373,10 +2853,9 @@ pub const Driver = struct {
                     const val = func.getValue(val_id);
                     const field_offset: i32 = @intCast(value.aux_int);
 
-                    // Convert x86-style negative offset to ARM64 positive sp-relative offset
-                    // arm64_offset = frame_size + x86_offset
+                    // Convert x86-style offset to ARM64 sp-relative offset using centralized function
                     const x86_offset: i32 = func.locals[@intCast(local_idx)].offset;
-                    const local_offset: i32 = @as(i32, @intCast(func.frame_size)) + x86_offset;
+                    const local_offset: i32 = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
                     const total_offset: i32 = local_offset + field_offset;
 
                     // Check if storing a slice (slice_make leaves ptr in x0, len in x1)
@@ -2409,7 +2888,8 @@ pub const Driver = struct {
                             }
                         } else if (val.op == .add or val.op == .sub or val.op == .mul or val.op == .div or
                             val.op == .load or val.op == .call or val.op == .field or val.op == .index or
-                            val.op == .slice_index or val.op == .union_payload)
+                            val.op == .slice_index or val.op == .union_payload or
+                            val.op == .map_new or val.op == .map_get or val.op == .map_has or val.op == .map_size)
                         {
                             // Operations that leave result in x0 - store directly
                             use_x0_directly = true;
@@ -2438,7 +2918,7 @@ pub const Driver = struct {
 
                     // Convert x86-style negative offset to ARM64 positive sp-relative offset
                     const x86_offset: i32 = func.locals[@intCast(local_idx)].offset;
-                    const local_offset: i32 = @as(i32, @intCast(func.frame_size)) + x86_offset;
+                    const local_offset: i32 = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
 
                     // Load from [sp + local_offset + field_offset]
                     const total_offset: i32 = local_offset + field_offset;
@@ -2463,7 +2943,7 @@ pub const Driver = struct {
 
                     // Get base stack offset for local (convert x86 negative to ARM64 positive)
                     const x86_offset: i32 = func.locals[@intCast(local_idx)].offset;
-                    const local_offset: i32 = @as(i32, @intCast(func.frame_size)) + x86_offset;
+                    const local_offset: i32 = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
 
                     // Get index value into x9
                     if (idx_val.op == .const_int) {
@@ -2477,7 +2957,7 @@ pub const Driver = struct {
                         // Load from a local variable using computed offset
                         const idx_local: usize = @intCast(idx_val.aux_int);
                         const idx_x86_offset: i32 = func.locals[idx_local].offset;
-                        const idx_sp_offset: i32 = @as(i32, @intCast(func.frame_size)) + idx_x86_offset;
+                        const idx_sp_offset: i32 = FrameLayout.aarch64LocalOffset(idx_x86_offset, func.frame_size);
                         if (idx_sp_offset >= 0 and @mod(idx_sp_offset, 8) == 0) {
                             const idx_scaled: u12 = @intCast(@divExact(idx_sp_offset, 8));
                             try aarch64.ldrRegImm(buf, .x9, .sp, idx_scaled);
@@ -2520,7 +3000,7 @@ pub const Driver = struct {
 
                     // Get array base address into x8
                     const x86_offset: i32 = func.locals[@intCast(local_idx)].offset;
-                    const local_offset: i32 = @as(i32, @intCast(func.frame_size)) + x86_offset;
+                    const local_offset: i32 = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
 
                     if (local_offset >= 0 and local_offset <= 4095) {
                         try aarch64.addRegImm12(buf, .x8, .sp, @intCast(local_offset));
@@ -2561,7 +3041,7 @@ pub const Driver = struct {
 
                     // Get slice's stack offset (convert x86 negative to ARM64 positive)
                     const x86_offset: i32 = func.locals[@intCast(local_idx)].offset;
-                    const local_offset: i32 = @as(i32, @intCast(func.frame_size)) + x86_offset;
+                    const local_offset: i32 = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
 
                     // Load slice ptr (first 8 bytes) into x8
                     if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
@@ -2580,7 +3060,7 @@ pub const Driver = struct {
                     } else if (idx_val.op == .load) {
                         const idx_local: usize = @intCast(idx_val.aux_int);
                         const idx_x86_offset: i32 = func.locals[idx_local].offset;
-                        const idx_sp_offset: i32 = @as(i32, @intCast(func.frame_size)) + idx_x86_offset;
+                        const idx_sp_offset: i32 = FrameLayout.aarch64LocalOffset(idx_x86_offset, func.frame_size);
                         if (idx_sp_offset >= 0 and @mod(idx_sp_offset, 8) == 0) {
                             const idx_scaled: u12 = @intCast(@divExact(idx_sp_offset, 8));
                             try aarch64.ldrRegImm(buf, .x9, .sp, idx_scaled);
@@ -2639,7 +3119,7 @@ pub const Driver = struct {
                         const local_idx: usize = @intCast(union_val.aux_int);
                         const x86_offset: i32 = func.locals[local_idx].offset;
                         // Convert x86 (rbp-relative negative) to ARM (sp-relative positive)
-                        const local_offset: i32 = @as(i32, @intCast(func.frame_size)) + x86_offset;
+                        const local_offset: i32 = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
                         if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
                             const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
                             try aarch64.ldrRegImm(buf, .x0, .sp, offset_scaled);
@@ -2660,7 +3140,7 @@ pub const Driver = struct {
                         const x86_offset: i32 = func.locals[local_idx].offset;
                         // Convert x86 (rbp-relative negative) to ARM (sp-relative positive)
                         // Add 8 for payload offset within union
-                        const local_offset: i32 = @as(i32, @intCast(func.frame_size)) + x86_offset + 8;
+                        const local_offset: i32 = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size) + 8;
                         if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
                             const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
                             try aarch64.ldrRegImm(buf, .x0, .sp, offset_scaled);
@@ -2668,12 +3148,331 @@ pub const Driver = struct {
                     }
                 }
             },
+            .@"or" => {
+                // Logical OR: combine two comparison results
+                // Strategy: capture each comparison result as 0/1, then OR them
+                const args = value.args();
+                if (args.len >= 2) {
+                    const left = func.getValue(args[0]);
+                    const right = func.getValue(args[1]);
+
+                    // Helper to get comparison result into x10 or x11
+                    // After comparison, use csel to convert flags to 0/1
+
+                    // Load 1 and 0 for csel
+                    try aarch64.movRegImm64(buf, .x12, 1);
+
+                    // Get left comparison result
+                    if (left.op == .eq or left.op == .ne or left.op == .lt or
+                        left.op == .le or left.op == .gt or left.op == .ge)
+                    {
+                        // Re-generate the comparison
+                        try self.generateAArch64Comparison(buf, func, left.*);
+                        // csel x10, x12, xzr, eq - x10 = 1 if equal, else 0
+                        const cond: aarch64.Cond = switch (left.op) {
+                            .eq => .eq,
+                            .ne => .ne,
+                            .lt => .lt,
+                            .le => .le,
+                            .gt => .gt,
+                            .ge => .ge,
+                            else => .eq,
+                        };
+                        try aarch64.csel(buf, .x10, .x12, aarch64.zr, cond);
+                    } else if (left.op == .@"or") {
+                        // Left is already an OR - its result should be in x10
+                        // Just keep it
+                    }
+
+                    // Get right comparison result
+                    if (right.op == .eq or right.op == .ne or right.op == .lt or
+                        right.op == .le or right.op == .gt or right.op == .ge)
+                    {
+                        // Re-generate the comparison
+                        try self.generateAArch64Comparison(buf, func, right.*);
+                        // csel x11, x12, xzr, eq - x11 = 1 if equal, else 0
+                        const cond: aarch64.Cond = switch (right.op) {
+                            .eq => .eq,
+                            .ne => .ne,
+                            .lt => .lt,
+                            .le => .le,
+                            .gt => .gt,
+                            .ge => .ge,
+                            else => .eq,
+                        };
+                        try aarch64.csel(buf, .x11, .x12, aarch64.zr, cond);
+                    } else if (right.op == .@"or") {
+                        // Right is already an OR - recurse handled its result
+                        // Move it to x11 if needed
+                        try aarch64.movRegReg(buf, .x11, .x10);
+                    }
+
+                    // Combine: orr x10, x10, x11
+                    try aarch64.orrRegReg(buf, .x10, .x10, .x11);
+
+                    // Set flags for subsequent select: cmp x10, #0
+                    // If x10 > 0, at least one was true (ZF = 0)
+                    // If x10 == 0, both false (ZF = 1)
+                    try aarch64.cmpRegImm12(buf, .x10, 0);
+                }
+            },
+            // Map operations - call runtime library functions
+            .map_new => {
+                // Call cot_map_new() - no arguments, returns handle in x0
+                const map_new_name = if (self.options.target.os == .macos) "_cot_map_new" else "cot_map_new";
+                try aarch64.callSymbol(buf, map_new_name);
+                // Result is in x0
+            },
+            .map_set => {
+                // Call cot_map_set(handle, key_ptr, key_len, value) - 4 args
+                // AArch64 ABI: x0=handle, x1=key_ptr, x2=key_len, x3=value
+                // Lowerer emits: args[0]=handle, args[1]=key, args[2]=value
+                const args = value.args();
+
+                // Load handle from local into x0
+                if (args.len > 0) {
+                    const handle_val = func.getValue(args[0]);
+                    if (handle_val.op == .load or handle_val.op == .copy) {
+                        // Use centralized offset calculation to prevent memory corruption
+                        const local_idx: u32 = @intCast(handle_val.aux_int);
+                        const x86_offset = self.getLocalOffset(func, local_idx);
+                        const local_offset = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
+                        if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
+                            const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
+                            try aarch64.ldrRegImm(buf, .x0, .sp, offset_scaled);
+                        }
+                    } else if (handle_val.op == .const_int) {
+                        try aarch64.movRegImm64(buf, .x0, handle_val.aux_int);
+                    }
+                }
+
+                // Load key_ptr and key_len from key string
+                if (args.len > 1) {
+                    const key_val = func.getValue(args[1]);
+                    if (key_val.op == .const_string) {
+                        const str_content = key_val.aux_str;
+                        const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
+                            str_content[1 .. str_content.len - 1]
+                        else
+                            str_content;
+                        const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
+                        // x1 = key_ptr
+                        try aarch64.loadSymbolAddr(buf, .x1, sym_name);
+                        // x2 = key_len
+                        try aarch64.movRegImm64(buf, .x2, @intCast(stripped.len));
+                    }
+                }
+
+                // Load value into x3
+                if (args.len > 2) {
+                    const val_val = func.getValue(args[2]);
+                    if (val_val.op == .const_int) {
+                        try aarch64.movRegImm64(buf, .x3, val_val.aux_int);
+                    } else if (val_val.op == .load or val_val.op == .copy) {
+                        const local_idx: u32 = @intCast(val_val.aux_int);
+                        const x86_offset = self.getLocalOffset(func, local_idx);
+                        const local_offset = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
+                        if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
+                            const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
+                            try aarch64.ldrRegImm(buf, .x3, .sp, offset_scaled);
+                        }
+                    }
+                }
+
+                const map_set_name = if (self.options.target.os == .macos) "_cot_map_set" else "cot_map_set";
+                try aarch64.callSymbol(buf, map_set_name);
+                // Result is in x0
+            },
+            .map_get => {
+                // Call cot_map_get(handle, key_ptr, key_len) - 3 args
+                // AArch64 ABI: x0=handle, x1=key_ptr, x2=key_len
+                // Lowerer emits: args[0]=handle, args[1]=key
+                const args = value.args();
+
+                // Load handle from local into x0
+                if (args.len > 0) {
+                    const handle_val = func.getValue(args[0]);
+                    if (handle_val.op == .load or handle_val.op == .copy) {
+                        // Use centralized offset calculation to prevent memory corruption
+                        const local_idx: u32 = @intCast(handle_val.aux_int);
+                        const x86_offset = self.getLocalOffset(func, local_idx);
+                        const local_offset = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
+                        if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
+                            const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
+                            try aarch64.ldrRegImm(buf, .x0, .sp, offset_scaled);
+                        }
+                    } else if (handle_val.op == .const_int) {
+                        try aarch64.movRegImm64(buf, .x0, handle_val.aux_int);
+                    }
+                }
+
+                // Load key_ptr and key_len from key string
+                if (args.len > 1) {
+                    const key_val = func.getValue(args[1]);
+                    if (key_val.op == .const_string) {
+                        const str_content = key_val.aux_str;
+                        const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
+                            str_content[1 .. str_content.len - 1]
+                        else
+                            str_content;
+                        const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
+                        // x1 = key_ptr
+                        try aarch64.loadSymbolAddr(buf, .x1, sym_name);
+                        // x2 = key_len
+                        try aarch64.movRegImm64(buf, .x2, @intCast(stripped.len));
+                    }
+                }
+
+                const map_get_name = if (self.options.target.os == .macos) "_cot_map_get" else "cot_map_get";
+                try aarch64.callSymbol(buf, map_get_name);
+                // Result is in x0
+            },
+            .map_has => {
+                // Call cot_map_has(handle, key_ptr, key_len) - 3 args
+                // AArch64 ABI: x0=handle, x1=key_ptr, x2=key_len
+                // Lowerer emits: args[0]=handle, args[1]=key
+                const args = value.args();
+
+                // Load handle from local into x0
+                if (args.len > 0) {
+                    const handle_val = func.getValue(args[0]);
+                    if (handle_val.op == .load or handle_val.op == .copy) {
+                        // Use centralized offset calculation to prevent memory corruption
+                        const local_idx: u32 = @intCast(handle_val.aux_int);
+                        const x86_offset = self.getLocalOffset(func, local_idx);
+                        const local_offset = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
+                        if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
+                            const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
+                            try aarch64.ldrRegImm(buf, .x0, .sp, offset_scaled);
+                        }
+                    } else if (handle_val.op == .const_int) {
+                        try aarch64.movRegImm64(buf, .x0, handle_val.aux_int);
+                    }
+                }
+
+                // Load key_ptr and key_len from key string
+                if (args.len > 1) {
+                    const key_val = func.getValue(args[1]);
+                    if (key_val.op == .const_string) {
+                        const str_content = key_val.aux_str;
+                        const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
+                            str_content[1 .. str_content.len - 1]
+                        else
+                            str_content;
+                        const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
+                        // x1 = key_ptr
+                        try aarch64.loadSymbolAddr(buf, .x1, sym_name);
+                        // x2 = key_len
+                        try aarch64.movRegImm64(buf, .x2, @intCast(stripped.len));
+                    }
+                }
+
+                const map_has_name = if (self.options.target.os == .macos) "_cot_map_has" else "cot_map_has";
+                try aarch64.callSymbol(buf, map_has_name);
+                // Result is in x0
+            },
+            .map_size => {
+                // Call cot_map_size(handle) - 1 arg
+                // Lowerer emits: args[0]=handle
+                const args = value.args();
+
+                if (args.len > 0) {
+                    const handle_val = func.getValue(args[0]);
+                    if (handle_val.op == .load or handle_val.op == .copy) {
+                        // Use centralized offset calculation to prevent memory corruption
+                        const local_idx: u32 = @intCast(handle_val.aux_int);
+                        const x86_offset = self.getLocalOffset(func, local_idx);
+                        const local_offset = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
+                        if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
+                            const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
+                            try aarch64.ldrRegImm(buf, .x0, .sp, offset_scaled);
+                        }
+                    } else if (handle_val.op == .const_int) {
+                        try aarch64.movRegImm64(buf, .x0, handle_val.aux_int);
+                    }
+                }
+                const map_size_name = if (self.options.target.os == .macos) "_cot_map_size" else "cot_map_size";
+                try aarch64.callSymbol(buf, map_size_name);
+                // Result is in x0
+            },
+            .map_free => {
+                // Call cot_map_free(handle) - 1 arg, no return
+                // Lowerer emits: args[0]=handle
+                const args = value.args();
+
+                if (args.len > 0) {
+                    const handle_val = func.getValue(args[0]);
+                    if (handle_val.op == .load or handle_val.op == .copy) {
+                        // Use centralized offset calculation to prevent memory corruption
+                        const local_idx: u32 = @intCast(handle_val.aux_int);
+                        const x86_offset = self.getLocalOffset(func, local_idx);
+                        const local_offset = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
+                        if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
+                            const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
+                            try aarch64.ldrRegImm(buf, .x0, .sp, offset_scaled);
+                        }
+                    } else if (handle_val.op == .const_int) {
+                        try aarch64.movRegImm64(buf, .x0, handle_val.aux_int);
+                    }
+                }
+                const map_free_name = if (self.options.target.os == .macos) "_cot_map_free" else "cot_map_free";
+                try aarch64.callSymbol(buf, map_free_name);
+            },
             else => {
                 // Warn about unhandled ops in debug mode
                 if (self.options.debug_codegen) {
                     std.debug.print("  [WARN] Unhandled AArch64 SSA op: {s}\n", .{@tagName(value.op)});
                 }
             },
+        }
+    }
+
+    /// Generate ARM64 code for a comparison operation (helper for or/and)
+    fn generateAArch64Comparison(self: *Driver, buf: *be.CodeBuffer, func: *ssa.Func, cmp_value: ssa.Value) !void {
+        _ = self;
+        const arg_regs = [_]aarch64.Reg{ .x0, .x1, .x2, .x3, .x4, .x5, .x6, .x7 };
+        const cmp_args = cmp_value.args();
+        if (cmp_args.len >= 2) {
+            const left = func.getValue(cmp_args[0]);
+            const right = func.getValue(cmp_args[1]);
+
+            // Load left operand into x8
+            if (left.op == .const_int) {
+                try aarch64.movRegImm64(buf, .x8, left.aux_int);
+            } else if (left.op == .arg) {
+                const idx: u32 = @intCast(left.aux_int);
+                if (idx < arg_regs.len) {
+                    try aarch64.movRegReg(buf, .x8, arg_regs[idx]);
+                }
+            } else if (left.op == .load) {
+                const local_idx: usize = @intCast(left.aux_int);
+                const x86_offset: i32 = func.locals[local_idx].offset;
+                const local_offset: i32 = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
+                if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
+                    const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
+                    try aarch64.ldrRegImm(buf, .x8, .sp, offset_scaled);
+                }
+            }
+
+            // Compare with right operand
+            if (right.op == .const_int) {
+                const imm: u12 = @intCast(right.aux_int & 0xFFF);
+                try aarch64.cmpRegImm12(buf, .x8, imm);
+            } else if (right.op == .arg) {
+                const idx: u32 = @intCast(right.aux_int);
+                if (idx < arg_regs.len) {
+                    try aarch64.cmpRegReg(buf, .x8, arg_regs[idx]);
+                }
+            } else if (right.op == .load) {
+                const local_idx: usize = @intCast(right.aux_int);
+                const x86_offset: i32 = func.locals[local_idx].offset;
+                const local_offset: i32 = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
+                if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
+                    const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
+                    try aarch64.ldrRegImm(buf, .x9, .sp, offset_scaled);
+                    try aarch64.cmpRegReg(buf, .x8, .x9);
+                }
+            }
         }
     }
 
@@ -2777,19 +3576,25 @@ pub const Driver = struct {
 
         switch (self.options.target.os) {
             .macos => {
-                // macOS: use ld64 via cc
+                // macOS: use zig cc for consistent cross-platform linking
+                try argv.append(self.allocator, "zig");
                 try argv.append(self.allocator, "cc");
                 try argv.append(self.allocator, "-o");
                 try argv.append(self.allocator, exe_path);
                 try argv.append(self.allocator, obj_path);
                 try argv.append(self.allocator, "-lSystem");
+                // Link with runtime library for map operations (use static lib directly)
+                try argv.append(self.allocator, "./runtime/libmap.a");
             },
             .linux => {
-                // Linux: use ld directly or via cc
+                // Linux: use zig cc for consistent cross-platform linking
+                try argv.append(self.allocator, "zig");
                 try argv.append(self.allocator, "cc");
                 try argv.append(self.allocator, "-o");
                 try argv.append(self.allocator, exe_path);
                 try argv.append(self.allocator, obj_path);
+                // Link with runtime library for map operations (use static lib directly)
+                try argv.append(self.allocator, "./runtime/libmap.a");
             },
             .windows => {
                 // Windows: use link.exe
@@ -2897,6 +3702,8 @@ test "IR op coverage - exhaustive" {
         // Struct/Array/Union
         .field, .index, .slice, .slice_index,
         .union_init, .union_tag, .union_payload,
+        // Map operations
+        .map_new, .map_set, .map_get, .map_has, .map_size, .map_free,
         // Control Flow
         .call, .ret, .jump, .branch, .phi, .select,
         // Conversions
@@ -2916,6 +3723,7 @@ test "IR op coverage - exhaustive" {
             .load, .store, .addr_local, .addr_field, .addr_index,
             .field, .index, .slice, .slice_index,
             .union_init, .union_tag, .union_payload,
+            .map_new, .map_set, .map_get, .map_has, .map_size, .map_free,
             .call, .ret, .jump, .branch, .phi, .select,
             .convert, .ptr_cast,
             .nop,
@@ -2949,6 +3757,8 @@ test "SSA op coverage - exhaustive" {
         .slice_make, .slice_index,
         // Union
         .union_init, .union_tag, .union_payload,
+        // Map operations
+        .map_new, .map_set, .map_get, .map_has, .map_size, .map_free,
         // Function
         .call, .arg,
         // ARC
@@ -2969,6 +3779,7 @@ test "SSA op coverage - exhaustive" {
             .field, .index,
             .slice_make, .slice_index,
             .union_init, .union_tag, .union_payload,
+            .map_new, .map_set, .map_get, .map_has, .map_size, .map_free,
             .call, .arg,
             .retain, .release,
             .ret, .jump, .branch, .@"unreachable",
@@ -2976,4 +3787,57 @@ test "SSA op coverage - exhaustive" {
         };
         try std.testing.expect(is_valid);
     }
+}
+
+// ============================================================================
+// Frame Layout Safety Tests - CRITICAL FOR PREVENTING MEMORY CORRUPTION
+// ============================================================================
+//
+// These tests verify that stack offset calculations are correct.
+// If these tests fail, local variables will overlap with saved registers
+// and corrupt the return address, causing crashes.
+
+test "FrameLayout AArch64 - local at offset -8 with frame_size 16" {
+    // Most common case: first local variable
+    // x86 layout: [rbp-8] = first local
+    // ARM64 layout: [sp+0] = fp, [sp+8] = lr, [sp+16+] = locals
+    // Expected: 16 + (-8) + 16 = 24
+    const result = FrameLayout.aarch64LocalOffset(-8, 16);
+    try std.testing.expectEqual(@as(i32, 24), result);
+}
+
+test "FrameLayout AArch64 - local at offset -16 with frame_size 16" {
+    // Second local at rbp-16
+    // Expected: 16 + (-16) + 16 = 16
+    const result = FrameLayout.aarch64LocalOffset(-16, 16);
+    try std.testing.expectEqual(@as(i32, 16), result);
+}
+
+test "FrameLayout AArch64 - offset must not overlap saved registers" {
+    // Any computed offset must be >= 16 (past saved fp/lr)
+    // This test verifies the safety assertion in aarch64LocalOffset
+    const offsets = [_]struct { x86: i32, frame: u32 }{
+        .{ .x86 = -8, .frame = 16 },   // Normal case
+        .{ .x86 = -16, .frame = 32 },  // Larger frame
+        .{ .x86 = -8, .frame = 32 },   // Different alignment
+        .{ .x86 = -24, .frame = 32 },  // Third local
+    };
+
+    for (offsets) |o| {
+        const result = FrameLayout.aarch64LocalOffset(o.x86, o.frame);
+        // Result must be >= AARCH64_SAVED_REGS to avoid corrupting fp/lr
+        try std.testing.expect(result >= FrameLayout.AARCH64_SAVED_REGS);
+    }
+}
+
+test "FrameLayout AArch64 - constant value is 16" {
+    // Verify the saved registers size constant is correct
+    // fp (8 bytes) + lr (8 bytes) = 16 bytes
+    try std.testing.expectEqual(@as(i32, 16), FrameLayout.AARCH64_SAVED_REGS);
+}
+
+test "FrameLayout x86_64 - offset unchanged" {
+    // x86_64 uses rbp-relative addressing, no conversion needed
+    try std.testing.expectEqual(@as(i32, -8), FrameLayout.x86_64LocalOffset(-8));
+    try std.testing.expectEqual(@as(i32, -16), FrameLayout.x86_64LocalOffset(-16));
 }

@@ -137,6 +137,20 @@ pub const Op = enum(u8) {
     /// Get union payload. aux = variant index, args[0] = union value
     union_payload,
 
+    // ========== Map Operations (runtime calls) ==========
+    /// Create new map. Returns handle pointer.
+    map_new,
+    /// Set key-value. args[0] = handle, args[1] = key_ptr, args[2] = key_len, args[3] = value
+    map_set,
+    /// Get value by key. args[0] = handle, args[1] = key_ptr, args[2] = key_len
+    map_get,
+    /// Check if key exists. args[0] = handle, args[1] = key_ptr, args[2] = key_len
+    map_has,
+    /// Get map size. args[0] = handle
+    map_size,
+    /// Free map. args[0] = handle
+    map_free,
+
     // ========== Control Flow ==========
     /// Function call. args[0] = func, args[1..] = arguments
     call,
@@ -171,6 +185,8 @@ pub const Op = enum(u8) {
     pub fn hasSideEffects(self: Op) bool {
         return switch (self) {
             .store, .call, .ret, .jump, .branch => true,
+            // Map operations modify heap state
+            .map_new, .map_set, .map_free => true,
             else => false,
         };
     }

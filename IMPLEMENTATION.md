@@ -39,6 +39,7 @@ Build a complete compiler in Zig that can compile simple cot programs.
 - [x] Slice support (runtime) - ptr+len storage (16 bytes), len() on slice variables
 - [x] Slice indexing (runtime) - s[i] access
 - [x] Switch expressions - switch x { 1 => a, 2 => b, else => c }
+- [x] Multi-value switch cases - `.a, .b, .c => x` (multiple patterns per arm)
 - [x] For-in loops - `for x in arr { ... }` (arrays and slices)
 - [x] Enum with backing type - `enum Color: i64 { red = 10, green = 20 }`
 - [x] @intFromEnum builtin - `@intFromEnum(Color.green)` returns 20
@@ -66,9 +67,9 @@ Running with `--debug-codegen` will show warnings for any unhandled SSA operatio
 
 **Test Counts:**
 - 135+ Zig embedded tests (unit tests in source files)
-- 40 binary tests (.cot test files)
+- 41 binary tests (.cot test files)
 
-**Both ARM64 and x86_64** - 40/40 tests pass (40 + 1 skip)
+**Both ARM64 and x86_64** - 41/41 tests pass (41 + 1 skip)
 
 | Test File | Expected | ARM64 | x86_64 |
 |-----------|----------|-------|--------|
@@ -95,6 +96,7 @@ Running with `--debug-codegen` will show warnings for any unhandled SSA operatio
 | test_mul.cot (6 * 7) | 42 | PASS | PASS |
 | test_div.cot (84 / 2) | 42 | PASS | PASS |
 | test_switch.cot (switch expression) | 42 | PASS | PASS |
+| test_switch_multi.cot (multi-value switch cases) | 42 | PASS | PASS |
 | test_slice_index.cot (s[i] access) | 30 | PASS | PASS |
 | test_for_array.cot (for x in arr) | 60 | PASS | PASS |
 | test_for_slice.cot (for x in slice) | 90 | PASS | PASS |
@@ -127,14 +129,21 @@ The project includes a pre-configured Docker setup for x86_64 testing:
 # Single test on ARM64 (native macOS)
 zig build && ./zig-out/bin/cot tests/test_file.cot -o test && ./test; echo "Exit: $?"
 
-# Single test on x86_64 (Docker)
+# Single test on x86_64 (no Docker needed - zig cc cross-links!)
+zig build && ./zig-out/bin/cot tests/test_file.cot -o ignored && \
+  zig cc test_file.o -o test -target x86_64-linux-gnu && ./test; echo "Exit: $?"
+
+# Or still use Docker if preferred
 zig build -Dtarget=x86_64-linux-gnu
 docker run --platform linux/amd64 -v $(pwd):/cot -w /cot cot-x86_64 \
-  sh -c "./zig-out/bin/cot tests/test_file.cot -o ignored; gcc -o test test_file.o && ./test; echo Exit: \$?"
+  sh -c "./zig-out/bin/cot tests/test_file.cot -o ignored; zig cc -o test test_file.o && ./test; echo Exit: \$?"
 ```
 
-**Note**: Must use `gcc` to link (not bare `ld`) because `main` returns a value.
-The C runtime's `_start` calls `exit(main())`. Using `ld -e main` causes segfault.
+**Note**: We use `zig cc` as the linker instead of system `gcc`/`ld`. Benefits:
+- Cross-platform: works on macOS, Linux, Windows
+- Cross-compilation: link for any target from any host
+- No additional dependencies: Zig bundles LLD and libc
+- Consistent behavior across all platforms
 
 ### Phase 2: Bootstrap Preparation ✓ Complete
 
@@ -831,6 +840,217 @@ cot/
 | libcot_runtime.a (http, json, crypto) | 2 days | - |
 | std/ Cot wrappers + Result types | 2 days | Runtime |
 | **Total** | ~1 week | After self-hosting |
+
+---
+
+## Phase 6: Windows Support
+
+Windows support is important for broader adoption. The good news: x86_64 instruction encoding is already complete and identical on Windows. Only the packaging and calling convention differ.
+
+### What's Reusable (100%)
+
+| Component | Notes |
+|-----------|-------|
+| x86_64 instruction encoding | Same bytes on Windows and Linux |
+| Register allocation | Architecture-level, OS-independent |
+| SSA/IR/frontend | Completely OS-independent |
+
+### New Work Required
+
+#### 1. PE/COFF Object Format
+
+Windows uses PE/COFF instead of ELF (Linux) or Mach-O (macOS):
+
+```
+codegen/object.zig:
+├── writeMachO()   ← macOS (done)
+├── writeELF()     ← Linux (done)
+└── writePE()      ← Windows (new)
+```
+
+**Effort:** 1-2 days
+
+PE/COFF structure:
+- DOS header (legacy stub)
+- PE signature
+- COFF file header
+- Optional header (PE32+)
+- Section headers (.text, .data, .rdata)
+- Section data
+- Symbol table
+- Relocation entries
+
+#### 2. Win64 Calling Convention
+
+Windows x64 uses different parameter registers than SystemV (Linux/macOS):
+
+| Parameter | SystemV (Unix) | Win64 (Windows) |
+|-----------|----------------|-----------------|
+| 1st | rdi | rcx |
+| 2nd | rsi | rdx |
+| 3rd | rdx | r8 |
+| 4th | rcx | r9 |
+| 5th+ | stack | stack |
+| Shadow space | None | 32 bytes required |
+| Callee-saved | rbx, r12-r15, rbp | rbx, rsi, rdi, r12-r15, rbp |
+
+**Implementation:**
+
+```zig
+// In codegen/x86_64.zig or codegen/callconv.zig
+
+pub const Win64 = CallConv{
+    .param_regs = &.{ .rcx, .rdx, .r8, .r9 },
+    .float_param_regs = &.{ .xmm0, .xmm1, .xmm2, .xmm3 },
+    .callee_saved = &.{ .rbx, .rsi, .rdi, .r12, .r13, .r14, .r15, .rbp },
+    .return_reg = .rax,
+    .shadow_space = 32,  // Must reserve 32 bytes for callee
+    .stack_align = 16,
+};
+
+// Prologue needs shadow space:
+// sub rsp, 32 + locals + alignment
+```
+
+**Effort:** 0.5-1 day
+
+#### 3. Runtime / System Integration
+
+**Option A: Link against UCRT (Recommended)**
+
+Use Microsoft's Universal C Runtime. Just call standard C functions:
+- `printf` / `puts` for output
+- `malloc` / `free` for memory
+- `exit` for program termination
+
+```zig
+// Linker flags:
+// link.exe app.obj /OUT:app.exe msvcrt.lib
+```
+
+**Option B: Direct Windows API**
+
+Call Windows APIs directly via kernel32.dll imports:
+- `WriteConsoleA` for output
+- `HeapAlloc` / `HeapFree` for memory
+- `ExitProcess` for termination
+
+```zig
+// Requires import table in PE file
+// More complex but no CRT dependency
+```
+
+**Effort:** 0.5-1 day
+
+#### 4. Linker Integration
+
+Use `zig cc` for consistent cross-platform linking (same approach as Linux/macOS):
+
+```zig
+fn link(objects: []const []const u8, output: []const u8, target: Target) !void {
+    var args = std.ArrayList([]const u8).init(allocator);
+    try args.append("zig");
+    try args.append("cc");
+
+    for (objects) |obj| try args.append(obj);
+
+    try args.append("-o");
+    try args.append(output);
+
+    // Target specification
+    switch (target.os) {
+        .macos => try args.append("-target"),
+                  try args.append("aarch64-macos"),  // or x86_64-macos
+        .linux => try args.append("-target"),
+                  try args.append("x86_64-linux-gnu"),
+        .windows => try args.append("-target"),
+                    try args.append("x86_64-windows"),
+    }
+
+    var child = std.process.Child.init(args.items, allocator);
+    _ = try child.spawnAndWait();
+}
+```
+
+**Benefits of zig cc for Windows:**
+- Cross-compile from macOS/Linux to Windows (no Windows machine needed for development)
+- Bundles LLD and mingw-w64 libc
+- No need to install Visual Studio or Windows SDK
+- Same command works on all host platforms
+
+**Alternative: Native link.exe** (if targeting MSVC ABI specifically):
+```bash
+link.exe app.obj /OUT:app.exe /SUBSYSTEM:CONSOLE kernel32.lib msvcrt.lib
+```
+
+**Effort:** 0.5 day
+
+### Cross-Compilation Support
+
+Once PE/COFF is implemented, cross-compilation from macOS to Windows becomes possible:
+
+```bash
+# On macOS, produce Windows executable:
+cot build app.cot --target=x86_64-windows -o app.exe
+
+# The .exe can be copied to Windows and run directly
+```
+
+This requires:
+1. PE/COFF writer (no Windows machine needed)
+2. Win64 calling convention
+3. Either: embed minimal CRT, or require user has Windows SDK
+
+### Testing Strategy
+
+**Option A: Windows VM/Machine**
+- Most reliable
+- Full integration testing
+- Requires Windows license
+
+**Option B: Wine on Linux/macOS**
+- Can run simple Windows executables
+- Free, no license needed
+- May have compatibility issues
+
+**Option C: CI with GitHub Actions**
+- Windows runners available
+- Automated testing on push
+- Free for open source
+
+### Recommended Implementation Order
+
+1. **PE/COFF writer** - Can develop/test on macOS using hex dumps
+2. **Win64 calling convention** - Modify existing x86_64 backend
+3. **Linker integration** - Use lld-link for cross-platform
+4. **Runtime stubs** - Minimal printf/exit via UCRT
+5. **Full testing** - VM or CI
+
+### Timeline Summary
+
+| Task | Effort |
+|------|--------|
+| PE/COFF object writer | 1-2 days |
+| Win64 calling convention | 0.5-1 day |
+| Runtime (print, exit) | 0.5-1 day |
+| Linker integration | 0.5 day |
+| Testing/debugging | 1-2 days |
+| **Total** | **3-5 days** |
+
+### When to Implement
+
+**Recommended: After self-hosting**
+
+- Write PE/COFF support in Cot, not Zig
+- Use Zig implementation as reference
+- Iterate faster in self-hosted compiler
+- The Zig x86_64 code serves as documentation
+
+**Alternative: Before self-hosting**
+
+- If Windows users are blocked
+- Adds ~3-5 days to bootstrap timeline
+- Work would need to be redone in Cot anyway
 
 ---
 

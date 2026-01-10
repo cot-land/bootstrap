@@ -762,10 +762,47 @@ pub const Lowerer = struct {
             .switch_expr => |switch_expr| self.lowerSwitchExpr(switch_expr),
             .paren => |paren| self.lowerExpr(paren.inner),
             .struct_init => |si| self.lowerStructInit(si),
+            .new_expr => |ne| self.lowerNewExpr(ne),
             .block => ir.null_node,  // Block expressions not yet implemented
             .type_expr => ir.null_node,  // Type expressions don't produce runtime values
             .bad_expr => ir.null_node,  // Skip invalid expressions
         };
+    }
+
+    fn lowerNewExpr(self: *Lowerer, ne: ast.NewExpr) Allocator.Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+
+        // Get the type being allocated
+        const type_node = self.tree.getNode(ne.type_expr);
+        log.debug("  lowerNewExpr: type_node tag = {s}", .{@tagName(type_node)});
+        if (type_node == .expr) {
+            log.debug("  lowerNewExpr: expr tag = {s}", .{@tagName(type_node.expr)});
+            if (type_node.expr == .type_expr) {
+                const type_expr = type_node.expr.type_expr;
+                log.debug("  lowerNewExpr: type_expr.kind = {s}", .{@tagName(type_expr.kind)});
+                switch (type_expr.kind) {
+                    .map => {
+                        // new Map<K, V>() -> emit map_new
+                        // Returns a pointer/handle to the map
+                        const node = ir.Node.init(.map_new, TypeRegistry.INT, ne.span);
+                        log.debug("  map_new", .{});
+                        return try fb.emit(node);
+                    },
+                    .list => {
+                        // TODO: new List<T>() -> emit list_new
+                        const node = ir.Node.init(.const_int, TypeRegistry.INT, ne.span)
+                            .withAux(0);
+                        return try fb.emit(node);
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        // Fallback: emit null pointer
+        const node = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
+            .withAux(0);
+        return try fb.emit(node);
     }
 
     fn lowerIdentifier(self: *Lowerer, ident: ast.Identifier) Allocator.Error!ir.NodeIndex {
@@ -956,6 +993,28 @@ pub const Lowerer = struct {
                             const t = self.type_reg.get(type_idx);
                             if (t == .union_type) {
                                 return self.lowerUnionConstruction(call, t.union_type, fa.field, type_idx);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check for Map method calls: map.set(k, v), map.get(k), map.has(k)
+        if (callee_expr) |expr| {
+            if (expr == .field_access) {
+                const fa = expr.field_access;
+                const base_expr = self.tree.getExpr(fa.base);
+                if (base_expr) |be| {
+                    if (be == .identifier) {
+                        const var_name = be.identifier.name;
+                        // Look up as a local variable
+                        if (fb.lookupLocal(var_name)) |local_idx| {
+                            const local = fb.locals.items[local_idx];
+                            const local_type = self.type_reg.get(local.type_idx);
+                            if (local_type == .map_type) {
+                                log.debug("  map method call: {s}.{s}", .{ var_name, fa.field });
+                                return self.lowerMapMethodCall(call, fa.field, @intCast(local_idx));
                             }
                         }
                     }
@@ -1249,6 +1308,84 @@ pub const Lowerer = struct {
             .withArgs(if (payload_node != ir.null_node) &.{payload_node} else &.{});
 
         return try fb.emit(node);
+    }
+
+    /// Lower Map method calls: map.set(k, v), map.get(k), map.has(k), map.size()
+    fn lowerMapMethodCall(
+        self: *Lowerer,
+        call: ast.Call,
+        method_name: []const u8,
+        local_idx: u32,
+    ) Allocator.Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+
+        // Load the map handle
+        const map_handle = try fb.emitLocalLoad(local_idx, TypeRegistry.INT, Span.fromPos(Pos.zero));
+
+        if (std.mem.eql(u8, method_name, "set")) {
+            // map.set(key, value) -> map_set(handle, key_ptr, key_len, value)
+            if (call.args.len != 2) {
+                log.debug("  map.set() expects 2 arguments, got {d}", .{call.args.len});
+                return ir.null_node;
+            }
+
+            // Lower the key argument
+            const key_node = try self.lowerExpr(call.args[0]);
+            // Lower the value argument
+            const value_node = try self.lowerExpr(call.args[1]);
+
+            // For string keys, we need to get ptr and len
+            // The key_node is a const_string, so we can use it directly
+            // The runtime will receive (handle, key_ptr, key_len, value)
+            const node = ir.Node.init(.map_set, TypeRegistry.VOID, Span.fromPos(Pos.zero))
+                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ map_handle, key_node, value_node }));
+
+            log.debug("  map.set() -> map_set IR op", .{});
+            return try fb.emit(node);
+        } else if (std.mem.eql(u8, method_name, "get")) {
+            // map.get(key) -> map_get(handle, key_ptr, key_len)
+            if (call.args.len != 1) {
+                log.debug("  map.get() expects 1 argument, got {d}", .{call.args.len});
+                return ir.null_node;
+            }
+
+            const key_node = try self.lowerExpr(call.args[0]);
+
+            const node = ir.Node.init(.map_get, TypeRegistry.INT, Span.fromPos(Pos.zero))
+                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ map_handle, key_node }));
+
+            log.debug("  map.get() -> map_get IR op", .{});
+            return try fb.emit(node);
+        } else if (std.mem.eql(u8, method_name, "has")) {
+            // map.has(key) -> map_has(handle, key_ptr, key_len)
+            if (call.args.len != 1) {
+                log.debug("  map.has() expects 1 argument, got {d}", .{call.args.len});
+                return ir.null_node;
+            }
+
+            const key_node = try self.lowerExpr(call.args[0]);
+
+            const node = ir.Node.init(.map_has, TypeRegistry.BOOL, Span.fromPos(Pos.zero))
+                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ map_handle, key_node }));
+
+            log.debug("  map.has() -> map_has IR op", .{});
+            return try fb.emit(node);
+        } else if (std.mem.eql(u8, method_name, "size")) {
+            // map.size() -> map_size(handle)
+            if (call.args.len != 0) {
+                log.debug("  map.size() expects 0 arguments, got {d}", .{call.args.len});
+                return ir.null_node;
+            }
+
+            const node = ir.Node.init(.map_size, TypeRegistry.INT, Span.fromPos(Pos.zero))
+                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{map_handle}));
+
+            log.debug("  map.size() -> map_size IR op", .{});
+            return try fb.emit(node);
+        } else {
+            log.debug("  unknown map method: {s}", .{method_name});
+            return ir.null_node;
+        }
     }
 
     fn lowerIndex(self: *Lowerer, index: ast.Index) Allocator.Error!ir.NodeIndex {
@@ -1649,6 +1786,39 @@ pub const Lowerer = struct {
     // Type Inference Helper
     // ========================================================================
 
+    /// Resolve a type expression node to a TypeIndex.
+    /// Used for generic type arguments like Map<K, V> where K and V are type nodes.
+    fn resolveTypeExprNode(self: *Lowerer, node_idx: NodeIndex) TypeIndex {
+        const node = self.tree.getNode(node_idx);
+        if (node == .expr) {
+            if (node.expr == .type_expr) {
+                const type_expr = node.expr.type_expr;
+                switch (type_expr.kind) {
+                    .named => |name| {
+                        // Look up basic types
+                        if (std.mem.eql(u8, name, "i64") or std.mem.eql(u8, name, "int")) return TypeRegistry.INT;
+                        if (std.mem.eql(u8, name, "i32")) return TypeRegistry.I32;
+                        if (std.mem.eql(u8, name, "i16")) return TypeRegistry.I16;
+                        if (std.mem.eql(u8, name, "i8")) return TypeRegistry.I8;
+                        if (std.mem.eql(u8, name, "u64")) return TypeRegistry.U64;
+                        if (std.mem.eql(u8, name, "u32")) return TypeRegistry.U32;
+                        if (std.mem.eql(u8, name, "u16")) return TypeRegistry.U16;
+                        if (std.mem.eql(u8, name, "u8")) return TypeRegistry.U8;
+                        if (std.mem.eql(u8, name, "f64") or std.mem.eql(u8, name, "float")) return TypeRegistry.FLOAT;
+                        if (std.mem.eql(u8, name, "f32")) return TypeRegistry.F32;
+                        if (std.mem.eql(u8, name, "bool")) return TypeRegistry.BOOL;
+                        if (std.mem.eql(u8, name, "string")) return TypeRegistry.STRING;
+                        if (std.mem.eql(u8, name, "void")) return TypeRegistry.VOID;
+                        // Look up in registry
+                        return self.type_reg.lookupByName(name) orelse TypeRegistry.VOID;
+                    },
+                    else => return TypeRegistry.VOID,
+                }
+            }
+        }
+        return TypeRegistry.VOID;
+    }
+
     /// Infer the type of an AST expression node.
     /// Used for type inference in variable declarations like `var i = 1`.
     fn inferTypeFromExpr(self: *Lowerer, node_idx: NodeIndex) TypeIndex {
@@ -1757,6 +1927,31 @@ pub const Lowerer = struct {
                             .basic => |k| if (k == .string_type) self.type_reg.makeSlice(TypeRegistry.U8) catch TypeRegistry.VOID else TypeRegistry.VOID,
                             else => TypeRegistry.VOID,
                         };
+                    },
+
+                    // new expression - new Map<K,V>() or new List<T>()
+                    .new_expr => |ne| {
+                        const type_node = self.tree.getNode(ne.type_expr);
+                        if (type_node == .expr) {
+                            if (type_node.expr == .type_expr) {
+                                const type_expr = type_node.expr.type_expr;
+                                switch (type_expr.kind) {
+                                    .map => |m| {
+                                        // Make Map<K, V> type
+                                        const key_type = self.resolveTypeExprNode(m.key);
+                                        const value_type = self.resolveTypeExprNode(m.value);
+                                        return self.type_reg.makeMap(key_type, value_type) catch TypeRegistry.VOID;
+                                    },
+                                    .list => |elem_node| {
+                                        // Make List<T> type
+                                        const elem_type = self.resolveTypeExprNode(elem_node);
+                                        return self.type_reg.makeList(elem_type) catch TypeRegistry.VOID;
+                                    },
+                                    else => return TypeRegistry.VOID,
+                                }
+                            }
+                        }
+                        return TypeRegistry.VOID;
                     },
 
                     else => return TypeRegistry.VOID,

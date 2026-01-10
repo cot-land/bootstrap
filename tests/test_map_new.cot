@@ -1,0 +1,7 @@
+// Test creating a new map
+// Expected: 42 (requires linking with libcot_runtime.a)
+// Note: This test requires manual linking: gcc -o test test_map_new.o zig-out/lib/libcot_runtime.a
+fn main() i64 {
+    var m = new Map<string, i64>()
+    return 42
+}

@@ -157,6 +157,8 @@ pub const Expr = union(enum) {
     switch_expr: SwitchExpr,
     block: Block,
     struct_init: StructInit,
+    // Heap allocation: new Map<K,V>(), new List<T>()
+    new_expr: NewExpr,
     // Type expressions
     type_expr: TypeExpr,
     // For error recovery
@@ -178,6 +180,7 @@ pub const Expr = union(enum) {
             .switch_expr => |e| e.span,
             .block => |e| e.span,
             .struct_init => |e| e.span,
+            .new_expr => |e| e.span,
             .type_expr => |e| e.span,
             .bad_expr => |e| e.span,
         };
@@ -308,6 +311,13 @@ pub const StructInit = struct {
     span: Span,
 };
 
+/// Heap allocation expression: new Map<K,V>(), new List<T>()
+pub const NewExpr = struct {
+    /// The type being allocated (a type expression node)
+    type_expr: NodeIndex,
+    span: Span,
+};
+
 /// Field initializer: .field = value
 pub const FieldInit = struct {
     name: []const u8,
@@ -348,6 +358,13 @@ pub const TypeKind = union(enum) {
         params: []const NodeIndex,
         return_type: ?NodeIndex,
     },
+    /// Map type (Map<K, V>)
+    map: struct {
+        key: NodeIndex, // key type
+        value: NodeIndex, // value type
+    },
+    /// List type (List<T>)
+    list: NodeIndex, // element type
 };
 
 // ============================================================================

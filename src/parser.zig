@@ -543,6 +543,50 @@ pub const Parser = struct {
         if (self.check(.identifier) or isTypeKeyword(self.tok.tok)) {
             const name = if (self.check(.identifier)) self.tok.text else self.tok.tok.toString();
             self.advance();
+
+            // Check for generic types: Map<K, V> or List<T>
+            if (self.match(.less)) {
+                if (std.mem.eql(u8, name, "Map")) {
+                    // Map<K, V>
+                    const key_type = try self.parseType() orelse {
+                        self.err.errorWithCode(self.pos(), .E202, "expected key type for Map");
+                        return null;
+                    };
+                    if (!self.expect(.comma)) return null;
+                    const value_type = try self.parseType() orelse {
+                        self.err.errorWithCode(self.pos(), .E202, "expected value type for Map");
+                        return null;
+                    };
+                    if (!self.expect(.greater)) return null;
+                    return try self.ast.addNode(.{
+                        .expr = .{
+                            .type_expr = .{
+                                .kind = .{ .map = .{ .key = key_type, .value = value_type } },
+                                .span = Span.init(start, self.tok.span.start),
+                            },
+                        },
+                    });
+                } else if (std.mem.eql(u8, name, "List")) {
+                    // List<T>
+                    const elem_type = try self.parseType() orelse {
+                        self.err.errorWithCode(self.pos(), .E202, "expected element type for List");
+                        return null;
+                    };
+                    if (!self.expect(.greater)) return null;
+                    return try self.ast.addNode(.{
+                        .expr = .{
+                            .type_expr = .{
+                                .kind = .{ .list = elem_type },
+                                .span = Span.init(start, self.tok.span.start),
+                            },
+                        },
+                    });
+                } else {
+                    self.err.errorWithCode(self.pos(), .E202, "unknown generic type");
+                    return null;
+                }
+            }
+
             return try self.ast.addNode(.{
                 .expr = .{
                     .type_expr = .{
@@ -923,6 +967,25 @@ pub const Parser = struct {
                         .literal = .{
                             .kind = .null_lit,
                             .value = "null",
+                            .span = Span.init(start, self.tok.span.start),
+                        },
+                    },
+                });
+            },
+            .kw_new => {
+                // new Map<K, V>() or new List<T>()
+                self.advance(); // consume 'new'
+                const type_node = try self.parseType() orelse {
+                    self.err.errorWithCode(self.pos(), .E202, "expected type after 'new'");
+                    return null;
+                };
+                // Expect () after type
+                if (!self.expect(.lparen)) return null;
+                if (!self.expect(.rparen)) return null;
+                return try self.ast.addNode(.{
+                    .expr = .{
+                        .new_expr = .{
+                            .type_expr = type_node,
                             .span = Span.init(start, self.tok.span.start),
                         },
                     },
@@ -1799,4 +1862,114 @@ test "parser union with unit variant" {
     // First variant has type, second doesn't (unit variant)
     try std.testing.expect(decl.?.union_decl.variants[0].type_expr != null);
     try std.testing.expect(decl.?.union_decl.variants[1].type_expr == null);
+}
+
+test "parser Map type" {
+    const content = "var m: Map<string, i64>";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var src = Source.init(alloc, "test.cot", content);
+    var err_reporter = ErrorReporter.init(&src, null);
+    var scan = Scanner.initWithErrors(&src, &err_reporter);
+    var tree = Ast.init(alloc);
+
+    var parser = Parser.init(alloc, &scan, &tree, &err_reporter);
+    const decl_idx = try parser.parseDecl();
+
+    try std.testing.expect(!err_reporter.hasErrors());
+    try std.testing.expect(decl_idx != null);
+    const decl = tree.getDecl(decl_idx.?);
+    try std.testing.expect(decl != null);
+    try std.testing.expect(decl.? == .var_decl);
+    try std.testing.expectEqualStrings("m", decl.?.var_decl.name);
+    // Check type expression is a Map type
+    try std.testing.expect(decl.?.var_decl.type_expr != null);
+    const type_node = tree.getExpr(decl.?.var_decl.type_expr.?);
+    try std.testing.expect(type_node != null);
+    try std.testing.expect(type_node.? == .type_expr);
+    try std.testing.expect(type_node.?.type_expr.kind == .map);
+}
+
+test "parser List type" {
+    const content = "var items: List<i64>";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var src = Source.init(alloc, "test.cot", content);
+    var err_reporter = ErrorReporter.init(&src, null);
+    var scan = Scanner.initWithErrors(&src, &err_reporter);
+    var tree = Ast.init(alloc);
+
+    var parser = Parser.init(alloc, &scan, &tree, &err_reporter);
+    const decl_idx = try parser.parseDecl();
+
+    try std.testing.expect(!err_reporter.hasErrors());
+    try std.testing.expect(decl_idx != null);
+    const decl = tree.getDecl(decl_idx.?);
+    try std.testing.expect(decl != null);
+    try std.testing.expect(decl.? == .var_decl);
+    try std.testing.expectEqualStrings("items", decl.?.var_decl.name);
+    // Check type expression is a List type
+    try std.testing.expect(decl.?.var_decl.type_expr != null);
+    const type_node = tree.getExpr(decl.?.var_decl.type_expr.?);
+    try std.testing.expect(type_node != null);
+    try std.testing.expect(type_node.? == .type_expr);
+    try std.testing.expect(type_node.?.type_expr.kind == .list);
+}
+
+test "parser new Map expression" {
+    const content = "var m = new Map<string, i64>()";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var src = Source.init(alloc, "test.cot", content);
+    var err_reporter = ErrorReporter.init(&src, null);
+    var scan = Scanner.initWithErrors(&src, &err_reporter);
+    var tree = Ast.init(alloc);
+
+    var parser = Parser.init(alloc, &scan, &tree, &err_reporter);
+    const decl_idx = try parser.parseDecl();
+
+    try std.testing.expect(!err_reporter.hasErrors());
+    try std.testing.expect(decl_idx != null);
+    const decl = tree.getDecl(decl_idx.?);
+    try std.testing.expect(decl != null);
+    try std.testing.expect(decl.? == .var_decl);
+    try std.testing.expectEqualStrings("m", decl.?.var_decl.name);
+    // Check initializer is a new expression
+    try std.testing.expect(decl.?.var_decl.value != null);
+    const init_node = tree.getExpr(decl.?.var_decl.value.?);
+    try std.testing.expect(init_node != null);
+    try std.testing.expect(init_node.? == .new_expr);
+}
+
+test "parser new List expression" {
+    const content = "var items = new List<i64>()";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var src = Source.init(alloc, "test.cot", content);
+    var err_reporter = ErrorReporter.init(&src, null);
+    var scan = Scanner.initWithErrors(&src, &err_reporter);
+    var tree = Ast.init(alloc);
+
+    var parser = Parser.init(alloc, &scan, &tree, &err_reporter);
+    const decl_idx = try parser.parseDecl();
+
+    try std.testing.expect(!err_reporter.hasErrors());
+    try std.testing.expect(decl_idx != null);
+    const decl = tree.getDecl(decl_idx.?);
+    try std.testing.expect(decl != null);
+    try std.testing.expect(decl.? == .var_decl);
+    try std.testing.expectEqualStrings("items", decl.?.var_decl.name);
+    // Check initializer is a new expression
+    try std.testing.expect(decl.?.var_decl.value != null);
+    const init_node = tree.getExpr(decl.?.var_decl.value.?);
+    try std.testing.expect(init_node != null);
+    try std.testing.expect(init_node.? == .new_expr);
 }

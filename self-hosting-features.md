@@ -105,7 +105,7 @@ These features are used extensively in all .cot files and must work first.
 |---------|--------|---------|-------|
 | Switch expression | Implemented | All | `var x = switch y { ... }` |
 | Switch statement | Implemented | parser.cot | `switch x { ... }` |
-| Multiple cases | **Gap** | parser.cot | `.plus, .minus => ...` |
+| Multiple cases | Implemented | parser.cot | `.plus, .minus => ...` |
 | Else case | Implemented | All | `else => default` |
 | Range patterns | **Gap** | - | Not used in wireframes |
 
@@ -134,8 +134,8 @@ These features are used extensively in all .cot files and must work first.
 
 | Feature | Status | Used In | Notes |
 |---------|--------|---------|-------|
-| Methods with self | **Gap** | ir.cot, checker.cot | `fn method(self: *T) { }` |
-| Method call syntax | **Gap** | All | `obj.method()` |
+| Methods with self | Partial | ir.cot, checker.cot | `fn method(self: *T) { }` - definition works |
+| Method call syntax (UFCS) | **Gap** | All | `obj.method()` - not yet implemented |
 
 ---
 
@@ -154,15 +154,15 @@ These features are used extensively in all .cot files and must work first.
 
 | Feature | Status | Used In | Notes |
 |---------|--------|---------|-------|
-| `List<T>` | **Gap** | All | Dynamic array |
+| `List<T>` | Partial | All | Type parsing + type checking done |
 | `List.push(item)` | **Gap** | All | Append item |
 | `List.get(index)` | **Gap** | ir.cot | Get by index |
-| `Map<K, V>` | **Gap** | checker.cot, ir.cot | Hash map |
-| `Map.set(k, v)` | **Gap** | checker.cot | Insert/update |
-| `Map.get(key)` | **Gap** | checker.cot | Lookup (returns ?V) |
-| `Map.has(key)` | **Gap** | checker.cot | Key exists |
-| `new List<T>` | **Gap** | All | Heap allocation |
-| `new Map<K,V>` | **Gap** | checker.cot | Heap allocation |
+| `Map<K, V>` | Implemented | checker.cot, ir.cot | Full runtime support |
+| `Map.set(k, v)` | **Gap** | checker.cot | Method call syntax TBD |
+| `Map.get(key)` | **Gap** | checker.cot | Method call syntax TBD |
+| `Map.has(key)` | **Gap** | checker.cot | Method call syntax TBD |
+| `new List<T>` | Partial | All | Parsing done, codegen TBD |
+| `new Map<K,V>` | Implemented | checker.cot | Full codegen + runtime |
 
 ---
 
@@ -279,6 +279,7 @@ The following features were implemented in recent development sessions:
 
 ### Control Flow
 - **Switch expressions/statements**: Full switch support with else clause
+- **Multiple switch case patterns**: `.a, .b, .c => value` - multiple values per arm
 - **For-in loops**: Iteration over arrays and slices
 - **If/else**: Full conditional support (was marked Partial)
 - **While loops**: Full while loop support (was marked Partial)
@@ -294,7 +295,7 @@ The following features were implemented in recent development sessions:
 ### Codegen
 - **ARM64 (macOS)**: Full Mach-O object file generation with relocations
 - **x86_64 (Linux)**: Full ELF object file generation with relocations
-- 40 tests passing on both architectures
+- 41 tests passing on both architectures
 
 ### Tagged Unions - **Complete**
 - **Union definition**: Parsing `union Name { variant: Type, ... }` syntax
@@ -302,6 +303,26 @@ The following features were implemented in recent development sessions:
 - **Switch on union**: `switch r { .ok |val| => val, .err |e| => e }`
 - **Payload capture**: `|val|` captures the union payload in switch cases
 - **Type system**: `union_type` in registry with variants and 8-byte aligned layout (tag + payload)
+
+### Map Types - **Implemented**
+- **Type syntax**: `Map<K, V>` parsing works
+- **Type checking**: Map types are registered and type-checked
+- **new expression**: `new Map<string, i64>()` parsing and codegen works
+- **Runtime library**: `runtime/map.zig` with C ABI functions:
+  - `cot_map_new()` - Create new map
+  - `cot_map_set(handle, key_ptr, key_len, value)` - Set key-value
+  - `cot_map_get(handle, key_ptr, key_len)` - Get value by key
+  - `cot_map_has(handle, key_ptr, key_len)` - Check if key exists
+  - `cot_map_size(handle)` - Get map size
+  - `cot_map_free(handle)` - Free map
+- **Implementation**: Linear probing hash table with 7-bit fingerprints, 80% load factor
+- **Remaining**: Method call syntax (`.set()`, `.get()`, `.has()`) - IR ops exist but AST lowering TBD
+
+### List Types - **Partial**
+- **Type syntax**: `List<T>` parsing works
+- **Type checking**: List types are registered and type-checked
+- **new expression**: `new List<i64>()` parsing works
+- **Remaining**: Runtime library and codegen TBD
 
 ---
 
@@ -316,14 +337,18 @@ Almost every .cot file uses tagged unions extensively:
 
 Tagged unions with payload capture are now working on both ARM64 and x86_64.
 
-### Built-in Generics Required
+### Built-in Generics Required - **Map DONE, List IN PROGRESS**
 
 The wireframes use `List<T>` and `Map<K,V>` extensively:
 - Parser builds lists of AST nodes
 - Checker uses maps for symbol tables
 - IR uses lists for values and blocks
 
-User-defined generics are NOT needed for bootstrap (per spec.md), but the built-in collections are essential.
+**Map Progress**: Full runtime implementation with hash table (linear probing, 7-bit fingerprints). Codegen emits calls to runtime library. `new Map<K,V>()` works end-to-end.
+
+**List Progress**: Type syntax parses and type-checks. Runtime library and codegen TBD.
+
+**Remaining**: Method call syntax (`.set()`, `.get()`) needs AST lowering. User-defined generics are NOT needed for bootstrap (per spec.md).
 
 ### Switch Expressions are Everywhere
 
@@ -337,7 +362,9 @@ The switch must work as an expression (returns value) with payload capture.
 ### Remaining Critical Gaps for Self-Hosting
 
 1. ~~**Tagged unions**~~ - **DONE** (construction + switch with payload capture)
-2. **Map<K,V>** - Symbol tables and lookup
-3. **Methods** - `fn method(self: *T)` pattern
-4. **String interpolation** - `"Error: ${msg}"` syntax
-5. **@maxInt/@minInt** - Integer bounds for type checks
+2. ~~**Map<K,V> types**~~ - **DONE** (runtime + codegen, method syntax TBD)
+3. **Map/List methods** - `.set()`, `.get()`, `.has()`, `.push()` method call syntax
+4. **List<T> runtime** - Runtime library for list operations
+5. **Methods** - `fn method(self: *T)` pattern
+6. **String interpolation** - `"Error: ${msg}"` syntax
+7. **@maxInt/@minInt** - Integer bounds for type checks

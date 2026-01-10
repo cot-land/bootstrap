@@ -1,0 +1,9 @@
+// expect: 42
+fn main() i64 {
+    var x = 2;
+    return switch x {
+        1, 2, 3 => 42,
+        4, 5 => 50,
+        else => 0,
+    };
+}

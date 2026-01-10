@@ -1,0 +1,7 @@
+// Test Map method calls: .set(), .get(), .has()
+// Expected: 42 (requires linking with libcot_runtime.a)
+fn main() i64 {
+    var m = new Map<string, i64>()
+    m.set("hello", 42)
+    return m.get("hello")
+}

@@ -449,9 +449,16 @@ pub const Checker = struct {
             .switch_expr => |se| try self.checkSwitchExpr(se),
             .block => |b| try self.checkBlock(b),
             .struct_init => |si| try self.checkStructInit(si),
+            .new_expr => |ne| try self.checkNewExpr(ne),
             .type_expr => invalid_type, // Types are not values
             .bad_expr => invalid_type,
         };
+    }
+
+    /// Check new expression: new Map<K, V>() or new List<T>()
+    fn checkNewExpr(self: *Checker, ne: ast.NewExpr) CheckError!TypeIndex {
+        // Resolve the type being allocated
+        return try self.resolveTypeExpr(ne.type_expr);
     }
 
     /// Check identifier expression.
@@ -853,6 +860,43 @@ pub const Checker = struct {
                     else => {},
                 }
                 self.err.errorWithCode(f.span.start, .E303, "cannot access field on this type");
+                return invalid_type;
+            },
+            .map_type => |mt| {
+                // Map method access: map.set, map.get, map.has, map.size
+                if (std.mem.eql(u8, f.field, "set")) {
+                    // set(key, value) returns void
+                    const params = try self.allocator.alloc(types.FuncParam, 2);
+                    params[0] = .{ .name = "key", .type_idx = mt.key };
+                    params[1] = .{ .name = "value", .type_idx = mt.value };
+                    return try self.types.add(.{ .func = .{
+                        .params = params,
+                        .return_type = TypeRegistry.VOID,
+                    } });
+                } else if (std.mem.eql(u8, f.field, "get")) {
+                    // get(key) returns value type
+                    const params = try self.allocator.alloc(types.FuncParam, 1);
+                    params[0] = .{ .name = "key", .type_idx = mt.key };
+                    return try self.types.add(.{ .func = .{
+                        .params = params,
+                        .return_type = mt.value,
+                    } });
+                } else if (std.mem.eql(u8, f.field, "has")) {
+                    // has(key) returns bool
+                    const params = try self.allocator.alloc(types.FuncParam, 1);
+                    params[0] = .{ .name = "key", .type_idx = mt.key };
+                    return try self.types.add(.{ .func = .{
+                        .params = params,
+                        .return_type = TypeRegistry.BOOL,
+                    } });
+                } else if (std.mem.eql(u8, f.field, "size")) {
+                    // size() returns int
+                    return try self.types.add(.{ .func = .{
+                        .params = &.{},
+                        .return_type = TypeRegistry.INT,
+                    } });
+                }
+                self.errUndefined(f.span.start, f.field);
                 return invalid_type;
             },
             else => {
@@ -1362,6 +1406,15 @@ pub const Checker = struct {
                 // TODO: function types
                 return invalid_type;
             },
+            .map => |m| {
+                const key = try self.resolveTypeExpr(m.key);
+                const value = try self.resolveTypeExpr(m.value);
+                return try self.types.makeMap(key, value);
+            },
+            .list => |elem_idx| {
+                const elem = try self.resolveTypeExpr(elem_idx);
+                return try self.types.makeList(elem);
+            },
         };
     }
 
@@ -1832,6 +1885,7 @@ test "AST expr coverage - exhaustive" {
         .switch_expr,
         .block,
         .struct_init,
+        .new_expr,
         .type_expr,
         .bad_expr,
     };
@@ -1852,6 +1906,7 @@ test "AST expr coverage - exhaustive" {
             .switch_expr,
             .block,
             .struct_init,
+            .new_expr,
             .type_expr,
             .bad_expr,
             => true,

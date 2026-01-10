@@ -233,6 +233,17 @@ pub const NamedType = struct {
     underlying: TypeIndex,
 };
 
+/// Map type: Map<K, V> - built-in hash map
+pub const MapType = struct {
+    key: TypeIndex,
+    value: TypeIndex,
+};
+
+/// List type: List<T> - built-in dynamic array
+pub const ListType = struct {
+    elem: TypeIndex,
+};
+
 // ============================================================================
 // Type Union
 // ============================================================================
@@ -251,6 +262,8 @@ pub const Type = union(enum) {
     union_type: UnionType,
     func: FuncType,
     named: NamedType,
+    map_type: MapType,
+    list_type: ListType,
 
     /// Get a string representation of this type.
     pub fn format(
@@ -286,6 +299,8 @@ pub const Type = union(enum) {
             .union_type => |u| try writer.writeAll(u.name),
             .func => try writer.writeAll("fn(...)"),
             .named => |n| try writer.writeAll(n.name),
+            .map_type => try writer.writeAll("Map<...>"),
+            .list_type => try writer.writeAll("List<...>"),
         }
     }
 };
@@ -399,6 +414,9 @@ pub const TypeRegistry = struct {
                 const payload_aligned = (max_payload + 7) / 8 * 8;
                 break :blk 8 + payload_aligned;
             },
+            // Map and List are heap-allocated, so pointer size
+            .map_type => 8, // pointer to heap-allocated map
+            .list_type => 8, // pointer to heap-allocated list
             else => 8, // Default to 8 bytes for unknown types
         };
     }
@@ -438,6 +456,16 @@ pub const TypeRegistry = struct {
     /// Create a decimal type.
     pub fn makeDecimal(self: *TypeRegistry, precision: u8, scale: u8) !TypeIndex {
         return self.add(.{ .decimal = .{ .precision = precision, .scale = scale } });
+    }
+
+    /// Create a map type: Map<K, V>
+    pub fn makeMap(self: *TypeRegistry, key: TypeIndex, value: TypeIndex) !TypeIndex {
+        return self.add(.{ .map_type = .{ .key = key, .value = value } });
+    }
+
+    /// Create a list type: List<T>
+    pub fn makeList(self: *TypeRegistry, elem: TypeIndex) !TypeIndex {
+        return self.add(.{ .list_type = .{ .elem = elem } });
     }
 
     /// Look up a type name and return its index.

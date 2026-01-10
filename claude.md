@@ -267,7 +267,7 @@ zig build
 
 # 3. FINALLY: ALWAYS run x86_64 tests in Docker (catches platform-specific bugs)
 zig build -Dtarget=x86_64-linux-gnu
-docker run --platform linux/amd64 -v $(pwd):/cot -w /cot gcc:latest ./run_tests_x86_64.sh
+docker run --platform linux/amd64 -v $(pwd):/cot -w /cot cot-zig:0.15.2 ./run_tests_x86_64.sh
 ```
 
 **IMPORTANT: Always run BOTH native AND x86_64 tests.** The x86_64 tests catch platform-specific codegen bugs that won't appear on ARM64. Never skip the Docker tests.
@@ -303,41 +303,46 @@ This ensures new features are implemented across all compilation stages.
 
 The cot compiler uses native target detection. To test x86_64 codegen on an ARM64 Mac:
 
+### One-time setup: Build the Docker image
+```bash
+docker build --platform linux/amd64 -t cot-zig:0.15.2 -f Dockerfile.zig .
+```
+
 ### Step 1: Build cot for x86_64 Linux
 ```bash
 zig build -Dtarget=x86_64-linux-gnu
 ```
 
 ### Step 2: Compile and link in Docker
-Use the `gcc` Docker image (already has gcc pre-installed - no apt-get needed):
+Use the `cot-zig:0.15.2` Docker image (has zig pre-installed for consistent linking):
 ```bash
-# Compile .cot file + link with gcc in Docker (fast - no install step)
-docker run --platform linux/amd64 -v $(pwd):/cot -w /cot gcc:latest \
+# Compile .cot file + link with zig cc in Docker
+docker run --platform linux/amd64 -v $(pwd):/cot -w /cot cot-zig:0.15.2 \
   sh -c "./zig-out/bin/cot tests/test_return.cot -o ignored 2>&1; \
-         gcc -o test test_return.o && ./test; echo Exit: \$?"
+         zig cc -o test test_return.o && ./test; echo Exit: \$?"
 ```
 
 **IMPORTANT**:
 - The `-o` option specifies the executable name but cot outputs .o files to the current working directory (uses input basename + .o)
-- Must use `gcc` (not bare `ld`) because `main` returns a value - C runtime's `_start` calls `exit(main())`
+- Must use `zig cc` (not bare `ld`) because `main` returns a value - C runtime's `_start` calls `exit(main())`
 - Using bare `ld -e main` causes segfault because `ret` from main has nowhere to return to
 - Test files are located in the `tests/` directory
 - When compiling `tests/foo.cot`, the .o file is output as `./foo.o` (in cwd, not in tests/)
 
 ### Verified working test commands
 ```bash
-# ARM64 (native macOS) - use gcc to link since linker may fail
-zig build && ./zig-out/bin/cot tests/test_return.cot -o ignored 2>/dev/null && \
-  gcc -o test test_return.o && ./test; echo "Exit: $?"
+# ARM64 (native macOS) - cot now uses zig cc for linking
+zig build && ./zig-out/bin/cot tests/test_return.cot -o test 2>/dev/null && \
+  ./test; echo "Exit: $?"
 
-# x86_64 (Docker) - uses gcc image, no install needed
+# x86_64 (Docker) - uses zig image for consistent linking
 zig build -Dtarget=x86_64-linux-gnu
-docker run --platform linux/amd64 -v $(pwd):/cot -w /cot gcc:latest \
+docker run --platform linux/amd64 -v $(pwd):/cot -w /cot cot-zig:0.15.2 \
   sh -c "./zig-out/bin/cot tests/test_return.cot -o ignored 2>&1; \
-         gcc -o test test_return.o && ./test; echo Exit: \$?"
+         zig cc -o test test_return.o && ./test; echo Exit: \$?"
 
 # Run full x86_64 test suite in Docker
-docker run --platform linux/amd64 -v $(pwd):/cot -w /cot gcc:latest ./run_tests_x86_64.sh
+docker run --platform linux/amd64 -v $(pwd):/cot -w /cot cot-zig:0.15.2 ./run_tests_x86_64.sh
 ```
 
 ---

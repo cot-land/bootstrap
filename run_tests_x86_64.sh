@@ -57,6 +57,7 @@ get_expected() {
         test_mul) echo 42 ;;
         test_div) echo 42 ;;
         test_switch) echo 42 ;;
+        test_switch_multi) echo 42 ;;
         test_enum) echo 20 ;;
         test_enum_from_int) echo 20 ;;
         test_union) echo 42 ;;
@@ -91,8 +92,8 @@ for test_file in tests/test_*.cot; do
         fi
     fi
 
-    # Link with gcc (provides C runtime)
-    if ! gcc -o test_out "${name}.o" 2>/dev/null; then
+    # Link with zig cc (provides C runtime, consistent with cot linker)
+    if ! zig cc -o test_out "${name}.o" 2>/dev/null; then
         echo "FAIL $name (link failed)"
         FAIL=$((FAIL + 1))
         rm -f "${name}.o"
