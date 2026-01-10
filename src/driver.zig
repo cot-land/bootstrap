@@ -670,6 +670,23 @@ pub const Driver = struct {
             return value_id;
         }
 
+        // Handle select (ternary) - args[0] = cond, args[1] = then, args[2] = else
+        if (node.op == .select) {
+            const value_id = try func.newValue(.select, node.type_idx, block);
+            var value = func.getValue(value_id);
+            var arg_count: u8 = 0;
+            for (node.args()) |ir_arg_idx| {
+                if (ir_to_ssa.get(ir_arg_idx)) |ssa_arg_id| {
+                    if (arg_count < 3) {
+                        value.args_storage[arg_count] = ssa_arg_id;
+                        arg_count += 1;
+                    }
+                }
+            }
+            value.args_len = arg_count;
+            return value_id;
+        }
+
         // Handle branch - conditional jump with true/false targets
         if (node.op == .branch) {
             const value_id = try func.newValue(.branch, node.type_idx, block);
@@ -1170,9 +1187,8 @@ pub const Driver = struct {
 
         switch (value.op) {
             .const_int, .const_bool => {
-                // Move constant to rax (return register for integers/bools)
-                // aux field contains the constant value (0 or 1 for bool)
-                try x86_64.movRegImm64(buf, .rax, value.aux_int);
+                // Constants are used as operands by other instructions.
+                // Don't generate standalone code - it would clobber rax.
             },
             .const_string => {
                 // String literals are stored in rodata.
@@ -1403,6 +1419,38 @@ pub const Driver = struct {
                         try x86_64.movRegMem(buf, .r9, .rbp, local_offset);
                         try x86_64.cmpRegReg(buf, .r8, .r9);
                     }
+                }
+            },
+            .select => {
+                // Conditional select: args[0] = cond, args[1] = then, args[2] = else
+                // The condition (eq/ne/lt/etc) has already set flags
+                // Load else value into rax, then value into r8, cmove to select
+                const args = value.args();
+                if (args.len >= 3) {
+                    const else_val = func.getValue(args[2]);
+                    const then_val = func.getValue(args[1]);
+
+                    // Load else value into rax (unless it's already there from previous select)
+                    if (else_val.op == .const_int) {
+                        try x86_64.movRegImm64(buf, .rax, else_val.aux_int);
+                    } else if (else_val.op == .load) {
+                        const local_idx: usize = @intCast(else_val.aux_int);
+                        const local_offset: i32 = func.locals[local_idx].offset;
+                        try x86_64.movRegMem(buf, .rax, .rbp, local_offset);
+                    }
+                    // else if else_val.op == .select, result is already in rax
+
+                    // Load then value into r8
+                    if (then_val.op == .const_int) {
+                        try x86_64.movRegImm64(buf, .r8, then_val.aux_int);
+                    } else if (then_val.op == .load) {
+                        const local_idx: usize = @intCast(then_val.aux_int);
+                        const local_offset: i32 = func.locals[local_idx].offset;
+                        try x86_64.movRegMem(buf, .r8, .rbp, local_offset);
+                    }
+
+                    // cmove: if equal (ZF=1), move r8 to rax
+                    try x86_64.cmoveRegReg(buf, .rax, .r8);
                 }
             },
             .branch, .jump => {
@@ -1959,6 +2007,48 @@ pub const Driver = struct {
                         }
                     }
                     // Comparison result is in flags, will be used by branch
+                }
+            },
+            .select => {
+                // Conditional select: args[0] = cond, args[1] = then, args[2] = else
+                // The condition (eq/ne/lt/etc) has already set flags
+                // Use CSEL: csel x0, x8 (then), x9 (else), eq
+                const args = value.args();
+                if (args.len >= 3) {
+                    const else_val = func.getValue(args[2]);
+                    const then_val = func.getValue(args[1]);
+
+                    // Load else value into x9
+                    if (else_val.op == .const_int) {
+                        try aarch64.movRegImm64(buf, .x9, else_val.aux_int);
+                    } else if (else_val.op == .load) {
+                        const local_idx: usize = @intCast(else_val.aux_int);
+                        const x86_offset: i32 = func.locals[local_idx].offset;
+                        const local_offset: i32 = @as(i32, @intCast(func.frame_size)) + x86_offset;
+                        if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
+                            const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
+                            try aarch64.ldrRegImm(buf, .x9, .sp, offset_scaled);
+                        }
+                    } else if (else_val.op == .select) {
+                        // Result of previous select is in x0, move to x9
+                        try aarch64.movRegReg(buf, .x9, .x0);
+                    }
+
+                    // Load then value into x8
+                    if (then_val.op == .const_int) {
+                        try aarch64.movRegImm64(buf, .x8, then_val.aux_int);
+                    } else if (then_val.op == .load) {
+                        const local_idx: usize = @intCast(then_val.aux_int);
+                        const x86_offset: i32 = func.locals[local_idx].offset;
+                        const local_offset: i32 = @as(i32, @intCast(func.frame_size)) + x86_offset;
+                        if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
+                            const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
+                            try aarch64.ldrRegImm(buf, .x8, .sp, offset_scaled);
+                        }
+                    }
+
+                    // CSEL x0, x8, x9, eq: if equal, x0 = x8 (then), else x0 = x9 (else)
+                    try aarch64.csel(buf, .x0, .x8, .x9, .eq);
                 }
             },
             .branch => {

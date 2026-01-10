@@ -429,6 +429,7 @@ pub const Checker = struct {
             .array_literal => |al| try self.checkArrayLiteral(al),
             .paren => |p| try self.checkExpr(p.inner),
             .if_expr => |ie| try self.checkIfExpr(ie),
+            .switch_expr => |se| try self.checkSwitchExpr(se),
             .block => |b| try self.checkBlock(b),
             .struct_init => |si| try self.checkStructInit(si),
             .type_expr => invalid_type, // Types are not values
@@ -798,6 +799,53 @@ pub const Checker = struct {
 
         // If without else has void type
         return TypeRegistry.VOID;
+    }
+
+    /// Check switch expression.
+    fn checkSwitchExpr(self: *Checker, se: ast.SwitchExpr) CheckError!TypeIndex {
+        const subject_type = try self.checkExpr(se.subject);
+
+        // Track result type (from first case body)
+        var result_type: TypeIndex = TypeRegistry.VOID;
+        var first_case = true;
+
+        // Check each case
+        for (se.cases) |case| {
+            // Check each value in this case
+            for (case.values) |val_idx| {
+                const val_type = try self.checkExpr(val_idx);
+                // Each value must be comparable to subject
+                if (!self.isComparable(subject_type, val_type)) {
+                    self.err.errorWithCode(case.span.start, .E300, "case value not comparable to switch subject");
+                }
+            }
+
+            // Check case body
+            const body_type = try self.checkExpr(case.body);
+
+            if (first_case) {
+                result_type = body_type;
+                first_case = false;
+            } else {
+                // All case bodies must have same type
+                if (!self.types.equal(result_type, body_type)) {
+                    self.err.errorWithCode(case.span.start, .E300, "switch case has different type than previous cases");
+                }
+            }
+        }
+
+        // Check else body if present
+        if (se.else_body) |else_idx| {
+            const else_type = try self.checkExpr(else_idx);
+            if (!first_case and !self.types.equal(result_type, else_type)) {
+                self.err.errorWithCode(se.span.start, .E300, "switch else has different type than cases");
+            }
+            if (first_case) {
+                result_type = else_type;
+            }
+        }
+
+        return result_type;
     }
 
     /// Check block expression.

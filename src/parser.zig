@@ -829,6 +829,9 @@ pub const Parser = struct {
             .kw_if => {
                 return self.parseIfExpr();
             },
+            .kw_switch => {
+                return self.parseSwitchExpr();
+            },
             .lbrace => {
                 return self.parseBlock();
             },
@@ -897,6 +900,82 @@ pub const Parser = struct {
                     .then_branch = then_branch,
                     .else_branch = else_branch,
                     .span = Span.init(start, self.tok.span.start),
+                },
+            },
+        });
+    }
+
+    /// Parse switch expression: switch expr { cases }
+    fn parseSwitchExpr(self: *Parser) ParseError!?NodeIndex {
+        const start = self.pos();
+        self.advance(); // consume 'switch'
+
+        // Parse subject expression - just use parseOperand to avoid struct init ambiguity
+        // For more complex expressions like a.b.c, we'd need lookahead or a different approach
+        const subject = try self.parseOperand() orelse return null;
+
+        // Expect opening brace
+        if (!self.expect(.lbrace)) return null;
+
+        var cases = std.ArrayList(ast.SwitchCase){ .items = &.{}, .capacity = 0 };
+        defer cases.deinit(self.allocator);
+        var else_body: ?NodeIndex = null;
+
+        // Parse cases
+        while (!self.check(.rbrace) and !self.check(.eof)) {
+            const case_start = self.pos();
+
+            // Check for else case
+            if (self.match(.kw_else)) {
+                if (!self.expect(.fat_arrow)) return null;
+                else_body = try self.parseExpr() orelse return null;
+                _ = self.match(.comma); // optional trailing comma
+                continue;
+            }
+
+            // Parse case values (comma-separated)
+            var values = std.ArrayList(NodeIndex){ .items = &.{}, .capacity = 0 };
+            defer values.deinit(self.allocator);
+
+            // Parse first value
+            const first_val = try self.parseExpr() orelse return null;
+            try values.append(self.allocator, first_val);
+
+            // Parse additional comma-separated values
+            while (self.check(.comma) and !self.check(.fat_arrow)) {
+                self.advance(); // consume comma
+                // Check if next is fat_arrow (end of values) or else
+                if (self.check(.fat_arrow) or self.check(.kw_else)) break;
+                const val = try self.parseExpr() orelse return null;
+                try values.append(self.allocator, val);
+            }
+
+            // Expect =>
+            if (!self.expect(.fat_arrow)) return null;
+
+            // Parse body expression
+            const body = try self.parseExpr() orelse return null;
+
+            try cases.append(self.allocator, .{
+                .values = try self.allocator.dupe(NodeIndex, values.items),
+                .body = body,
+                .span = Span.init(case_start, self.tok.span.end),
+            });
+
+            // Optional trailing comma
+            _ = self.match(.comma);
+        }
+
+        const end = self.tok.span.end;
+        if (!self.expect(.rbrace)) return null;
+
+        return try self.ast.addNode(.{
+            .expr = .{
+                .switch_expr = .{
+                    .subject = subject,
+                    .cases = try self.allocator.dupe(ast.SwitchCase, cases.items),
+                    .else_body = else_body,
+                    .span = Span.init(start, end),
                 },
             },
         });

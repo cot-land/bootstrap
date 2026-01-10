@@ -1,0 +1,9 @@
+fn main() i64 {
+    var x = 2;
+    return switch x {
+        1 => 10,
+        2 => 42,
+        3 => 30,
+        else => 0,
+    };
+}

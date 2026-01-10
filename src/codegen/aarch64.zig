@@ -562,6 +562,18 @@ pub fn bCond(buf: *CodeBuffer, cond: Cond, offset: i19) !void {
     try emit32(buf, branchCond(cond, offset));
 }
 
+/// CSEL Xd, Xn, Xm, cond - conditional select
+/// If cond is true, Rd = Rn; else Rd = Rm
+pub fn csel(buf: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg, cond: Cond) !void {
+    // Encoding: 1|00|11010100|Rm|cond|00|Rn|Rd
+    const inst: u32 = 0x9A800000 // Base opcode for CSEL (64-bit)
+    | (@as(u32, @intFromEnum(rm)) << 16) // Rm at bits 20:16
+    | (@as(u32, @intFromEnum(cond)) << 12) // cond at bits 15:12
+    | (@as(u32, @intFromEnum(rn)) << 5) // Rn at bits 9:5
+    | @as(u32, @intFromEnum(rd)); // Rd at bits 4:0
+    try emit32(buf, inst);
+}
+
 /// BL with relocation
 pub fn callSymbol(buf: *CodeBuffer, symbol: []const u8) !void {
     try buf.addRelocation(.pc_rel_32, symbol, 0);

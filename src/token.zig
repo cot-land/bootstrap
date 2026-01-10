@@ -56,6 +56,7 @@ pub const Token = enum(u8) {
     question_question, // ??
     question_dot, // ?.
     arrow, // ->
+    fat_arrow, // =>
 
     // Delimiters
     lparen, // (
@@ -76,6 +77,7 @@ pub const Token = enum(u8) {
     kw_struct,
     kw_if,
     kw_else,
+    kw_switch,
     kw_while,
     kw_for,
     kw_in,
@@ -160,6 +162,7 @@ pub const Token = enum(u8) {
             .question_question => "??",
             .question_dot => "?.",
             .arrow => "->",
+            .fat_arrow => "=>",
             .lparen => "(",
             .rparen => ")",
             .lbracket => "[",
@@ -176,6 +179,7 @@ pub const Token = enum(u8) {
             .kw_struct => "struct",
             .kw_if => "if",
             .kw_else => "else",
+            .kw_switch => "switch",
             .kw_while => "while",
             .kw_for => "for",
             .kw_in => "in",
@@ -226,6 +230,7 @@ pub const keywords = std.StaticStringMap(Token).initComptime(.{
     .{ "struct", .kw_struct },
     .{ "if", .kw_if },
     .{ "else", .kw_else },
+    .{ "switch", .kw_switch },
     .{ "while", .kw_while },
     .{ "for", .kw_for },
     .{ "in", .kw_in },

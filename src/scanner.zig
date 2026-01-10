@@ -403,6 +403,9 @@ pub const Scanner = struct {
             '=' => if (self.ch == '=') blk: {
                 self.advance();
                 break :blk .equal_equal;
+            } else if (self.ch == '>') blk: {
+                self.advance();
+                break :blk .fat_arrow;
             } else .equal,
 
             '!' => if (self.ch == '=') blk: {

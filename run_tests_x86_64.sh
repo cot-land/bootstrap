@@ -54,6 +54,7 @@ get_expected() {
         test_sub) echo 42 ;;
         test_mul) echo 42 ;;
         test_div) echo 42 ;;
+        test_switch) echo 42 ;;
         *) echo "" ;;
     esac
 }

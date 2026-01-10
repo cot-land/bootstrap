@@ -137,6 +137,7 @@ pub const Expr = union(enum) {
     array_literal: ArrayLiteral,
     paren: Paren,
     if_expr: IfExpr,
+    switch_expr: SwitchExpr,
     block: Block,
     struct_init: StructInit,
     // Type expressions
@@ -157,6 +158,7 @@ pub const Expr = union(enum) {
             .array_literal => |e| e.span,
             .paren => |e| e.span,
             .if_expr => |e| e.span,
+            .switch_expr => |e| e.span,
             .block => |e| e.span,
             .struct_init => |e| e.span,
             .type_expr => |e| e.span,
@@ -251,6 +253,22 @@ pub const IfExpr = struct {
     condition: NodeIndex,
     then_branch: NodeIndex,
     else_branch: ?NodeIndex,
+    span: Span,
+};
+
+/// Switch expression
+/// switch value { .a => x, .b, .c => y, else => z }
+pub const SwitchExpr = struct {
+    subject: NodeIndex, // value being switched on
+    cases: []const SwitchCase, // case arms
+    else_body: ?NodeIndex, // else => body (optional)
+    span: Span,
+};
+
+/// A single switch case arm
+pub const SwitchCase = struct {
+    values: []const NodeIndex, // can match multiple values: .a, .b => ...
+    body: NodeIndex, // expression or block
     span: Span,
 };
 

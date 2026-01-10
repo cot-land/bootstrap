@@ -489,6 +489,28 @@ pub fn jccRel8(buf: *CodeBuffer, cc: CondCode, offset: i8) !void {
 }
 
 // ============================================================================
+// CMOVcc Instructions (conditional move)
+// ============================================================================
+
+/// CMOVcc r64, r64 - conditional move based on condition code
+pub fn cmovccRegReg(buf: *CodeBuffer, cc: CondCode, dst: Reg, src: Reg) !void {
+    try buf.emit8(rex(true, dst, src));
+    try buf.emit8(0x0F);
+    try buf.emit8(0x40 | @intFromEnum(cc));
+    try buf.emit8(ModRM.regReg(dst, src));
+}
+
+/// CMOVE r64, r64 - move if equal (ZF=1)
+pub fn cmoveRegReg(buf: *CodeBuffer, dst: Reg, src: Reg) !void {
+    try cmovccRegReg(buf, .e, dst, src);
+}
+
+/// CMOVNE r64, r64 - move if not equal (ZF=0)
+pub fn cmovneRegReg(buf: *CodeBuffer, dst: Reg, src: Reg) !void {
+    try cmovccRegReg(buf, .ne, dst, src);
+}
+
+// ============================================================================
 // LEA Instruction
 // ============================================================================
 

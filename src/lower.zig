@@ -561,6 +561,7 @@ pub const Lowerer = struct {
             .field_access => |field| self.lowerFieldAccess(field),
             .array_literal => |al| self.lowerArrayLiteral(al),
             .if_expr => |if_expr| self.lowerIfExpr(if_expr),
+            .switch_expr => |switch_expr| self.lowerSwitchExpr(switch_expr),
             .paren => |paren| self.lowerExpr(paren.inner),
             .struct_init => |si| self.lowerStructInit(si),
             .block => ir.null_node,  // Block expressions not yet implemented
@@ -1132,6 +1133,63 @@ pub const Lowerer = struct {
             .withArgs(&.{ cond, then_val, else_val });
 
         return try fb.emit(node);
+    }
+
+    /// Lower switch expression to nested selects.
+    /// switch x { 1 => a, 2 => b, else => c } becomes:
+    /// select(x == 1, a, select(x == 2, b, c))
+    fn lowerSwitchExpr(self: *Lowerer, switch_expr: ast.SwitchExpr) Allocator.Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+
+        // Evaluate subject once
+        const subject = try self.lowerExpr(switch_expr.subject);
+
+        // Get the else value (default), or use a placeholder if no else
+        var result = if (switch_expr.else_body) |else_idx|
+            try self.lowerExpr(else_idx)
+        else
+            ir.null_node;
+
+        // Process cases in reverse order to build nested selects from inside out
+        // For: switch x { 1 => a, 2 => b, else => c }
+        // We build: select(x == 2, b, c) first, then select(x == 1, a, that)
+        var case_idx: usize = switch_expr.cases.len;
+        while (case_idx > 0) {
+            case_idx -= 1;
+            const case = switch_expr.cases[case_idx];
+
+            // Evaluate case body
+            const case_body = try self.lowerExpr(case.body);
+
+            // Build OR of all value comparisons for this case
+            // For case "1, 2 => x", build: (subject == 1) or (subject == 2)
+            var cond: ir.NodeIndex = ir.null_node;
+            for (case.values) |val_idx| {
+                const val = try self.lowerExpr(val_idx);
+                // Generate comparison: subject == val
+                const cmp = ir.Node.init(.eq, TypeRegistry.BOOL, Span.fromPos(Pos.zero))
+                    .withArgs(&.{ subject, val });
+                const cmp_idx = try fb.emit(cmp);
+
+                if (cond == ir.null_node) {
+                    cond = cmp_idx;
+                } else {
+                    // OR with previous condition
+                    const or_node = ir.Node.init(.@"or", TypeRegistry.BOOL, Span.fromPos(Pos.zero))
+                        .withArgs(&.{ cond, cmp_idx });
+                    cond = try fb.emit(or_node);
+                }
+            }
+
+            // Build select: if (cond) case_body else result
+            if (cond != ir.null_node) {
+                const select = ir.Node.init(.select, TypeRegistry.VOID, Span.fromPos(Pos.zero))
+                    .withArgs(&.{ cond, case_body, result });
+                result = try fb.emit(select);
+            }
+        }
+
+        return result;
     }
 
     // ========================================================================

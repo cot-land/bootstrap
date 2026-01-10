@@ -91,6 +91,10 @@ pub const Op = enum(u8) {
     @"or",
     not,
 
+    // Conditional select (ternary)
+    // args[0] = condition, args[1] = then_value, args[2] = else_value
+    select,
+
     // Memory
     load,
     store,
