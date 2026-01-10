@@ -1,0 +1,10 @@
+enum Color: i64 {
+    red = 10,
+    green = 20,
+    blue = 30,
+}
+
+fn main() int {
+    var c = @enumFromInt(Color, 20);
+    return @intFromEnum(c);
+}

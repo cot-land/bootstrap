@@ -1,0 +1,16 @@
+// Test switch on tagged union with payload capture
+union Result {
+    ok: int,
+    err: int,
+}
+
+fn main() int {
+    // Create a union value with ok variant
+    var r = Result.ok(42);
+
+    // Switch on the union and extract the payload
+    return switch r {
+        .ok |val| => val,
+        .err |e| => e,
+    };
+}

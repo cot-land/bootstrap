@@ -174,7 +174,8 @@ pub const Parser = struct {
             .kw_var, .kw_let => try self.parseVarDecl(),
             .kw_const => try self.parseConstDecl(),
             .kw_struct => try self.parseStructDecl(),
-            // Note: enum parsing disabled until kw_enum is added to token.zig
+            .kw_enum => try self.parseEnumDecl(),
+            .kw_union => try self.parseUnionDecl(),
             else => {
                 self.syntaxError("expected declaration");
                 return null;
@@ -325,7 +326,7 @@ pub const Parser = struct {
         });
     }
 
-    /// Parse enum declaration: enum Name { variants }
+    /// Parse enum declaration: enum Name { variants } or enum Name: Type { variants }
     fn parseEnumDecl(self: *Parser) !?NodeIndex {
         const start = self.pos();
         self.advance(); // consume 'enum'
@@ -336,6 +337,16 @@ pub const Parser = struct {
         }
         const name = self.tok.text;
         self.advance();
+
+        // Optional backing type: enum Name: u8 { ... }
+        var backing_type: ?NodeIndex = null;
+        if (self.match(.colon)) {
+            backing_type = try self.parseType();
+            if (backing_type == null) {
+                self.syntaxError("expected backing type after ':'");
+                return null;
+            }
+        }
 
         if (!self.expect(.lbrace)) return null;
 
@@ -371,7 +382,66 @@ pub const Parser = struct {
             .decl = .{
                 .enum_decl = .{
                     .name = name,
+                    .backing_type = backing_type,
                     .variants = try self.allocator.dupe(ast.EnumVariant, variants.items),
+                    .span = Span.init(start, self.tok.span.start),
+                },
+            },
+        });
+    }
+
+    /// Parse union declaration: union Name { variant: Type, ... }
+    fn parseUnionDecl(self: *Parser) !?NodeIndex {
+        const start = self.pos();
+        self.advance(); // consume 'union'
+
+        if (!self.check(.identifier)) {
+            self.err.errorWithCode(self.pos(), .E203, "expected union name");
+            return null;
+        }
+        const name = self.tok.text;
+        self.advance();
+
+        if (!self.expect(.lbrace)) return null;
+
+        var variants = std.ArrayList(ast.UnionVariant){ .items = &.{}, .capacity = 0 };
+        defer variants.deinit(self.allocator);
+
+        while (!self.check(.rbrace) and !self.check(.eof)) {
+            if (!self.check(.identifier)) {
+                self.syntaxError("expected variant name");
+                break;
+            }
+            const variant_name = self.tok.text;
+            const variant_start = self.pos();
+            self.advance();
+
+            // Optional payload type: variant_name: Type
+            var type_expr: ?NodeIndex = null;
+            if (self.match(.colon)) {
+                type_expr = try self.parseType();
+                if (type_expr == null) {
+                    self.syntaxError("expected type after ':'");
+                    return null;
+                }
+            }
+
+            try variants.append(self.allocator, .{
+                .name = variant_name,
+                .type_expr = type_expr,
+                .span = Span.init(variant_start, self.tok.span.start),
+            });
+
+            if (!self.match(.comma)) break;
+        }
+
+        if (!self.expect(.rbrace)) return null;
+
+        return try self.ast.addNode(.{
+            .decl = .{
+                .union_decl = .{
+                    .name = name,
+                    .variants = try self.allocator.dupe(ast.UnionVariant, variants.items),
                     .span = Span.init(start, self.tok.span.start),
                 },
             },
@@ -736,6 +806,28 @@ pub const Parser = struct {
         const start = self.pos();
 
         switch (self.tok.tok) {
+            .dot => {
+                // Inferred variant literal: .variant_name
+                // Used in switch cases to match union/enum variants
+                self.advance(); // consume '.'
+                if (!self.check(.identifier)) {
+                    self.err.errorWithCode(self.pos(), .E203, "expected variant name after '.'");
+                    return null;
+                }
+                const name = self.tok.text;
+                const end = self.tok.span.end;
+                self.advance();
+                // Represent as field_access with null_node base (inferred type)
+                return try self.ast.addNode(.{
+                    .expr = .{
+                        .field_access = .{
+                            .base = ast.null_node,
+                            .field = name,
+                            .span = Span.init(start, end),
+                        },
+                    },
+                });
+            },
             .identifier => {
                 const name = self.tok.text;
                 self.advance();
@@ -885,6 +977,32 @@ pub const Parser = struct {
                     },
                 });
             },
+            .at => {
+                // Builtin call: @intFromEnum(x), @import("foo"), etc.
+                self.advance(); // consume '@'
+
+                if (!self.check(.identifier)) {
+                    self.err.errorWithCode(self.pos(), .E203, "expected builtin name after '@'");
+                    return null;
+                }
+
+                // Create synthetic name with @ prefix
+                const builtin_name = self.tok.text;
+                const end = self.tok.span.end;
+                self.advance();
+
+                // Allocate "@name" string
+                const full_name = try std.fmt.allocPrint(self.allocator, "@{s}", .{builtin_name});
+
+                return try self.ast.addNode(.{
+                    .expr = .{
+                        .identifier = .{
+                            .name = full_name,
+                            .span = Span.init(start, end),
+                        },
+                    },
+                });
+            },
             else => {
                 self.err.errorWithCode(self.pos(), .E201, "expected expression");
                 return null;
@@ -958,11 +1076,12 @@ pub const Parser = struct {
             }
 
             // Parse case values (comma-separated)
+            // Use parseOperand (not parseExpr) to avoid consuming | as binary OR
             var values = std.ArrayList(NodeIndex){ .items = &.{}, .capacity = 0 };
             defer values.deinit(self.allocator);
 
-            // Parse first value
-            const first_val = try self.parseExpr() orelse return null;
+            // Parse first value - use parsePrimaryExpr to handle field access chains
+            const first_val = try self.parsePrimaryExpr() orelse return null;
             try values.append(self.allocator, first_val);
 
             // Parse additional comma-separated values
@@ -970,8 +1089,23 @@ pub const Parser = struct {
                 self.advance(); // consume comma
                 // Check if next is fat_arrow (end of values) or else
                 if (self.check(.fat_arrow) or self.check(.kw_else)) break;
-                const val = try self.parseExpr() orelse return null;
+                const val = try self.parsePrimaryExpr() orelse return null;
                 try values.append(self.allocator, val);
+            }
+
+            // Check for optional payload capture: .ok |val| => ...
+            var capture: ?[]const u8 = null;
+            if (self.match(.pipe)) {
+                // Parse capture name
+                if (self.check(.identifier)) {
+                    capture = self.tok.text;
+                    self.advance(); // consume identifier
+                } else {
+                    self.syntaxError("expected identifier for payload capture");
+                    return null;
+                }
+                // Expect closing |
+                if (!self.expect(.pipe)) return null;
             }
 
             // Expect =>
@@ -983,6 +1117,7 @@ pub const Parser = struct {
             try cases.append(self.allocator, .{
                 .values = try self.allocator.dupe(NodeIndex, values.items),
                 .body = body,
+                .capture = capture,
                 .span = Span.init(case_start, self.tok.span.end),
             });
 
@@ -1535,4 +1670,133 @@ test "parser slice expression" {
 
     try std.testing.expect(tree.file != null);
     try std.testing.expect(!err_reporter.hasErrors());
+}
+
+test "parser enum declaration" {
+    const content = "enum Color { red, green, blue }";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var src = Source.init(alloc, "test.cot", content);
+    var err_reporter = ErrorReporter.init(&src, null);
+    var scan = Scanner.initWithErrors(&src, &err_reporter);
+    var tree = Ast.init(alloc);
+
+    var parser = Parser.init(alloc, &scan, &tree, &err_reporter);
+    try parser.parseFile();
+
+    try std.testing.expect(tree.file != null);
+    try std.testing.expect(!err_reporter.hasErrors());
+    try std.testing.expect(tree.file.?.decls.len > 0);
+    const decl = tree.getDecl(tree.file.?.decls[0]);
+    try std.testing.expect(decl != null);
+    try std.testing.expect(decl.? == .enum_decl);
+    try std.testing.expectEqualStrings("Color", decl.?.enum_decl.name);
+    try std.testing.expectEqual(@as(usize, 3), decl.?.enum_decl.variants.len);
+    try std.testing.expect(decl.?.enum_decl.backing_type == null);
+}
+
+test "parser enum with backing type" {
+    const content = "enum Token: u8 { eof, ident, number }";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var src = Source.init(alloc, "test.cot", content);
+    var err_reporter = ErrorReporter.init(&src, null);
+    var scan = Scanner.initWithErrors(&src, &err_reporter);
+    var tree = Ast.init(alloc);
+
+    var parser = Parser.init(alloc, &scan, &tree, &err_reporter);
+    try parser.parseFile();
+
+    try std.testing.expect(tree.file != null);
+    try std.testing.expect(!err_reporter.hasErrors());
+    try std.testing.expect(tree.file.?.decls.len > 0);
+    const decl = tree.getDecl(tree.file.?.decls[0]);
+    try std.testing.expect(decl != null);
+    try std.testing.expect(decl.? == .enum_decl);
+    try std.testing.expectEqualStrings("Token", decl.?.enum_decl.name);
+    try std.testing.expectEqual(@as(usize, 3), decl.?.enum_decl.variants.len);
+    try std.testing.expect(decl.?.enum_decl.backing_type != null);
+}
+
+test "parser enum with explicit values" {
+    const content = "enum Status { ok = 0, error = 100, pending = 200 }";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var src = Source.init(alloc, "test.cot", content);
+    var err_reporter = ErrorReporter.init(&src, null);
+    var scan = Scanner.initWithErrors(&src, &err_reporter);
+    var tree = Ast.init(alloc);
+
+    var parser = Parser.init(alloc, &scan, &tree, &err_reporter);
+    try parser.parseFile();
+
+    try std.testing.expect(tree.file != null);
+    try std.testing.expect(!err_reporter.hasErrors());
+    try std.testing.expect(tree.file.?.decls.len > 0);
+    const decl = tree.getDecl(tree.file.?.decls[0]);
+    try std.testing.expect(decl != null);
+    try std.testing.expect(decl.? == .enum_decl);
+    try std.testing.expectEqualStrings("Status", decl.?.enum_decl.name);
+    try std.testing.expectEqual(@as(usize, 3), decl.?.enum_decl.variants.len);
+    // First variant should have an explicit value
+    try std.testing.expect(decl.?.enum_decl.variants[0].value != null);
+}
+
+test "parser union declaration" {
+    const content = "union Result { ok: int, err: string }";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var src = Source.init(alloc, "test.cot", content);
+    var err_reporter = ErrorReporter.init(&src, null);
+    var scan = Scanner.initWithErrors(&src, &err_reporter);
+    var tree = Ast.init(alloc);
+
+    var parser = Parser.init(alloc, &scan, &tree, &err_reporter);
+    try parser.parseFile();
+
+    try std.testing.expect(tree.file != null);
+    try std.testing.expect(!err_reporter.hasErrors());
+    try std.testing.expect(tree.file.?.decls.len > 0);
+    const decl = tree.getDecl(tree.file.?.decls[0]);
+    try std.testing.expect(decl != null);
+    try std.testing.expect(decl.? == .union_decl);
+    try std.testing.expectEqualStrings("Result", decl.?.union_decl.name);
+    try std.testing.expectEqual(@as(usize, 2), decl.?.union_decl.variants.len);
+    // First variant should have a type
+    try std.testing.expect(decl.?.union_decl.variants[0].type_expr != null);
+}
+
+test "parser union with unit variant" {
+    const content = "union Option { some: int, none }";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var src = Source.init(alloc, "test.cot", content);
+    var err_reporter = ErrorReporter.init(&src, null);
+    var scan = Scanner.initWithErrors(&src, &err_reporter);
+    var tree = Ast.init(alloc);
+
+    var parser = Parser.init(alloc, &scan, &tree, &err_reporter);
+    try parser.parseFile();
+
+    try std.testing.expect(tree.file != null);
+    try std.testing.expect(!err_reporter.hasErrors());
+    try std.testing.expect(tree.file.?.decls.len > 0);
+    const decl = tree.getDecl(tree.file.?.decls[0]);
+    try std.testing.expect(decl != null);
+    try std.testing.expect(decl.? == .union_decl);
+    try std.testing.expectEqualStrings("Option", decl.?.union_decl.name);
+    try std.testing.expectEqual(@as(usize, 2), decl.?.union_decl.variants.len);
+    // First variant has type, second doesn't (unit variant)
+    try std.testing.expect(decl.?.union_decl.variants[0].type_expr != null);
+    try std.testing.expect(decl.?.union_decl.variants[1].type_expr == null);
 }

@@ -1,0 +1,12 @@
+// Test tagged union construction
+union Result {
+    ok: int,
+    err: int,
+}
+
+fn main() int {
+    // Create a union value with ok variant
+    var r = Result.ok(42);
+    // For now, just return a constant to verify construction works
+    return 42;
+}

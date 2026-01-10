@@ -46,20 +46,20 @@ These features are used extensively in all .cot files and must work first.
 | Feature | Status | Used In | Notes |
 |---------|--------|---------|-------|
 | Simple enum | Implemented | All | `enum Color { red, green, blue }` |
-| Enum with backing type | **Gap** | token.cot, errors.cot | `enum Token: u8 { ... }` |
-| Enum with explicit values | **Gap** | errors.cot | `E100 = 100` |
-| `@intFromEnum(e)` | **Gap** | errors.cot | Convert enum to int |
-| `@enumFromInt(T, i)` | **Gap** | - | Convert int to enum |
+| Enum with backing type | Implemented | token.cot, errors.cot | `enum Token: u8 { ... }` |
+| Enum with explicit values | Implemented | errors.cot | `E100 = 100` |
+| `@intFromEnum(e)` | Implemented | errors.cot | Convert enum to int |
+| `@enumFromInt(T, i)` | Implemented | - | Convert int to enum |
 
 ### Tagged Unions
 
 | Feature | Status | Used In | Notes |
 |---------|--------|---------|-------|
-| Union definition | **Gap** | ast.cot, types.cot, ir.cot | `union Decl { fn_decl: FnDecl, ... }` |
-| Union construction | **Gap** | All | `Decl.fn_decl(FnDecl{...})` |
-| Switch on union | **Gap** | All | `switch d { .fn_decl \|f\| => f.span }` |
-| Payload capture | **Gap** | All | `\|f\|` captures the payload |
-| Unit variants | **Gap** | ir.cot | `none,` (no payload) |
+| Union definition | Implemented | ast.cot, types.cot, ir.cot | Parsing and type checking done |
+| Union construction | Implemented | All | `Result.ok(42)` |
+| Switch on union | Implemented | All | `switch r { .ok \|val\| => val }` |
+| Payload capture | Implemented | All | `\|val\|` captures the payload |
+| Unit variants | Partial | ir.cot | Parsing done, no payload = `none,` |
 
 ### Arrays and Slices
 
@@ -227,7 +227,7 @@ Some features depend on others. Suggested implementation order:
 4. Compound assignment (`+=`, etc.)
 
 ### Tier 2 (Core Patterns)
-1. Tagged unions with switch/capture
+1. ~~Tagged unions with switch/capture~~ - **Done**
 2. If/while capture syntax (`if x |val| { }`)
 3. `??` null coalescing
 4. `.?` optional unwrap
@@ -261,14 +261,14 @@ Some features depend on others. Suggested implementation order:
 
 | File | LOC | Key Dependencies | Ready? |
 |------|-----|------------------|--------|
-| token.cot | 171 | Enum w/ backing type, @intFromEnum | Mostly |
+| token.cot | 171 | ~~Enum w/ backing type~~, ~~@intFromEnum~~ | **Yes** |
 | source.cot | 120 | @maxInt, @min, @max | Close |
-| scanner.cot | 401 | String ops, for-index, switch | Closer |
-| ast.cot | 513 | Tagged unions, type alias | No |
-| types.cot | 458 | Tagged unions, switch | No |
-| ir.cot | 664 | Tagged unions, List<T>, Map | No |
-| errors.cot | 198 | Enum values, fn types, interpolation | No |
-| parser.cot | 1289 | Tagged unions, ??, .?, switch | No |
+| scanner.cot | 401 | String ops, for-index, ~~switch~~ | Closer |
+| ast.cot | 513 | ~~Tagged unions~~, type alias | Closer |
+| types.cot | 458 | ~~Tagged unions~~, ~~switch~~ | Closer |
+| ir.cot | 664 | ~~Tagged unions~~, List<T>, Map | Closer |
+| errors.cot | 198 | ~~Enum values~~, fn types, interpolation | Close |
+| parser.cot | 1289 | ~~Tagged unions~~, ??, .?, ~~switch~~ | Closer |
 | checker.cot | 963 | Everything | No |
 
 ---
@@ -294,20 +294,27 @@ The following features were implemented in recent development sessions:
 ### Codegen
 - **ARM64 (macOS)**: Full Mach-O object file generation with relocations
 - **x86_64 (Linux)**: Full ELF object file generation with relocations
-- 36 tests passing on both architectures
+- 40 tests passing on both architectures
+
+### Tagged Unions - **Complete**
+- **Union definition**: Parsing `union Name { variant: Type, ... }` syntax
+- **Union construction**: `Result.ok(42)` creates a union value with payload
+- **Switch on union**: `switch r { .ok |val| => val, .err |e| => e }`
+- **Payload capture**: `|val|` captures the union payload in switch cases
+- **Type system**: `union_type` in registry with variants and 8-byte aligned layout (tag + payload)
 
 ---
 
 ## Notes
 
-### Tagged Unions are Critical
+### Tagged Unions are Critical - **NOW IMPLEMENTED**
 
 Almost every .cot file uses tagged unions extensively:
 - `ast.cot`: Decl, Expr, Stmt, TypeExpr unions
 - `types.cot`: Type union
 - `ir.cot`: Op enum, Aux union
 
-Without tagged unions with payload capture, self-hosting is impossible.
+Tagged unions with payload capture are now working on both ARM64 and x86_64.
 
 ### Built-in Generics Required
 
@@ -329,8 +336,8 @@ The switch must work as an expression (returns value) with payload capture.
 
 ### Remaining Critical Gaps for Self-Hosting
 
-1. **Tagged unions** - The single most important missing feature
-2. **Enum with backing type** - `enum Token: u8 { ... }`
-3. **@intFromEnum** - Convert enum to int for switch
-4. **Map<K,V>** - Symbol tables and lookup
-5. **Methods** - `fn method(self: *T)` pattern
+1. ~~**Tagged unions**~~ - **DONE** (construction + switch with payload capture)
+2. **Map<K,V>** - Symbol tables and lookup
+3. **Methods** - `fn method(self: *T)` pattern
+4. **String interpolation** - `"Error: ${msg}"` syntax
+5. **@maxInt/@minInt** - Integer bounds for type checks

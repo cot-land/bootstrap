@@ -121,7 +121,7 @@ pub const Op = enum(u8) {
     /// Get array element address. args[0] = array addr, args[1] = index
     addr_index,
 
-    // ========== Struct/Array ==========
+    // ========== Struct/Array/Union ==========
     /// Get struct field. aux = field index, args[0] = struct value
     field,
     /// Get array/slice element. args[0] = array, args[1] = index
@@ -130,6 +130,12 @@ pub const Op = enum(u8) {
     slice,
     /// Index into slice. args[0] = slice local, args[1] = index. aux = elem_size
     slice_index,
+    /// Initialize union. aux = variant index (tag), args[0] = payload (if any)
+    union_init,
+    /// Get union tag. args[0] = union value
+    union_tag,
+    /// Get union payload. aux = variant index, args[0] = union value
+    union_payload,
 
     // ========== Control Flow ==========
     /// Function call. args[0] = func, args[1..] = arguments

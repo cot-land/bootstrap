@@ -57,6 +57,10 @@ get_expected() {
         test_switch) echo 42 ;;
         test_for_array) echo 60 ;;
         test_for_slice) echo 90 ;;
+        test_enum) echo 20 ;;
+        test_enum_from_int) echo 20 ;;
+        test_union) echo 42 ;;
+        test_union_switch) echo 42 ;;
         *) echo "" ;;
     esac
 }

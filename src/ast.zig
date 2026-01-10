@@ -47,6 +47,7 @@ pub const Decl = union(enum) {
     const_decl: ConstDecl,
     struct_decl: StructDecl,
     enum_decl: EnumDecl,
+    union_decl: UnionDecl,
     // For error recovery
     bad_decl: BadDecl,
 
@@ -57,6 +58,7 @@ pub const Decl = union(enum) {
             .const_decl => |d| d.span,
             .struct_decl => |d| d.span,
             .enum_decl => |d| d.span,
+            .union_decl => |d| d.span,
             .bad_decl => |d| d.span,
         };
     }
@@ -95,9 +97,10 @@ pub const StructDecl = struct {
     span: Span,
 };
 
-/// enum { variants }
+/// enum Name { variants } or enum Name: BackingType { variants }
 pub const EnumDecl = struct {
     name: []const u8,
+    backing_type: ?NodeIndex, // optional backing type like u8, i32
     variants: []const EnumVariant,
     span: Span,
 };
@@ -118,6 +121,20 @@ pub const Field = struct {
 pub const EnumVariant = struct {
     name: []const u8,
     value: ?NodeIndex, // explicit value
+    span: Span,
+};
+
+/// union Name { variants } - Tagged union declaration
+pub const UnionDecl = struct {
+    name: []const u8,
+    variants: []const UnionVariant,
+    span: Span,
+};
+
+/// Union variant: name: Type or name (no payload)
+pub const UnionVariant = struct {
+    name: []const u8,
+    type_expr: ?NodeIndex, // null = no payload (unit variant)
     span: Span,
 };
 
@@ -258,6 +275,7 @@ pub const IfExpr = struct {
 
 /// Switch expression
 /// switch value { .a => x, .b, .c => y, else => z }
+/// With payload capture: switch u { .ok |val| => val, .err |e| => 0 }
 pub const SwitchExpr = struct {
     subject: NodeIndex, // value being switched on
     cases: []const SwitchCase, // case arms
@@ -269,6 +287,7 @@ pub const SwitchExpr = struct {
 pub const SwitchCase = struct {
     values: []const NodeIndex, // can match multiple values: .a, .b => ...
     body: NodeIndex, // expression or block
+    capture: ?[]const u8, // optional payload capture: .ok |val| => ...
     span: Span,
 };
 

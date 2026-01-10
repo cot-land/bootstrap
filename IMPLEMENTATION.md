@@ -40,6 +40,11 @@ Build a complete compiler in Zig that can compile simple cot programs.
 - [x] Slice indexing (runtime) - s[i] access
 - [x] Switch expressions - switch x { 1 => a, 2 => b, else => c }
 - [x] For-in loops - `for x in arr { ... }` (arrays and slices)
+- [x] Enum with backing type - `enum Color: i64 { red = 10, green = 20 }`
+- [x] @intFromEnum builtin - `@intFromEnum(Color.green)` returns 20
+- [x] @enumFromInt builtin - `@enumFromInt(Color, 20)` returns Color.green
+- [x] Tagged union parsing - `union Result { ok: int, err: string }` (parse + type check only)
+- [x] Tagged union codegen - construction (`Result.ok(42)`) and switch matching with payload capture (`switch r { .ok |val| => val }`)
 - [ ] Standard library basics (print, memory)
 
 **Automated Test Runner**
@@ -60,10 +65,10 @@ Running with `--debug-codegen` will show warnings for any unhandled SSA operatio
 ### Verified Test Results (January 2026)
 
 **Test Counts:**
-- 129 Zig embedded tests (unit tests in source files)
-- 36 binary tests (.cot test files)
+- 135+ Zig embedded tests (unit tests in source files)
+- 40 binary tests (.cot test files)
 
-**Both ARM64 and x86_64** - 36/36 tests pass
+**Both ARM64 and x86_64** - 40/40 tests pass (40 + 1 skip)
 
 | Test File | Expected | ARM64 | x86_64 |
 |-----------|----------|-------|--------|
@@ -93,8 +98,10 @@ Running with `--debug-codegen` will show warnings for any unhandled SSA operatio
 | test_slice_index.cot (s[i] access) | 30 | PASS | PASS |
 | test_for_array.cot (for x in arr) | 60 | PASS | PASS |
 | test_for_slice.cot (for x in slice) | 90 | PASS | PASS |
+| test_union.cot (union construction) | 42 | PASS | PASS |
+| test_union_switch.cot (switch with payload capture) | 42 | PASS | PASS |
 
-**All tests pass** - conditionals, while loops, string comparisons, switch expressions, slice indexing, and for-in loops now working.
+**All tests pass** - conditionals, while loops, string comparisons, switch expressions, slice indexing, for-in loops, and tagged unions with payload capture now working.
 
 ### Testing Commands
 

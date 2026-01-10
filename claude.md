@@ -261,14 +261,16 @@ Before any commit or after any code changes, **always run tests in this order**:
 # 1. FIRST: Run Zig embedded tests (catches compilation and unit test errors)
 zig build test
 
-# 2. THEN: Build the compiler
+# 2. THEN: Build the compiler and run native tests
 zig build
+./run_tests.sh                    # ARM64 macOS native tests
 
-# 3. FINALLY: Run binary tests (ARM64 native or Docker for x86_64)
-./run_tests.sh                    # ARM64 macOS
-# OR
-./docker_test.sh                  # x86_64 via Docker
+# 3. FINALLY: ALWAYS run x86_64 tests in Docker (catches platform-specific bugs)
+zig build -Dtarget=x86_64-linux-gnu
+docker run --platform linux/amd64 -v $(pwd):/cot -w /cot gcc:latest ./run_tests_x86_64.sh
 ```
+
+**IMPORTANT: Always run BOTH native AND x86_64 tests.** The x86_64 tests catch platform-specific codegen bugs that won't appear on ARM64. Never skip the Docker tests.
 
 **Why this order matters:**
 1. `zig build test` catches:
@@ -277,11 +279,13 @@ zig build
    - Unit test failures in parser, checker, lowerer, codegen
    - Exhaustive switch violations (missing cases for new ops/expressions)
 
-2. Binary tests only work if the Zig code compiles successfully
+2. Native binary tests verify ARM64 codegen works
+
+3. x86_64 Docker tests verify cross-platform codegen (critical for self-hosting)
 
 **Current test counts:**
-- 129 Zig embedded tests (unit tests in source files)
-- 36 binary tests (.cot test files)
+- 135+ Zig embedded tests (unit tests in source files)
+- 39 binary tests (.cot test files)
 
 ### Exhaustive Switches for New Features
 

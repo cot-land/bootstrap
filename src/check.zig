@@ -255,11 +255,27 @@ pub const Checker = struct {
                     self.errRedefined(e.span.start, e.name);
                     return;
                 }
-                // TODO: build enum type
+                // Build enum type
+                const enum_type = try self.buildEnumType(e);
                 try self.scope.define(Symbol.init(
                     e.name,
                     .type_name,
-                    invalid_type,
+                    enum_type,
+                    idx,
+                    false,
+                ));
+            },
+            .union_decl => |u| {
+                if (self.scope.isDefined(u.name)) {
+                    self.errRedefined(u.span.start, u.name);
+                    return;
+                }
+                // Build union type
+                const union_type = try self.buildUnionType(u);
+                try self.scope.define(Symbol.init(
+                    u.name,
+                    .type_name,
+                    union_type,
                     idx,
                     false,
                 ));
@@ -281,7 +297,8 @@ pub const Checker = struct {
             .var_decl => |v| try self.checkVarDecl(v, idx),
             .const_decl => |c| try self.checkConstDecl(c, idx),
             .struct_decl => {}, // Already processed in collectDecl
-            .enum_decl => {}, // TODO
+            .enum_decl => {}, // Already processed in collectDecl
+            .union_decl => {}, // Already processed in collectDecl
             .bad_decl => {},
         }
     }
@@ -545,6 +562,12 @@ pub const Checker = struct {
                 if (std.mem.eql(u8, name, "print") or std.mem.eql(u8, name, "println")) {
                     return self.checkBuiltinPrint(c);
                 }
+                if (std.mem.eql(u8, name, "@intFromEnum")) {
+                    return self.checkBuiltinIntFromEnum(c);
+                }
+                if (std.mem.eql(u8, name, "@enumFromInt")) {
+                    return self.checkBuiltinEnumFromInt(c);
+                }
             }
         }
 
@@ -633,6 +656,70 @@ pub const Checker = struct {
         return TypeRegistry.VOID;
     }
 
+    /// Check builtin @intFromEnum() function.
+    fn checkBuiltinIntFromEnum(self: *Checker, c: ast.Call) CheckError!TypeIndex {
+        // @intFromEnum() takes exactly one argument
+        if (c.args.len != 1) {
+            self.err.errorWithCode(c.span.start, .E300, "@intFromEnum() expects exactly one argument");
+            return invalid_type;
+        }
+
+        const arg_type = try self.checkExpr(c.args[0]);
+        const arg = self.types.get(arg_type);
+
+        // Argument must be an enum type
+        switch (arg) {
+            .enum_type => |e| {
+                // Return the backing type of the enum
+                return e.backing_type;
+            },
+            else => {
+                self.err.errorWithCode(c.span.start, .E300, "@intFromEnum() argument must be an enum value");
+                return invalid_type;
+            },
+        }
+    }
+
+    /// Check builtin @enumFromInt() function.
+    /// Syntax: @enumFromInt(EnumType, int_value)
+    fn checkBuiltinEnumFromInt(self: *Checker, c: ast.Call) CheckError!TypeIndex {
+        // @enumFromInt() takes exactly two arguments: type and value
+        if (c.args.len != 2) {
+            self.err.errorWithCode(c.span.start, .E300, "@enumFromInt() expects two arguments: (EnumType, value)");
+            return invalid_type;
+        }
+
+        // First argument should be an enum type name (identifier)
+        const type_arg = self.tree.getExpr(c.args[0]);
+        if (type_arg == null or type_arg.? != .identifier) {
+            self.err.errorWithCode(c.span.start, .E300, "@enumFromInt() first argument must be an enum type name");
+            return invalid_type;
+        }
+
+        const type_name = type_arg.?.identifier.name;
+        const enum_type_idx = self.types.lookupByName(type_name) orelse {
+            self.errUndefined(c.span.start, type_name);
+            return invalid_type;
+        };
+
+        const enum_type = self.types.get(enum_type_idx);
+        if (enum_type != .enum_type) {
+            self.err.errorWithCode(c.span.start, .E300, "@enumFromInt() first argument must be an enum type");
+            return invalid_type;
+        }
+
+        // Second argument should be an integer
+        const value_type = try self.checkExpr(c.args[1]);
+        const value = self.types.get(value_type);
+        if (!isInteger(value)) {
+            self.err.errorWithCode(c.span.start, .E300, "@enumFromInt() second argument must be an integer");
+            return invalid_type;
+        }
+
+        // Return the enum type
+        return enum_type_idx;
+    }
+
     /// Check index expression.
     fn checkIndex(self: *Checker, i: ast.Index) CheckError!TypeIndex {
         const base_type = try self.checkExpr(i.base);
@@ -709,6 +796,42 @@ pub const Checker = struct {
                 for (st.fields) |field| {
                     if (std.mem.eql(u8, field.name, f.field)) {
                         return field.type_idx;
+                    }
+                }
+                self.errUndefined(f.span.start, f.field);
+                return invalid_type;
+            },
+            .enum_type => |et| {
+                // Enum variant access: Color.red
+                for (et.variants) |variant| {
+                    if (std.mem.eql(u8, variant.name, f.field)) {
+                        // Return the enum type itself (not the backing type)
+                        return base_type;
+                    }
+                }
+                self.errUndefined(f.span.start, f.field);
+                return invalid_type;
+            },
+            .union_type => |ut| {
+                // Union variant access: Result.ok
+                // This returns a "constructor" - handled specially in checkCall
+                for (ut.variants) |variant| {
+                    if (std.mem.eql(u8, variant.name, f.field)) {
+                        // For unit variants (no payload), return the union type directly
+                        if (variant.type_idx == types.invalid_type) {
+                            return base_type;
+                        }
+                        // For variants with payload, create a synthetic function type: fn(PayloadType) UnionType
+                        // Must heap-allocate params to avoid dangling pointer
+                        const params = try self.allocator.alloc(types.FuncParam, 1);
+                        params[0] = .{
+                            .name = "payload",
+                            .type_idx = variant.type_idx,
+                        };
+                        return try self.types.add(.{ .func = .{
+                            .params = params,
+                            .return_type = base_type,
+                        } });
                     }
                 }
                 self.errUndefined(f.span.start, f.field);
@@ -835,6 +958,7 @@ pub const Checker = struct {
     /// Check switch expression.
     fn checkSwitchExpr(self: *Checker, se: ast.SwitchExpr) CheckError!TypeIndex {
         const subject_type = try self.checkExpr(se.subject);
+        const subject_t = self.types.get(subject_type);
 
         // Track result type (from first case body)
         var result_type: TypeIndex = TypeRegistry.VOID;
@@ -844,6 +968,42 @@ pub const Checker = struct {
         for (se.cases) |case| {
             // Check each value in this case
             for (case.values) |val_idx| {
+                const val_node = self.tree.getNode(val_idx);
+                // Handle inferred variant literals (.variant) for union switches
+                if (val_node == .expr and val_node.expr == .field_access) {
+                    const fa = val_node.expr.field_access;
+                    if (fa.base == ast.null_node) {
+                        // Inferred variant literal - check against subject type
+                        if (subject_t == .union_type) {
+                            const ut = subject_t.union_type;
+                            var found = false;
+                            for (ut.variants) |v| {
+                                if (std.mem.eql(u8, v.name, fa.field)) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found) {
+                                self.err.errorWithCode(case.span.start, .E301, "unknown union variant");
+                            }
+                            continue; // Skip normal type checking
+                        } else if (subject_t == .enum_type) {
+                            const et = subject_t.enum_type;
+                            var found = false;
+                            for (et.variants) |v| {
+                                if (std.mem.eql(u8, v.name, fa.field)) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found) {
+                                self.err.errorWithCode(case.span.start, .E301, "unknown enum variant");
+                            }
+                            continue; // Skip normal type checking
+                        }
+                    }
+                }
+                // Regular expression - check type normally
                 const val_type = try self.checkExpr(val_idx);
                 // Each value must be comparable to subject
                 if (!self.isComparable(subject_type, val_type)) {
@@ -851,8 +1011,53 @@ pub const Checker = struct {
                 }
             }
 
-            // Check case body
-            const body_type = try self.checkExpr(case.body);
+            // Handle payload capture for union switch
+            var body_type: TypeIndex = undefined;
+            if (case.capture) |capture_name| {
+                // Subject must be a union type
+                if (subject_t != .union_type) {
+                    self.err.errorWithCode(case.span.start, .E300, "payload capture only valid for union switch");
+                    body_type = try self.checkExpr(case.body);
+                } else {
+                    // Get the variant name from the case value (first value)
+                    // Value should be .variant_name (field access on inferred type)
+                    const ut = subject_t.union_type;
+                    var payload_type: TypeIndex = TypeRegistry.VOID;
+
+                    // Find the variant type from the case value
+                    if (case.values.len > 0) {
+                        const val_node = self.tree.getNode(case.values[0]);
+                        if (val_node == .expr and val_node.expr == .field_access) {
+                            const variant_name = val_node.expr.field_access.field;
+                            for (ut.variants) |v| {
+                                if (std.mem.eql(u8, v.name, variant_name)) {
+                                    payload_type = v.type_idx;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // Create scope with captured variable
+                    var case_scope = Scope.init(self.allocator, self.scope);
+                    defer case_scope.deinit();
+                    try case_scope.define(.{
+                        .name = capture_name,
+                        .kind = .variable,
+                        .type_idx = payload_type,
+                        .node = ast.null_node,
+                        .mutable = false,
+                    });
+
+                    const old_scope = self.scope;
+                    self.scope = &case_scope;
+                    body_type = try self.checkExpr(case.body);
+                    self.scope = old_scope;
+                }
+            } else {
+                // No capture - check body in current scope
+                body_type = try self.checkExpr(case.body);
+            }
 
             if (first_case) {
                 result_type = body_type;
@@ -1209,6 +1414,90 @@ pub const Checker = struct {
         } });
     }
 
+    /// Build an enum type from an AST enum declaration.
+    fn buildEnumType(self: *Checker, e: ast.EnumDecl) CheckError!TypeIndex {
+        // Resolve backing type (default to i32 if not specified)
+        var backing_type: TypeIndex = TypeRegistry.I32;
+        if (e.backing_type) |bt_node| {
+            backing_type = try self.resolveTypeExpr(bt_node);
+            // Validate it's an integer type
+            const bt = self.types.get(backing_type);
+            switch (bt) {
+                .basic => |k| {
+                    if (!k.isInteger()) {
+                        self.err.errorAt(e.span.start, "enum backing type must be an integer type");
+                        backing_type = TypeRegistry.I32;
+                    }
+                },
+                else => {
+                    self.err.errorAt(e.span.start, "enum backing type must be an integer type");
+                    backing_type = TypeRegistry.I32;
+                },
+            }
+        }
+
+        var enum_variants = std.ArrayList(types.EnumVariant){ .items = &.{}, .capacity = 0 };
+        defer enum_variants.deinit(self.allocator);
+
+        var next_value: i64 = 0;
+        for (e.variants) |variant| {
+            var value = next_value;
+            if (variant.value) |val_node| {
+                // Evaluate the constant expression
+                const val_type = try self.checkExpr(val_node);
+                _ = val_type;
+                // For now, just look for a literal
+                if (self.tree.getExpr(val_node)) |expr| {
+                    switch (expr) {
+                        .literal => |lit| {
+                            if (lit.kind == .int) {
+                                value = std.fmt.parseInt(i64, lit.value, 10) catch 0;
+                            }
+                        },
+                        else => {},
+                    }
+                }
+            }
+            try enum_variants.append(self.allocator, .{
+                .name = variant.name,
+                .value = value,
+            });
+            next_value = value + 1;
+        }
+
+        return try self.types.add(.{ .enum_type = .{
+            .name = e.name,
+            .backing_type = backing_type,
+            .variants = try self.allocator.dupe(types.EnumVariant, enum_variants.items),
+        } });
+    }
+
+    /// Build a union type from a union declaration.
+    fn buildUnionType(self: *Checker, u: ast.UnionDecl) CheckError!TypeIndex {
+        var union_variants = std.ArrayList(types.UnionVariant){ .items = &.{}, .capacity = 0 };
+        defer union_variants.deinit(self.allocator);
+
+        for (u.variants) |variant| {
+            var payload_type: TypeIndex = types.invalid_type;
+            if (variant.type_expr) |type_node| {
+                payload_type = try self.resolveTypeExpr(type_node);
+            }
+            try union_variants.append(self.allocator, .{
+                .name = variant.name,
+                .type_idx = payload_type,
+            });
+        }
+
+        // Tag type is u8 if <= 256 variants, u16 otherwise
+        const tag_type: TypeIndex = if (u.variants.len <= 256) TypeRegistry.U8 else TypeRegistry.U16;
+
+        return try self.types.add(.{ .union_type = .{
+            .name = u.name,
+            .variants = try self.allocator.dupe(types.UnionVariant, union_variants.items),
+            .tag_type = tag_type,
+        } });
+    }
+
     // ========================================================================
     // Type utilities
     // ========================================================================
@@ -1222,6 +1511,18 @@ pub const Checker = struct {
             .optional => |o| self.typeSize(o.elem) + 1, // simplified
             .array => |a| @intCast(a.length * self.typeSize(a.elem)),
             .struct_type => |s| s.size,
+            .enum_type => |e| self.typeSize(e.backing_type),
+            .union_type => |ut| blk: {
+                // Union size = tag size + max payload size
+                var max_payload: u32 = 0;
+                for (ut.variants) |v| {
+                    if (v.type_idx != types.invalid_type) {
+                        const payload_size = self.typeSize(v.type_idx);
+                        if (payload_size > max_payload) max_payload = payload_size;
+                    }
+                }
+                break :blk self.typeSize(ut.tag_type) + max_payload;
+            },
             else => 0,
         };
     }

@@ -115,6 +115,14 @@ pub const Op = enum(u8) {
     // aux_int = element size
     slice_index,
 
+    // Union operations
+    // Initialize union. aux_int = variant index (tag), args[0] = payload (if any)
+    union_init,
+    // Get union tag. args[0] = union value
+    union_tag,
+    // Get union payload. aux_int = variant index, args[0] = union value
+    union_payload,
+
     // Function
     call,
     arg,

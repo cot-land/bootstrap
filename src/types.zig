@@ -189,6 +189,32 @@ pub const StructType = struct {
     alignment: u8, // alignment requirement
 };
 
+/// Enum variant
+pub const EnumVariant = struct {
+    name: []const u8,
+    value: i64, // resolved integer value
+};
+
+/// Enum type
+pub const EnumType = struct {
+    name: []const u8,
+    backing_type: TypeIndex, // u8, i32, etc. (defaults to i32 if not specified)
+    variants: []const EnumVariant,
+};
+
+/// Tagged union variant
+pub const UnionVariant = struct {
+    name: []const u8,
+    type_idx: TypeIndex, // The payload type (invalid_type for unit variants)
+};
+
+/// Tagged union type
+pub const UnionType = struct {
+    name: []const u8,
+    variants: []const UnionVariant,
+    tag_type: TypeIndex, // The internal tag type (usually u8 or u16)
+};
+
 /// Function parameter
 pub const FuncParam = struct {
     name: []const u8,
@@ -221,6 +247,8 @@ pub const Type = union(enum) {
     slice: SliceType,
     array: ArrayType,
     struct_type: StructType,
+    enum_type: EnumType,
+    union_type: UnionType,
     func: FuncType,
     named: NamedType,
 
@@ -254,6 +282,8 @@ pub const Type = union(enum) {
                     try writer.writeAll("struct{...}");
                 }
             },
+            .enum_type => |e| try writer.writeAll(e.name),
+            .union_type => |u| try writer.writeAll(u.name),
             .func => try writer.writeAll("fn(...)"),
             .named => |n| try writer.writeAll(n.name),
         }
@@ -353,6 +383,21 @@ pub const TypeRegistry = struct {
                     size += self.sizeOf(field.type_idx);
                 }
                 break :blk size;
+            },
+            .enum_type => |e| self.sizeOf(e.backing_type),
+            .union_type => |u| blk: {
+                // Union size = 8-byte aligned tag + max payload size
+                // Codegen assumes tag at offset 0 (8 bytes) and payload at offset 8
+                var max_payload: u32 = 0;
+                for (u.variants) |v| {
+                    if (v.type_idx != invalid_type) {
+                        const payload_size = self.sizeOf(v.type_idx);
+                        if (payload_size > max_payload) max_payload = payload_size;
+                    }
+                }
+                // Use 8 bytes for tag (aligned) + max payload aligned to 8
+                const payload_aligned = (max_payload + 7) / 8 * 8;
+                break :blk 8 + payload_aligned;
             },
             else => 8, // Default to 8 bytes for unknown types
         };
@@ -454,12 +499,22 @@ pub const TypeRegistry = struct {
         };
     }
 
-    /// Look up a type by name (for struct types).
+    /// Look up a type by name (for struct, enum, and union types).
     pub fn lookupByName(self: *const TypeRegistry, name: []const u8) ?TypeIndex {
         for (self.types.items, 0..) |t, idx| {
             switch (t) {
                 .struct_type => |st| {
                     if (std.mem.eql(u8, st.name, name)) {
+                        return @intCast(idx);
+                    }
+                },
+                .enum_type => |et| {
+                    if (std.mem.eql(u8, et.name, name)) {
+                        return @intCast(idx);
+                    }
+                },
+                .union_type => |ut| {
+                    if (std.mem.eql(u8, ut.name, name)) {
                         return @intCast(idx);
                     }
                 },

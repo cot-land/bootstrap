@@ -841,6 +841,50 @@ pub const Driver = struct {
             return value_id;
         }
 
+        // Handle union_init - args[0] = payload value (SSA ref), aux = variant index
+        if (node.op == .union_init) {
+            const value_id = try func.newValue(.union_init, node.type_idx, block);
+            var value = func.getValue(value_id);
+            value.aux_int = node.aux;  // variant index (tag)
+            // args[0] is IR node ID for payload that needs SSA conversion
+            if (node.args_len > 0) {
+                if (ir_to_ssa.get(node.args()[0])) |ssa_val| {
+                    value.args_storage[0] = ssa_val;  // payload value (SSA ref)
+                    value.args_len = 1;
+                }
+            }
+            return value_id;
+        }
+
+        // Handle union_tag - args[0] = union value (SSA ref)
+        if (node.op == .union_tag) {
+            const value_id = try func.newValue(.union_tag, node.type_idx, block);
+            var value = func.getValue(value_id);
+            // args[0] is IR node ID for union that needs SSA conversion
+            if (node.args_len > 0) {
+                if (ir_to_ssa.get(node.args()[0])) |ssa_val| {
+                    value.args_storage[0] = ssa_val;  // union value (SSA ref)
+                    value.args_len = 1;
+                }
+            }
+            return value_id;
+        }
+
+        // Handle union_payload - args[0] = union value (SSA ref), aux = variant index
+        if (node.op == .union_payload) {
+            const value_id = try func.newValue(.union_payload, node.type_idx, block);
+            var value = func.getValue(value_id);
+            value.aux_int = node.aux;  // variant index
+            // args[0] is IR node ID for union that needs SSA conversion
+            if (node.args_len > 0) {
+                if (ir_to_ssa.get(node.args()[0])) |ssa_val| {
+                    value.args_storage[0] = ssa_val;  // union value (SSA ref)
+                    value.args_len = 1;
+                }
+            }
+            return value_id;
+        }
+
         // Convert IR op to SSA op
         const ssa_op: ssa.Op = switch (node.op) {
             .const_int => .const_int,
@@ -868,9 +912,12 @@ pub const Driver = struct {
             .store => .store,
             .jump => .jump,
             .branch => .branch,
-            .addr_field => .field,  // Field address becomes field op in SSA
+            .addr_field => .field, // Field address becomes field op in SSA
             .field => .field,
-            else => .copy,  // Default fallback
+            .union_init => .union_init,
+            .union_tag => .union_tag,
+            .union_payload => .union_payload,
+            else => .copy, // Default fallback
         };
 
         // Create SSA value
@@ -1699,6 +1746,10 @@ pub const Driver = struct {
                         // Store 16-byte slice: ptr at offset 0, len at offset 8
                         try x86_64.movMemReg(buf, .rbp, total_offset, .rax);
                         try x86_64.movMemReg(buf, .rbp, total_offset + 8, .rdx);
+                    } else if (val.op == .union_init) {
+                        // Store 16-byte union: tag at offset 0, payload at offset 8
+                        try x86_64.movMemReg(buf, .rbp, total_offset, .rax);
+                        try x86_64.movMemReg(buf, .rbp, total_offset + 8, .rdx);
                     } else {
                         // Get value to store into r8, or use rax directly for ops
                         var use_rax_directly = false;
@@ -1711,7 +1762,7 @@ pub const Driver = struct {
                             }
                         } else if (val.op == .add or val.op == .sub or val.op == .mul or val.op == .div or
                             val.op == .load or val.op == .call or val.op == .field or val.op == .index or
-                            val.op == .slice_index)
+                            val.op == .slice_index or val.op == .union_payload)
                         {
                             // Operations that leave result in rax - store directly
                             use_rax_directly = true;
@@ -1723,6 +1774,65 @@ pub const Driver = struct {
                         } else {
                             try x86_64.movMemReg(buf, .rbp, total_offset, .r8);
                         }
+                    }
+                }
+            },
+            .union_init => {
+                // Initialize a tagged union value
+                // aux_int = variant index (tag), args[0] = payload value (if any)
+                // Union layout: tag (8 bytes) at offset 0, payload at offset 8
+                const variant_idx: i64 = value.aux_int;
+
+                // Store tag in rax (for later store)
+                try x86_64.movRegImm64(buf, .rax, variant_idx);
+
+                // If there's a payload, get it into rdx
+                const args = value.args();
+                if (args.len > 0) {
+                    const payload_id = args[0];
+                    const payload_val = func.getValue(payload_id);
+                    if (payload_val.op == .const_int) {
+                        try x86_64.movRegImm64(buf, .rdx, payload_val.aux_int);
+                    } else {
+                        // Payload should be in rax from previous computation, save tag first
+                        try x86_64.movRegReg(buf, .r8, .rax); // save tag
+                        // The payload computation left result in rax, move to rdx
+                        try x86_64.movRegReg(buf, .rdx, .rax);
+                        try x86_64.movRegReg(buf, .rax, .r8); // restore tag
+                    }
+                }
+                // Result: rax = tag, rdx = payload (if any)
+            },
+            .union_tag => {
+                // Extract tag from union value
+                // Union layout: tag (8 bytes) at offset 0
+                // Use r8 for tag to avoid conflicts with operations that use rax
+                const args = value.args();
+                if (args.len > 0) {
+                    const union_id = args[0];
+                    const union_val = func.getValue(union_id);
+                    // If the union value is a load, get its address
+                    if (union_val.op == .load) {
+                        const local_idx: usize = @intCast(union_val.aux_int);
+                        const local_offset: i32 = func.locals[local_idx].offset;
+                        // Load tag (8 bytes at offset 0 from local) into r8
+                        try x86_64.movRegMem(buf, .r8, .rbp, local_offset);
+                    }
+                }
+            },
+            .union_payload => {
+                // Extract payload from union value
+                // Union layout: tag (8 bytes) at offset 0, payload at offset 8
+                const args = value.args();
+                if (args.len > 0) {
+                    const union_id = args[0];
+                    const union_val = func.getValue(union_id);
+                    // If the union value is a load, get its address
+                    if (union_val.op == .load) {
+                        const local_idx: usize = @intCast(union_val.aux_int);
+                        const local_offset: i32 = func.locals[local_idx].offset;
+                        // Load payload (at offset 8 from local)
+                        try x86_64.movRegMem(buf, .rax, .rbp, local_offset + 8);
                     }
                 }
             },
@@ -2278,6 +2388,14 @@ pub const Driver = struct {
                             try aarch64.strRegImm(buf, .x0, .sp, ptr_offset); // store ptr
                             try aarch64.strRegImm(buf, .x1, .sp, len_offset); // store len
                         }
+                    } else if (val.op == .union_init) {
+                        // Store 16-byte union: tag at offset 0, payload at offset 8
+                        if (total_offset >= 0 and @mod(total_offset, 8) == 0) {
+                            const tag_offset: u12 = @intCast(@divExact(total_offset, 8));
+                            const payload_offset: u12 = tag_offset + 1; // +8 bytes
+                            try aarch64.strRegImm(buf, .x0, .sp, tag_offset); // store tag
+                            try aarch64.strRegImm(buf, .x1, .sp, payload_offset); // store payload
+                        }
                     } else {
                         // Regular 8-byte store
                         // Get value to store into x8 (temp register), or use x0 directly for ops
@@ -2291,7 +2409,7 @@ pub const Driver = struct {
                             }
                         } else if (val.op == .add or val.op == .sub or val.op == .mul or val.op == .div or
                             val.op == .load or val.op == .call or val.op == .field or val.op == .index or
-                            val.op == .slice_index)
+                            val.op == .slice_index or val.op == .union_payload)
                         {
                             // Operations that leave result in x0 - store directly
                             use_x0_directly = true;
@@ -2481,6 +2599,73 @@ pub const Driver = struct {
 
                     // Load value from [x8]: ldr x0, [x8, #0]
                     try aarch64.ldrRegImm(buf, .x0, .x8, 0);
+                }
+            },
+            .union_init => {
+                // Initialize a tagged union value
+                // aux_int = variant index (tag), args[0] = payload value (if any)
+                // Union layout: tag (8 bytes) at offset 0, payload at offset 8
+                const variant_idx: i64 = value.aux_int;
+
+                // Store tag in x0 (for later store)
+                try aarch64.movRegImm64(buf, .x0, variant_idx);
+
+                // If there's a payload, get it into x1
+                const args = value.args();
+                if (args.len > 0) {
+                    const payload_id = args[0];
+                    const payload_val = func.getValue(payload_id);
+                    if (payload_val.op == .const_int) {
+                        try aarch64.movRegImm64(buf, .x1, payload_val.aux_int);
+                    } else {
+                        // Payload should be in x0 from previous computation, save tag first
+                        try aarch64.movRegReg(buf, .x8, .x0); // save tag
+                        // The payload computation left result in x0, move to x1
+                        try aarch64.movRegReg(buf, .x1, .x0);
+                        try aarch64.movRegReg(buf, .x0, .x8); // restore tag
+                    }
+                }
+                // Result: x0 = tag, x1 = payload (if any)
+            },
+            .union_tag => {
+                // Extract tag from union value
+                // Union layout: tag (8 bytes) at offset 0
+                const args = value.args();
+                if (args.len > 0) {
+                    const union_id = args[0];
+                    const union_val = func.getValue(union_id);
+                    // If the union value is a load, get its address
+                    if (union_val.op == .load) {
+                        const local_idx: usize = @intCast(union_val.aux_int);
+                        const x86_offset: i32 = func.locals[local_idx].offset;
+                        // Convert x86 (rbp-relative negative) to ARM (sp-relative positive)
+                        const local_offset: i32 = @as(i32, @intCast(func.frame_size)) + x86_offset;
+                        if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
+                            const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
+                            try aarch64.ldrRegImm(buf, .x0, .sp, offset_scaled);
+                        }
+                    }
+                }
+            },
+            .union_payload => {
+                // Extract payload from union value
+                // Union layout: tag (8 bytes) at offset 0, payload at offset 8
+                const args = value.args();
+                if (args.len > 0) {
+                    const union_id = args[0];
+                    const union_val = func.getValue(union_id);
+                    // If the union value is a load, get its address
+                    if (union_val.op == .load) {
+                        const local_idx: usize = @intCast(union_val.aux_int);
+                        const x86_offset: i32 = func.locals[local_idx].offset;
+                        // Convert x86 (rbp-relative negative) to ARM (sp-relative positive)
+                        // Add 8 for payload offset within union
+                        const local_offset: i32 = @as(i32, @intCast(func.frame_size)) + x86_offset + 8;
+                        if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
+                            const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
+                            try aarch64.ldrRegImm(buf, .x0, .sp, offset_scaled);
+                        }
+                    }
                 }
             },
             else => {
@@ -2709,8 +2894,9 @@ test "IR op coverage - exhaustive" {
         .bit_and, .bit_or, .bit_xor, .bit_not, .shl, .shr,
         // Memory
         .load, .store, .addr_local, .addr_field, .addr_index,
-        // Struct/Array
+        // Struct/Array/Union
         .field, .index, .slice, .slice_index,
+        .union_init, .union_tag, .union_payload,
         // Control Flow
         .call, .ret, .jump, .branch, .phi, .select,
         // Conversions
@@ -2729,6 +2915,7 @@ test "IR op coverage - exhaustive" {
             .bit_and, .bit_or, .bit_xor, .bit_not, .shl, .shr,
             .load, .store, .addr_local, .addr_field, .addr_index,
             .field, .index, .slice, .slice_index,
+            .union_init, .union_tag, .union_payload,
             .call, .ret, .jump, .branch, .phi, .select,
             .convert, .ptr_cast,
             .nop,
@@ -2760,6 +2947,8 @@ test "SSA op coverage - exhaustive" {
         .field, .index,
         // Slice
         .slice_make, .slice_index,
+        // Union
+        .union_init, .union_tag, .union_payload,
         // Function
         .call, .arg,
         // ARC
@@ -2779,6 +2968,7 @@ test "SSA op coverage - exhaustive" {
             .load, .store, .addr, .alloc,
             .field, .index,
             .slice_make, .slice_index,
+            .union_init, .union_tag, .union_payload,
             .call, .arg,
             .retain, .release,
             .ret, .jump, .branch, .@"unreachable",
