@@ -158,11 +158,11 @@ These features are used extensively in all .cot files and must work first.
 | `List.push(item)` | **Gap** | All | Append item |
 | `List.get(index)` | **Gap** | ir.cot | Get by index |
 | `Map<K, V>` | Implemented | checker.cot, ir.cot | Full runtime support |
-| `Map.set(k, v)` | **Gap** | checker.cot | Method call syntax TBD |
-| `Map.get(key)` | **Gap** | checker.cot | Method call syntax TBD |
-| `Map.has(key)` | **Gap** | checker.cot | Method call syntax TBD |
+| `Map.set(k, v)` | Implemented | checker.cot | Native layout + FFI |
+| `Map.get(key)` | Implemented | checker.cot | Native layout + FFI |
+| `Map.has(key)` | Implemented | checker.cot | Native layout + FFI |
 | `new List<T>` | Partial | All | Parsing done, codegen TBD |
-| `new Map<K,V>` | Implemented | checker.cot | Full codegen + runtime |
+| `new Map<K,V>` | Implemented | checker.cot | Native calloc + init |
 
 ---
 
@@ -308,15 +308,17 @@ The following features were implemented in recent development sessions:
 - **Type syntax**: `Map<K, V>` parsing works
 - **Type checking**: Map types are registered and type-checked
 - **new expression**: `new Map<string, i64>()` parsing and codegen works
-- **Runtime library**: `runtime/map.zig` with C ABI functions:
-  - `cot_map_new()` - Create new map
-  - `cot_map_set(handle, key_ptr, key_len, value)` - Set key-value
-  - `cot_map_get(handle, key_ptr, key_len)` - Get value by key
-  - `cot_map_has(handle, key_ptr, key_len)` - Check if key exists
-  - `cot_map_size(handle)` - Get map size
-  - `cot_map_free(handle)` - Free map
-- **Implementation**: Linear probing hash table with 7-bit fingerprints, 80% load factor
-- **Remaining**: Method call syntax (`.set()`, `.get()`, `.has()`) - IR ops exist but AST lowering TBD
+- **Native layout** (allocated via `calloc` in codegen):
+  - Header (32 bytes): capacity, size, seed (FNV offset basis), unused
+  - Slots (64 × 32 bytes): meta byte, padding, key_ptr, key_len, value
+  - Total: 2080 bytes per map
+- **Runtime library**: `runtime/map.zig` with C ABI functions for native layout:
+  - `cot_native_map_set(map, key_ptr, key_len, value)` - FNV-1a hash + linear probe
+  - `cot_native_map_get(map, key_ptr, key_len)` - Hash lookup with probing
+  - `cot_native_map_has(map, key_ptr, key_len)` - Check if key exists
+  - `cot_native_map_size(map)` - Read size from header
+  - `cot_native_map_free(map)` - Free keys and map memory
+- **Method syntax**: `.set()`, `.get()`, `.has()` all work via IR ops
 
 ### List Types - **Partial**
 - **Type syntax**: `List<T>` parsing works
@@ -344,11 +346,11 @@ The wireframes use `List<T>` and `Map<K,V>` extensively:
 - Checker uses maps for symbol tables
 - IR uses lists for values and blocks
 
-**Map Progress**: Full runtime implementation with hash table (linear probing, 7-bit fingerprints). Codegen emits calls to runtime library. `new Map<K,V>()` works end-to-end.
+**Map Progress**: Complete. Native layout with heap allocation via `calloc`. FNV-1a hashing with linear probing. Method syntax (`.set()`, `.get()`, `.has()`) works. 43 tests pass on ARM64 and x86_64.
 
 **List Progress**: Type syntax parses and type-checks. Runtime library and codegen TBD.
 
-**Remaining**: Method call syntax (`.set()`, `.get()`) needs AST lowering. User-defined generics are NOT needed for bootstrap (per spec.md).
+**Remaining**: List runtime implementation. User-defined generics are NOT needed for bootstrap (per spec.md).
 
 ### Switch Expressions are Everywhere
 
@@ -362,9 +364,10 @@ The switch must work as an expression (returns value) with payload capture.
 ### Remaining Critical Gaps for Self-Hosting
 
 1. ~~**Tagged unions**~~ - **DONE** (construction + switch with payload capture)
-2. ~~**Map<K,V> types**~~ - **DONE** (runtime + codegen, method syntax TBD)
-3. **Map/List methods** - `.set()`, `.get()`, `.has()`, `.push()` method call syntax
+2. ~~**Map<K,V> types**~~ - **DONE** (native layout + FFI, method syntax works)
+3. ~~**Map methods**~~ - **DONE** (`.set()`, `.get()`, `.has()` all work)
 4. **List<T> runtime** - Runtime library for list operations
-5. **Methods** - `fn method(self: *T)` pattern
-6. **String interpolation** - `"Error: ${msg}"` syntax
-7. **@maxInt/@minInt** - Integer bounds for type checks
+5. **List methods** - `.push()`, `.get()` method call syntax
+6. **Methods** - `fn method(self: *T)` pattern
+7. **String interpolation** - `"Error: ${msg}"` syntax
+8. **@maxInt/@minInt** - Integer bounds for type checks
