@@ -1,0 +1,10 @@
+// Test @minInt builtin
+// Returns 42 if @minInt(i8) == -128
+
+fn main() i64 {
+    const min = @minInt(i8);
+    if (min == -128) {
+        return 42;
+    }
+    return 0;
+}

@@ -1244,6 +1244,21 @@ pub const Driver = struct {
             return value_id;
         }
 
+        // Handle unary operations - neg, not
+        if (node.op == .neg or node.op == .not) {
+            const ssa_op: ssa.Op = if (node.op == .neg) .neg else .not;
+            const value_id = try func.newValue(ssa_op, node.type_idx, block);
+            var value = func.getValue(value_id);
+            // args[0] is the operand to negate/not
+            if (node.args_len > 0) {
+                if (ir_to_ssa.get(node.args()[0])) |ssa_val| {
+                    value.args_storage[0] = ssa_val;
+                    value.args_len = 1;
+                }
+            }
+            return value_id;
+        }
+
         // Convert IR op to SSA op
         const ssa_op: ssa.Op = switch (node.op) {
             .const_int => .const_int,
@@ -1949,13 +1964,9 @@ pub const Driver = struct {
         const arg_regs = [_]x86_64.Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
 
         switch (value.op) {
-            .const_int, .const_bool => {
-                // Constants are used as operands by other instructions.
-                // Don't generate standalone code - it would clobber rax.
-            },
-            .const_string => {
-                // String literals are stored in rodata.
-                // For now, don't generate standalone code - they're used as operands.
+            .const_int, .const_bool, .const_string, .load => {
+                // Constants and loads are used as operands by other instructions.
+                // Don't generate standalone code - they're loaded inline when used.
             },
             .arg => {
                 // Load parameter from argument register to rax
@@ -2058,6 +2069,19 @@ pub const Driver = struct {
                 }
 
                 // Save result using allocator
+                try self.saveX86Result(buf, value_idx, .rax);
+            },
+            .neg => {
+                // Unary negation
+                const args = value.args();
+                if (args.len >= 1) {
+                    const operand_idx = args[0];
+                    // Load operand to rax
+                    _ = try self.loadX86ValueToReg(buf, func, operand_idx, .rax);
+                    // NEG rax
+                    try x86_64.negReg(buf, .rax);
+                }
+                // Save result
                 try self.saveX86Result(buf, value_idx, .rax);
             },
             .call => {
@@ -2168,6 +2192,11 @@ pub const Driver = struct {
                             const local_offset: i32 = func.locals[local_idx].offset;
                             try x86_64.movRegMem(buf, .r8, .rbp, local_offset + field_offset);
                         }
+                    } else {
+                        // Computed value (neg, add, etc) - load from storage
+                        if (self.storage.get(args[0])) |slot| {
+                            try x86_64.movRegMem(buf, .r8, .rbp, slot);
+                        }
                     }
 
                     // Compare with right operand
@@ -2192,6 +2221,12 @@ pub const Driver = struct {
                             const field_offset: i32 = @intCast(right.aux_int);
                             const local_offset: i32 = func.locals[local_idx].offset;
                             try x86_64.movRegMem(buf, .r9, .rbp, local_offset + field_offset);
+                            try x86_64.cmpRegReg(buf, .r8, .r9);
+                        }
+                    } else {
+                        // Computed value (neg, add, etc) - load from storage
+                        if (self.storage.get(args[1])) |slot| {
+                            try x86_64.movRegMem(buf, .r9, .rbp, slot);
                             try x86_64.cmpRegReg(buf, .r8, .r9);
                         }
                     }
@@ -3363,6 +3398,19 @@ pub const Driver = struct {
                 }
 
                 // Save result to storage
+                try self.saveAArch64Result(buf, func, value_idx, .x0);
+            },
+            .neg => {
+                // Unary negation
+                const args = value.args();
+                if (args.len >= 1) {
+                    const operand_idx = args[0];
+                    // Load operand to x0
+                    _ = try self.loadAArch64ValueToReg(buf, func, operand_idx, .x0);
+                    // NEG x0, x0 (sub x0, xzr, x0)
+                    try aarch64.negReg(buf, .x0, .x0);
+                }
+                // Save result
                 try self.saveAArch64Result(buf, func, value_idx, .x0);
             },
             .call => {

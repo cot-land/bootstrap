@@ -202,7 +202,7 @@ These features are used extensively in all .cot files and must work first.
 | `print(x)` | Implemented | ir.cot | Print without newline (via libc write) |
 | `@sizeof(T)` | **Gap** | - | Not used in wireframes |
 | `@maxInt(T)` | Implemented | ast.cot, ir.cot | Max value for int type |
-| `@minInt(T)` | **Gap** | - | Min value for int type |
+| `@minInt(T)` | Implemented | - | Min value for int type |
 | `@intCast(T, v)` | **Gap** | ast.cot, types.cot | Type cast |
 
 ### Other
@@ -398,7 +398,7 @@ The switch must work as an expression (returns value) with payload capture.
 6. ~~**Methods**~~ - **DONE** (`fn method(self: *T)` + UFCS `obj.method()`)
 7. ~~**String interpolation**~~ - **DONE** (`"Error: {msg}"` syntax)
 8. ~~**@maxInt**~~ - **DONE** (Integer bounds for type checks)
-9. **@minInt** - Integer minimum bounds (not yet implemented)
+9. ~~**@minInt**~~ - **DONE** (Integer minimum bounds)
 10. **Type aliases** - `type NodeIndex = u32` syntax
 11. **Import system** - `import "module"` syntax
 12. **Compound assignment** - `+=`, `-=`, etc.

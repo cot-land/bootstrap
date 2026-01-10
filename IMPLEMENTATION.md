@@ -67,9 +67,9 @@ Running with `--debug-codegen` will show warnings for any unhandled SSA operatio
 
 **Test Counts:**
 - 135+ Zig embedded tests (unit tests in source files)
-- 51 binary tests (.cot test files)
+- 52 binary tests (.cot test files)
 
-**Both ARM64 and x86_64** - 51/51 tests pass
+**Both ARM64 and x86_64** - 52/52 tests pass
 
 | Test File | Expected | ARM64 | x86_64 |
 |-----------|----------|-------|--------|
@@ -110,10 +110,11 @@ Running with `--debug-codegen` will show warnings for any unhandled SSA operatio
 | test_value_lifetime.cot (intermediate value preservation) | 42 | PASS | PASS |
 | test_method.cot (method call with self: *T) | 42 | PASS | PASS |
 | test_maxint.cot (@maxInt builtin) | 42 | PASS | PASS |
+| test_minint.cot (@minInt builtin) | 42 | PASS | PASS |
 | test_interpolation.cot (string interpolation) | 42 | PASS | PASS |
 | test_interp_var.cot (interpolation with variables) | 42 | PASS | PASS |
 
-**All tests pass** - conditionals, while loops, string comparisons, switch expressions, slice indexing, for-in loops, tagged unions with payload capture, Map<K,V>, List<T>, value lifetime preservation, methods, @maxInt, and string interpolation all working.
+**All tests pass** - conditionals, while loops, string comparisons, switch expressions, slice indexing, for-in loops, tagged unions with payload capture, Map<K,V>, List<T>, value lifetime preservation, methods, @maxInt, @minInt, and string interpolation all working.
 
 ### Testing Commands
 
@@ -178,27 +179,175 @@ Write cot source files that will form the self-hosted compiler.
 
 Use the Zig compiler to compile the cot compiler written in cot.
 
-**Milestone 3.1: Compile cot with Zig**
-- [ ] Compile token.cot, scanner.cot, etc. to object files
-- [ ] Link into working cot-stage1 executable
-- [ ] Verify cot-stage1 can parse itself
+**Milestone 3.1: Concatenate and Compile**
 
-**Milestone 3.2: Full Bootstrap**
+No import system needed - concatenate files in dependency order:
+
+```bash
+# Order matters: dependencies first
+cat src/token.cot \
+    src/source.cot \
+    src/ast.cot \
+    src/scanner.cot \
+    src/errors.cot \
+    src/parser.cot \
+    src/types.cot \
+    src/checker.cot \
+    src/ir.cot \
+    src/ssa.cot \
+    src/codegen.cot \
+    src/driver.cot \
+    src/main.cot > /tmp/compiler.cot
+
+# Compile with Zig implementation
+./zig-out/bin/cot /tmp/compiler.cot -o cot-stage1
+```
+
+- [ ] All .cot files concatenate without conflicts
+- [ ] Zig cot compiles concatenated source
+- [ ] cot-stage1 binary executes
+
+**Milestone 3.2: Stage 1 Verification**
+
+- [ ] cot-stage1 can tokenize itself (`cot-stage1 --tokens /tmp/compiler.cot`)
+- [ ] cot-stage1 can parse itself (`cot-stage1 --ast /tmp/compiler.cot`)
+- [ ] cot-stage1 can type-check itself (`cot-stage1 --check /tmp/compiler.cot`)
+
+**Milestone 3.3: Full Bootstrap**
+
+```bash
+# Stage 1: Zig compiles cot → cot-stage1
+./zig-out/bin/cot /tmp/compiler.cot -o cot-stage1
+
+# Stage 2: cot-stage1 compiles cot → cot-stage2
+./cot-stage1 /tmp/compiler.cot -o cot-stage2
+
+# Stage 3: cot-stage2 compiles cot → cot-stage3
+./cot-stage2 /tmp/compiler.cot -o cot-stage3
+
+# Verification: stage2 and stage3 must be byte-identical
+diff cot-stage2 cot-stage3 && echo "BOOTSTRAP COMPLETE"
+```
+
 - [ ] cot-stage1 compiles cot source → cot-stage2
 - [ ] cot-stage2 compiles cot source → cot-stage3
-- [ ] Verify stage2 == stage3 (bootstrap complete)
+- [ ] `diff cot-stage2 cot-stage3` shows no differences
+- [ ] All 51+ tests pass when run with cot-stage2
 
-### Phase 4: Post-Bootstrap (Future)
+**Why byte-identical matters:** If stage2 ≠ stage3, there's a bug where the compiler behaves differently than its source code describes. This is the definitive proof of correctness.
 
-Features that can wait until after self-hosting.
+### Phase 4: Post-Bootstrap Restructuring
 
-- [ ] Optimization passes (constant folding, DCE, etc.)
+Immediately after bootstrap, restructure to match Go's compiler layout.
+
+**Milestone 4.1: Import System**
+
+Implement simple file-based imports (no package versioning):
+
+```cot
+// parser.cot
+import "syntax/token"
+import "syntax/ast"
+
+fn parseExpr() ast.Expr {
+    if self.tok == token.Plus { ... }
+}
+```
+
+Implementation:
+1. When parser sees `import "path"`, read and parse that file
+2. Create namespace for imported declarations
+3. Resolve `module.Name` references during type checking
+4. Track import graph to detect cycles
+
+Effort: 1-2 days
+
+**Milestone 4.2: Restructure to Match Go**
+
+```
+cot/
+├── src/
+│   ├── syntax/           # Frontend (like cmd/compile/internal/syntax/)
+│   │   ├── token.cot     # Token definitions
+│   │   ├── scanner.cot   # Lexer
+│   │   ├── parser.cot    # Parser
+│   │   └── ast.cot       # AST nodes
+│   │
+│   ├── types/            # Type system (like cmd/compile/internal/types2/)
+│   │   ├── types.cot     # Type representation
+│   │   └── checker.cot   # Type checker
+│   │
+│   ├── ir/               # Middle-end (like cmd/compile/internal/ir/, ssa/)
+│   │   ├── ir.cot        # IR nodes
+│   │   └── ssa.cot       # SSA construction
+│   │
+│   ├── codegen/          # Backend (like cmd/compile/internal/amd64/, arm64/)
+│   │   ├── backend.cot   # Common codegen interface
+│   │   ├── x86_64.cot    # x86-64 instruction encoding
+│   │   ├── aarch64.cot   # ARM64 instruction encoding
+│   │   └── object.cot    # ELF/Mach-O/PE generation
+│   │
+│   ├── driver.cot        # Compilation orchestration
+│   └── main.cot          # Entry point
+│
+├── std/                  # Standard library
+│   ├── fs.cot
+│   ├── http.cot
+│   └── ...
+│
+├── runtime/              # Zig FFI runtime (libcot_runtime.a)
+│   └── cot_runtime.zig
+│
+└── tests/
+    └── *.cot
+```
+
+**Milestone 4.3: Go Source Reference**
+
+Use `~/learning/go/src/cmd/compile/` as reference:
+
+| Go Package | Cot Equivalent | Reference For |
+|------------|----------------|---------------|
+| `internal/syntax/` | `syntax/` | Scanner, parser patterns |
+| `internal/types2/` | `types/` | Type checker architecture |
+| `internal/ir/` | `ir/` | IR node design |
+| `internal/ssa/` | `ir/ssa.cot` | SSA construction, passes |
+| `internal/amd64/` | `codegen/x86_64.cot` | Instruction selection |
+| `internal/arm64/` | `codegen/aarch64.cot` | Instruction selection |
+
+**Milestone 4.4: Pure Cot Data Structures**
+
+Replace FFI-based Map/List with pure cot implementations:
+
+```cot
+// std/collections/map.cot
+struct Map<K, V> {
+    buckets: []?Entry<K, V>,
+    count: u64,
+
+    fn get(self: *Map<K, V>, key: K) ?V { ... }
+    fn set(self: *Map<K, V>, key: K, value: V) void { ... }
+    fn has(self: *Map<K, V>, key: K) bool { ... }
+}
+```
+
+Benefits:
+- ARC integration (automatic memory management)
+- Compiler can inline/optimize
+- No runtime library dependency for basics
+- Generics work naturally
+
+**Milestone 4.5: Additional Language Features**
+
+After restructuring, add features in pure cot:
+
+- [ ] Optimization passes (constant folding, DCE, inlining)
 - [ ] ARC memory management
 - [ ] Traits/interfaces
-- [ ] Generics
-- [ ] Package system
+- [ ] User-defined generics (beyond built-in List/Map)
 - [ ] REPL
 - [ ] LSP server
+- [ ] Debugger support
 
 ---
 
