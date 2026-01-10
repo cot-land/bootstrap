@@ -56,6 +56,7 @@ pub const Token = enum(u8) {
     greater_greater, // >>
     dot_dot, // ..
     dot_star, // .*
+    dot_question, // .? (optional unwrap)
     question_question, // ??
     question_dot, // ?.
     arrow, // ->
@@ -168,6 +169,7 @@ pub const Token = enum(u8) {
             .greater_greater => ">>",
             .dot_dot => "..",
             .dot_star => ".*",
+            .dot_question => ".?",
             .question_question => "??",
             .question_dot => "?.",
             .arrow => "->",
@@ -284,17 +286,19 @@ pub const keywords = std.StaticStringMap(Token).initComptime(.{
 /// Follows Go's precedence but with cot's keyword operators.
 pub const Precedence = enum(u8) {
     none = 0,
-    or_prec = 1, // or
-    and_prec = 2, // and
-    compare = 3, // == != < <= > >=
-    add = 4, // + - | ^
-    mul = 5, // * / % & << >>
-    unary = 6, // not ! - ~ & *
+    coalesce = 1, // ?? (null coalescing, lowest binary op)
+    or_prec = 2, // or
+    and_prec = 3, // and
+    compare = 4, // == != < <= > >=
+    add = 5, // + - | ^
+    mul = 6, // * / % & << >>
+    unary = 7, // not ! - ~ & *
 };
 
 /// Returns the binary operator precedence for a token.
 pub fn binaryPrecedence(tok: Token) Precedence {
     return switch (tok) {
+        .question_question => .coalesce,
         .kw_or => .or_prec,
         .kw_and => .and_prec,
         .equal_equal, .bang_equal, .less, .less_equal, .greater, .greater_equal => .compare,

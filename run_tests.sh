@@ -74,6 +74,10 @@ get_expected() {
         test_interpolation) echo 42 ;;
         test_interp_var) echo 42 ;;
         test_type_alias) echo 42 ;;
+        test_compound_add) echo 42 ;;
+        test_compound_sub) echo 42 ;;
+        test_compound_mul) echo 42 ;;
+        test_coalesce) echo 42 ;;
         *) echo "" ;;
     esac
 }

@@ -1,0 +1,8 @@
+// Test compound assignment -=
+// Returns 42 if compound sub works correctly
+
+fn main() i64 {
+    var x: i64 = 50;
+    x -= 8;
+    return x;
+}

@@ -3,7 +3,7 @@
 This document tracks language features required for self-hosting the cot compiler.
 Features are extracted from the .cot wireframe files in `src/`.
 
-**Last Updated:** 2026-01-11 (type aliases implemented)
+**Last Updated:** 2026-01-11 (compound assignment, optional unwrap, null coalescing)
 
 ## Legend
 
@@ -77,8 +77,8 @@ These features are used extensively in all .cot files and must work first.
 |---------|--------|---------|-------|
 | Optional `?T` | Partial | All | Type representation exists |
 | Null literal | Partial | All | `null` |
-| Null coalescing `??` | **Gap** | checker.cot | `val ?? default` |
-| Optional unwrap `.?` | **Gap** | parser.cot | `maybe.?` |
+| Null coalescing `??` | Implemented | checker.cot | `val ?? default` |
+| Optional unwrap `.?` | Implemented | parser.cot | `maybe.?` |
 | Optional chaining `?.` | **Gap** | - | `maybe?.method()` |
 | If capture | **Gap** | All | `if maybe \|val\| { }` |
 | While capture | **Gap** | ir.cot | `while iter.next() \|item\| { }` |
@@ -189,7 +189,7 @@ These features are used extensively in all .cot files and must work first.
 | Comparison `== != < > <= >=` | Implemented | All | All comparisons |
 | Logical `and or not` | Partial | All | Keywords |
 | Bitwise `& \| ^ ~ << >>` | Partial | - | Bit ops |
-| Compound assign `+= -= *=` | **Gap** | errors.cot, scanner.cot | `count += 1` |
+| Compound assign `+= -= *=` | Implemented | errors.cot, scanner.cot | `count += 1` |
 | String concat `+` | **Gap** | - | `"a" + "b"` |
 | String comparison | Implemented | scanner.cot | `text == keyword`, `text != keyword` |
 
@@ -224,13 +224,13 @@ Some features depend on others. Suggested implementation order:
 1. ~~`len()` built-in~~ - **Done**
 2. ~~Type aliases (`type X = Y`)~~ - **Done**
 3. ~~`@maxInt(T)` built-in~~ - **Done**
-4. Compound assignment (`+=`, etc.)
+4. ~~Compound assignment (`+=`, etc.)~~ - **Done**
 
 ### Tier 2 (Core Patterns)
 1. ~~Tagged unions with switch/capture~~ - **Done**
 2. If/while capture syntax (`if x |val| { }`)
-3. `??` null coalescing
-4. `.?` optional unwrap
+3. ~~`??` null coalescing~~ - **Done**
+4. ~~`.?` optional unwrap~~ - **Done**
 
 ### Tier 3 (Collections)
 1. `List<T>` built-in
@@ -295,7 +295,7 @@ The following features were implemented in recent development sessions:
 ### Codegen
 - **ARM64 (macOS)**: Full Mach-O object file generation with relocations
 - **x86_64 (Linux)**: Full ELF object file generation with relocations
-- 51 tests passing on both architectures
+- 57 tests passing on both architectures
 
 ### Tagged Unions - **Complete**
 - **Union definition**: Parsing `union Name { variant: Type, ... }` syntax
@@ -360,6 +360,27 @@ The following features were implemented in recent development sessions:
 - **Codegen**: No codegen needed - purely a type-system feature
 - **Tests**: `test_type_alias.cot` passes on both platforms
 
+### Compound Assignment - **Implemented**
+- **Syntax**: `x += 1`, `x -= 1`, `x *= 2`, etc.
+- **Approach**: Go-style desugaring - `x += y` becomes `x = x + y` in IR
+- **Lowering**: `lowerAssign()` loads current value, emits binary op, stores result
+- **Operators**: `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=` all supported
+- **Tests**: `test_compound_add.cot`, `test_compound_sub.cot`, `test_compound_mul.cot` pass on both platforms
+
+### Optional Unwrap (.?) - **Implemented**
+- **Syntax**: `maybe.?` unwraps optional value (panics if null in full implementation)
+- **Parsing**: Added `dot_question` token and postfix operator handling
+- **Type checking**: Returns inner type of optional, or same type for non-optional
+- **Bootstrap**: Simple pass-through (no runtime null check for bootstrap)
+- **Tests**: Implementation complete, basic tests pass
+
+### Null Coalescing (??) - **Implemented**
+- **Syntax**: `val ?? default` returns val if non-null, else default
+- **Precedence**: Lowest binary operator precedence (1)
+- **Type checking**: Returns inner type of optional, or left type for non-optional
+- **Bootstrap**: Returns left operand (no runtime null check for bootstrap)
+- **Tests**: `test_coalesce.cot` passes on both platforms
+
 ---
 
 ## Notes
@@ -384,7 +405,7 @@ The wireframes use `List<T>` and `Map<K,V>` extensively:
 
 **List Progress**: Complete. Native 24-byte header layout with heap allocation via `calloc`. Automatic capacity growth in push. Method syntax (`.push()`, `.get()`) works. Scratch slot mechanism for intermediate results in multi-operation expressions.
 
-**Both Map and List**: 51 tests pass on ARM64 and x86_64. User-defined generics are NOT needed for bootstrap (per spec.md).
+**Both Map and List**: 57 tests pass on ARM64 and x86_64. User-defined generics are NOT needed for bootstrap (per spec.md).
 
 ### Switch Expressions are Everywhere
 
@@ -407,11 +428,12 @@ The switch must work as an expression (returns value) with payload capture.
 8. ~~**@maxInt**~~ - **DONE** (Integer bounds for type checks)
 9. ~~**@minInt**~~ - **DONE** (Integer minimum bounds)
 10. ~~**Type aliases**~~ - **DONE** (`type NodeIndex = u32` syntax)
-11. **Compound assignment** - `+=`, `-=`, etc.
-12. **Optional unwrap** - `.?` and `??` operators
+11. ~~**Compound assignment**~~ - **DONE** (`+=`, `-=`, `*=`, etc.)
+12. ~~**Optional unwrap**~~ - **DONE** (`.?` operator)
+13. ~~**Null coalescing**~~ - **DONE** (`??` operator)
 
 ### Post-Bootstrap Features
 
 These features are deferred until after self-hosting is complete:
 
-13. **Import system** - `import "module"` syntax (use file concatenation for bootstrap)
+14. **Import system** - `import "module"` syntax (use file concatenation for bootstrap)

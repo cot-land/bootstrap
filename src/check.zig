@@ -556,6 +556,7 @@ pub const Checker = struct {
             .struct_init => |si| try self.checkStructInit(si),
             .new_expr => |ne| try self.checkNewExpr(ne),
             .string_interp => |si| try self.checkStringInterp(si),
+            .optional_unwrap => |ou| try self.checkOptionalUnwrap(ou),
             .type_expr => invalid_type, // Types are not values
             .bad_expr => invalid_type,
         };
@@ -585,6 +586,22 @@ pub const Checker = struct {
         }
         // String interpolation always produces a string
         return TypeRegistry.STRING;
+    }
+
+    /// Check optional unwrap: expr.? - unwraps optional, panics if null
+    fn checkOptionalUnwrap(self: *Checker, ou: ast.OptionalUnwrap) CheckError!TypeIndex {
+        const operand_type = try self.checkExpr(ou.operand);
+        const t = self.types.get(operand_type);
+
+        // Operand must be an optional type
+        if (t == .optional) {
+            // Return the inner/element type
+            return t.optional.elem;
+        }
+
+        // For now, allow unwrap on any type (for flexibility during bootstrap)
+        // In a stricter type system, we'd error here
+        return operand_type;
     }
 
     /// Check identifier expression.
@@ -653,6 +670,16 @@ pub const Checker = struct {
                     self.errInvalidOp(bin.span.start, "bitwise", left_type, right_type);
                     return invalid_type;
                 }
+                return left_type;
+            },
+            // Null coalescing: ??
+            .question_question => {
+                // a ?? b: if a is optional ?T, return T (which should match b's type)
+                // For bootstrap simplicity, just return left's inner type or right's type
+                if (left == .optional) {
+                    return left.optional.elem;
+                }
+                // If left is not optional, just return left type (fallback)
                 return left_type;
             },
             else => return invalid_type,
@@ -2161,6 +2188,7 @@ test "AST expr coverage - exhaustive" {
         .new_expr,
         .type_expr,
         .string_interp,
+        .optional_unwrap,
         .bad_expr,
     };
 
@@ -2183,6 +2211,7 @@ test "AST expr coverage - exhaustive" {
             .new_expr,
             .type_expr,
             .string_interp,
+            .optional_unwrap,
             .bad_expr,
             => true,
         };

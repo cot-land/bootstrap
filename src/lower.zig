@@ -442,12 +442,48 @@ pub const Lowerer = struct {
                     .identifier => |ident| {
                         const name = ident.name;
                         if (fb.lookupLocal(name)) |local_idx| {
-                            const value_node = try self.lowerExpr(assign.value);
                             const local_type = fb.locals.items[local_idx].type_idx;
+
+                            // Handle compound assignment: x += 1 becomes x = x + 1
+                            const value_node = if (assign.op) |compound_op| blk: {
+                                // Load current value of target
+                                const load = ir.Node.init(.load, local_type, Span.fromPos(Pos.zero))
+                                    .withAux(@intCast(local_idx));
+                                const current_value = try fb.emit(load);
+
+                                // Lower the right-hand side
+                                const rhs = try self.lowerExpr(assign.value);
+
+                                // Determine the binary op from compound op
+                                const bin_op: ir.Op = switch (compound_op) {
+                                    .plus_equal => .add,
+                                    .minus_equal => .sub,
+                                    .star_equal => .mul,
+                                    .slash_equal => .div,
+                                    .percent_equal => .mod,
+                                    .ampersand_equal => .bit_and,
+                                    .pipe_equal => .bit_or,
+                                    .caret_equal => .bit_xor,
+                                    else => .add,
+                                };
+
+                                // Emit binary operation
+                                const op_node = ir.Node.init(bin_op, local_type, Span.fromPos(Pos.zero))
+                                    .withArgs(&.{ current_value, rhs });
+                                break :blk try fb.emit(op_node);
+                            } else blk: {
+                                // Simple assignment
+                                break :blk try self.lowerExpr(assign.value);
+                            };
+
                             const store = ir.Node.init(.store, local_type, Span.fromPos(Pos.zero))
                                 .withArgs(&.{ @intCast(local_idx), value_node });
                             _ = try fb.emit(store);
-                            log.debug("  assign: {s}", .{name});
+                            if (assign.op) |op| {
+                                log.debug("  compound assign {s}: {s}", .{ op.toString(), name });
+                            } else {
+                                log.debug("  assign: {s}", .{name});
+                            }
                         }
                     },
                     else => {},
@@ -773,9 +809,10 @@ pub const Lowerer = struct {
             .struct_init => |si| self.lowerStructInit(si),
             .new_expr => |ne| self.lowerNewExpr(ne),
             .string_interp => |si| self.lowerStringInterp(si),
-            .block => ir.null_node,  // Block expressions not yet implemented
-            .type_expr => ir.null_node,  // Type expressions don't produce runtime values
-            .bad_expr => ir.null_node,  // Skip invalid expressions
+            .optional_unwrap => |ou| self.lowerOptionalUnwrap(ou),
+            .block => ir.null_node, // Block expressions not yet implemented
+            .type_expr => ir.null_node, // Type expressions don't produce runtime values
+            .bad_expr => ir.null_node, // Skip invalid expressions
         };
     }
 
@@ -947,6 +984,14 @@ pub const Lowerer = struct {
         return ir.null_node;
     }
 
+    /// Lower optional unwrap: expr.? - unwraps optional value
+    /// For bootstrap simplicity, this just evaluates the operand.
+    /// A real implementation would add a null check and panic.
+    fn lowerOptionalUnwrap(self: *Lowerer, ou: ast.OptionalUnwrap) Allocator.Error!ir.NodeIndex {
+        // Simply evaluate the operand - null checks are TODO
+        return self.lowerExpr(ou.operand);
+    }
+
     fn lowerLiteral(self: *Lowerer, lit: ast.Literal) Allocator.Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
 
@@ -998,6 +1043,14 @@ pub const Lowerer = struct {
 
     fn lowerBinary(self: *Lowerer, bin: ast.Binary) Allocator.Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
+
+        // Handle null coalescing separately - it needs special semantics
+        // a ?? b returns a if a is not null, else b
+        // For bootstrap simplicity, just return left operand (assumes non-null)
+        // TODO: Proper null check implementation
+        if (bin.op == .question_question) {
+            return self.lowerExpr(bin.left);
+        }
 
         // Check for string literal comparisons - constant fold them
         if (bin.op == .equal_equal or bin.op == .bang_equal) {

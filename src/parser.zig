@@ -708,9 +708,21 @@ pub const Parser = struct {
     fn parsePrimaryExpr(self: *Parser) ParseError!?NodeIndex {
         var expr = try self.parseOperand() orelse return null;
 
-        // Postfix operators: ., [], ()
+        // Postfix operators: ., .?, [], ()
         while (true) {
-            if (self.match(.dot)) {
+            if (self.match(.dot_question)) {
+                // Optional unwrap: expr.?
+                const expr_span = self.ast.getNode(expr).span();
+                const end = self.tok.span.start; // end at the '?' position
+                expr = try self.ast.addNode(.{
+                    .expr = .{
+                        .optional_unwrap = .{
+                            .operand = expr,
+                            .span = Span.init(expr_span.start, end),
+                        },
+                    },
+                });
+            } else if (self.match(.dot)) {
                 // Field access: expr.field
                 if (!self.check(.identifier)) {
                     self.err.errorWithCode(self.pos(), .E203, "expected field name");

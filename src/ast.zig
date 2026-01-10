@@ -171,6 +171,8 @@ pub const Expr = union(enum) {
     new_expr: NewExpr,
     // String interpolation: "text ${expr} more"
     string_interp: StringInterp,
+    // Optional unwrap: expr.? (panics if null)
+    optional_unwrap: OptionalUnwrap,
     // Type expressions
     type_expr: TypeExpr,
     // For error recovery
@@ -194,6 +196,7 @@ pub const Expr = union(enum) {
             .struct_init => |e| e.span,
             .new_expr => |e| e.span,
             .string_interp => |e| e.span,
+            .optional_unwrap => |e| e.span,
             .type_expr => |e| e.span,
             .bad_expr => |e| e.span,
         };
@@ -342,6 +345,12 @@ pub const StructInit = struct {
 pub const NewExpr = struct {
     /// The type being allocated (a type expression node)
     type_expr: NodeIndex,
+    span: Span,
+};
+
+/// Optional unwrap: expr.? - unwraps optional, panics if null
+pub const OptionalUnwrap = struct {
+    operand: NodeIndex,
     span: Span,
 };
 

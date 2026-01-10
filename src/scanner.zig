@@ -541,6 +541,9 @@ pub const Scanner = struct {
             } else if (self.ch == '*') blk: {
                 self.advance();
                 break :blk .dot_star;
+            } else if (self.ch == '?') blk: {
+                self.advance();
+                break :blk .dot_question;
             } else .dot,
 
             '?' => if (self.ch == '?') blk: {
@@ -642,7 +645,7 @@ test "scanner basics" {
 }
 
 test "scanner operators" {
-    const content = "== != <= >= << >> .. .* ?? ?.";
+    const content = "== != <= >= << >> .. .* .? ?? ?.";
     var src = Source.init(std.testing.allocator, "test.cot", content);
     defer src.deinit();
 
@@ -656,6 +659,7 @@ test "scanner operators" {
     try std.testing.expectEqual(Token.greater_greater, scanner.next().tok);
     try std.testing.expectEqual(Token.dot_dot, scanner.next().tok);
     try std.testing.expectEqual(Token.dot_star, scanner.next().tok);
+    try std.testing.expectEqual(Token.dot_question, scanner.next().tok);
     try std.testing.expectEqual(Token.question_question, scanner.next().tok);
     try std.testing.expectEqual(Token.question_dot, scanner.next().tok);
     try std.testing.expectEqual(Token.eof, scanner.next().tok);

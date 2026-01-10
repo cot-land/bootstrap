@@ -1,0 +1,8 @@
+// Test compound assignment +=
+// Returns 42 if compound add works correctly
+
+fn main() i64 {
+    var x: i64 = 40;
+    x += 2;
+    return x;
+}
