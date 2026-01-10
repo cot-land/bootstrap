@@ -1429,6 +1429,11 @@ pub const Driver = struct {
                         }
                     } else if (ret_val.op == .const_int or ret_val.op == .const_bool) {
                         try x86_64.movRegImm64(buf, .rax, ret_val.aux_int);
+                    } else if (ret_val.op == .load) {
+                        // Load from local variable into rax
+                        const local_idx: usize = @intCast(ret_val.aux_int);
+                        const local_offset: i32 = func.locals[local_idx].offset;
+                        try x86_64.movRegMem(buf, .rax, .rbp, local_offset);
                     }
                     // .field and call results are already in rax
                 }
@@ -1457,6 +1462,15 @@ pub const Driver = struct {
                         const local_idx: usize = @intCast(left.aux_int);
                         const local_offset: i32 = func.locals[local_idx].offset;
                         try x86_64.movRegMem(buf, .r8, .rbp, local_offset);
+                    } else if (left.op == .field) {
+                        // Field access: load from struct at local + field offset
+                        const field_args = left.args();
+                        if (field_args.len > 0) {
+                            const local_idx: usize = @intCast(field_args[0]);
+                            const field_offset: i32 = @intCast(left.aux_int);
+                            const local_offset: i32 = func.locals[local_idx].offset;
+                            try x86_64.movRegMem(buf, .r8, .rbp, local_offset + field_offset);
+                        }
                     }
 
                     // Compare with right operand
@@ -1473,6 +1487,16 @@ pub const Driver = struct {
                         const local_offset: i32 = func.locals[local_idx].offset;
                         try x86_64.movRegMem(buf, .r9, .rbp, local_offset);
                         try x86_64.cmpRegReg(buf, .r8, .r9);
+                    } else if (right.op == .field) {
+                        // Field access: load from struct at local + field offset
+                        const field_args = right.args();
+                        if (field_args.len > 0) {
+                            const local_idx: usize = @intCast(field_args[0]);
+                            const field_offset: i32 = @intCast(right.aux_int);
+                            const local_offset: i32 = func.locals[local_idx].offset;
+                            try x86_64.movRegMem(buf, .r9, .rbp, local_offset + field_offset);
+                            try x86_64.cmpRegReg(buf, .r8, .r9);
+                        }
                     }
                 }
             },

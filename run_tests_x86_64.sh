@@ -32,6 +32,8 @@ get_expected() {
         test_while_simple) echo 42 ;;
         test_while_true) echo 42 ;;
         test_while) echo 5 ;;
+        test_for_array) echo 60 ;;
+        test_for_slice) echo 90 ;;
         test_len) echo 5 ;;
         test_len2) echo 12 ;;
         test_string) echo 5 ;;

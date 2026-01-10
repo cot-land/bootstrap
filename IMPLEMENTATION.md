@@ -176,6 +176,461 @@ Features that can wait until after self-hosting.
 
 ---
 
+## Phase 5: Standard Library via Zig FFI
+
+After self-hosting, Cot needs a standard library (HTTP, crypto, JSON, file I/O, etc.). Rather than rewriting everything from scratch, we can leverage Zig's battle-tested `std` library via C ABI exports.
+
+### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Cot Application                          │
+│   import "std/http"                                          │
+│   http.get("https://example.com")                            │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              │ calls extern fn
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    libcot_runtime.a                          │
+│   (Zig implementation, exported via C ABI)                   │
+│                                                              │
+│   export fn cot_http_get(...) callconv(.C) i64              │
+│   export fn cot_json_parse(...) callconv(.C) *JsonValue     │
+│   export fn cot_file_read(...) callconv(.C) i64             │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              │ uses internally
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                     Zig std library                          │
+│   std.http.Client, std.json, std.fs, std.crypto             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Step 1: Create Zig Runtime Library
+
+**File:** `runtime/cot_runtime.zig`
+
+```zig
+const std = @import("std");
+
+// Use C allocator for FFI compatibility
+const allocator = std.heap.c_allocator;
+
+// ============================================================
+// HTTP Client
+// ============================================================
+
+export fn cot_http_get(
+    url_ptr: [*:0]const u8,
+    out_buf: [*]u8,
+    buf_len: usize,
+) callconv(.C) i64 {
+    const url = std.mem.span(url_ptr);
+
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    var response = client.fetch(allocator, .{
+        .url = url,
+    }) catch return -1;
+    defer response.deinit();
+
+    const body = response.body orelse return 0;
+    const copy_len = @min(body.len, buf_len);
+    @memcpy(out_buf[0..copy_len], body[0..copy_len]);
+
+    return @intCast(copy_len);
+}
+
+export fn cot_http_post(
+    url_ptr: [*:0]const u8,
+    body_ptr: [*]const u8,
+    body_len: usize,
+    out_buf: [*]u8,
+    out_len: usize,
+) callconv(.C) i64 {
+    // Implementation using std.http.Client
+    _ = url_ptr; _ = body_ptr; _ = body_len; _ = out_buf; _ = out_len;
+    return -1; // TODO
+}
+
+// ============================================================
+// JSON
+// ============================================================
+
+pub const JsonValue = opaque {};
+
+export fn cot_json_parse(
+    json_ptr: [*]const u8,
+    json_len: usize,
+) callconv(.C) ?*JsonValue {
+    const json_str = json_ptr[0..json_len];
+    const parsed = std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        json_str,
+        .{},
+    ) catch return null;
+
+    // Store parsed value and return opaque pointer
+    const result = allocator.create(std.json.Parsed(std.json.Value)) catch return null;
+    result.* = parsed;
+    return @ptrCast(result);
+}
+
+export fn cot_json_free(value: ?*JsonValue) callconv(.C) void {
+    if (value) |v| {
+        const parsed: *std.json.Parsed(std.json.Value) = @ptrCast(@alignCast(v));
+        parsed.deinit();
+        allocator.destroy(parsed);
+    }
+}
+
+export fn cot_json_get_string(
+    value: *JsonValue,
+    key_ptr: [*:0]const u8,
+    out_buf: [*]u8,
+    buf_len: usize,
+) callconv(.C) i64 {
+    _ = value; _ = key_ptr; _ = out_buf; _ = buf_len;
+    return -1; // TODO: implement object field access
+}
+
+// ============================================================
+// File I/O
+// ============================================================
+
+export fn cot_file_read(
+    path_ptr: [*:0]const u8,
+    out_buf: [*]u8,
+    buf_len: usize,
+) callconv(.C) i64 {
+    const path = std.mem.span(path_ptr);
+
+    const file = std.fs.cwd().openFile(path, .{}) catch return -1;
+    defer file.close();
+
+    const bytes_read = file.read(out_buf[0..buf_len]) catch return -1;
+    return @intCast(bytes_read);
+}
+
+export fn cot_file_write(
+    path_ptr: [*:0]const u8,
+    data_ptr: [*]const u8,
+    data_len: usize,
+) callconv(.C) i64 {
+    const path = std.mem.span(path_ptr);
+    const data = data_ptr[0..data_len];
+
+    const file = std.fs.cwd().createFile(path, .{}) catch return -1;
+    defer file.close();
+
+    file.writeAll(data) catch return -1;
+    return @intCast(data_len);
+}
+
+export fn cot_file_exists(path_ptr: [*:0]const u8) callconv(.C) bool {
+    const path = std.mem.span(path_ptr);
+    std.fs.cwd().access(path, .{}) catch return false;
+    return true;
+}
+
+// ============================================================
+// Crypto (Hashing)
+// ============================================================
+
+export fn cot_sha256(
+    data_ptr: [*]const u8,
+    data_len: usize,
+    out_hash: [*]u8,  // Must be 32 bytes
+) callconv(.C) void {
+    const data = data_ptr[0..data_len];
+    const hash = std.crypto.hash.sha2.Sha256.hash(data, .{});
+    @memcpy(out_hash[0..32], &hash);
+}
+
+// ============================================================
+// Memory Management (for Cot heap objects)
+// ============================================================
+
+export fn cot_alloc(size: usize) callconv(.C) ?*anyopaque {
+    const mem = allocator.alloc(u8, size) catch return null;
+    return mem.ptr;
+}
+
+export fn cot_free(ptr: ?*anyopaque, size: usize) callconv(.C) void {
+    if (ptr) |p| {
+        const slice: [*]u8 = @ptrCast(p);
+        allocator.free(slice[0..size]);
+    }
+}
+
+export fn cot_realloc(
+    ptr: ?*anyopaque,
+    old_size: usize,
+    new_size: usize,
+) callconv(.C) ?*anyopaque {
+    if (ptr) |p| {
+        const old_slice: [*]u8 = @ptrCast(p);
+        const new_mem = allocator.realloc(old_slice[0..old_size], new_size) catch return null;
+        return new_mem.ptr;
+    }
+    return cot_alloc(new_size);
+}
+
+// ============================================================
+// String Utilities
+// ============================================================
+
+export fn cot_string_concat(
+    a_ptr: [*]const u8,
+    a_len: usize,
+    b_ptr: [*]const u8,
+    b_len: usize,
+    out_ptr: [*]u8,
+    out_cap: usize,
+) callconv(.C) i64 {
+    const total = a_len + b_len;
+    if (total > out_cap) return -1;
+
+    @memcpy(out_ptr[0..a_len], a_ptr[0..a_len]);
+    @memcpy(out_ptr[a_len..total], b_ptr[0..b_len]);
+
+    return @intCast(total);
+}
+
+// ============================================================
+// Print (stdout)
+// ============================================================
+
+export fn cot_print(ptr: [*]const u8, len: usize) callconv(.C) void {
+    const stdout = std.io.getStdOut().writer();
+    stdout.writeAll(ptr[0..len]) catch {};
+}
+
+export fn cot_println(ptr: [*]const u8, len: usize) callconv(.C) void {
+    const stdout = std.io.getStdOut().writer();
+    stdout.writeAll(ptr[0..len]) catch {};
+    stdout.writeByte('\n') catch {};
+}
+```
+
+### Step 2: Build the Runtime Library
+
+**File:** `runtime/build.zig`
+
+```zig
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    // Build as static library with C ABI
+    const lib = b.addStaticLibrary(.{
+        .name = "cot_runtime",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cot_runtime.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    // Install to lib/ directory
+    b.installArtifact(lib);
+
+    // Also generate C header (optional, for documentation)
+    // The actual interface is documented in cot's std/ modules
+}
+```
+
+**Build commands:**
+```bash
+cd runtime
+zig build -Doptimize=ReleaseFast
+# Produces: zig-out/lib/libcot_runtime.a
+```
+
+### Step 3: Cot Language Support for extern fn
+
+**Cot syntax for external functions:**
+
+```cot
+// Declare external function (implemented in libcot_runtime.a)
+extern fn cot_http_get(url: *u8, out: *u8, len: i64) i64
+extern fn cot_file_read(path: *u8, out: *u8, len: i64) i64
+extern fn cot_sha256(data: *u8, len: i64, out: *u8) void
+
+// Usage in Cot code
+fn fetch(url: string) string {
+    var buf: [65536]u8 = undefined
+    const len = cot_http_get(url.ptr, &buf, 65536)
+    if (len < 0) {
+        return ""
+    }
+    return string.from_bytes(buf[0..len])
+}
+```
+
+**Implementation in compiler:**
+
+1. **Parser:** Recognize `extern fn` declarations (no body)
+2. **Type checker:** Validate extern function signatures
+3. **Codegen:** Emit external symbol reference (no code generation for extern)
+4. **Linker:** Link against libcot_runtime.a
+
+### Step 4: Standard Library Wrappers (Pure Cot)
+
+**File:** `std/http.cot`
+
+```cot
+// High-level HTTP API wrapping low-level extern functions
+
+extern fn cot_http_get(url: *u8, out: *u8, len: i64) i64
+
+pub struct Response {
+    status: i64,
+    body: string,
+}
+
+pub fn get(url: string) ?Response {
+    var buf: [1048576]u8 = undefined  // 1MB buffer
+    const len = cot_http_get(url.ptr, &buf, 1048576)
+
+    if (len < 0) {
+        return null
+    }
+
+    return Response{
+        .status = 200,
+        .body = string.from_bytes(buf[0..len]),
+    }
+}
+
+pub fn post(url: string, body: string) ?Response {
+    // TODO: implement using cot_http_post
+    _ = url
+    _ = body
+    return null
+}
+```
+
+**File:** `std/fs.cot`
+
+```cot
+// File system operations
+
+extern fn cot_file_read(path: *u8, out: *u8, len: i64) i64
+extern fn cot_file_write(path: *u8, data: *u8, len: i64) i64
+extern fn cot_file_exists(path: *u8) bool
+
+pub fn read_file(path: string) ?string {
+    var buf: [1048576]u8 = undefined
+    const len = cot_file_read(path.ptr, &buf, 1048576)
+
+    if (len < 0) {
+        return null
+    }
+
+    return string.from_bytes(buf[0..len])
+}
+
+pub fn write_file(path: string, content: string) bool {
+    const result = cot_file_write(path.ptr, content.ptr, content.len)
+    return result >= 0
+}
+
+pub fn exists(path: string) bool {
+    return cot_file_exists(path.ptr)
+}
+```
+
+### Step 5: Distribution Structure
+
+```
+cot/
+├── bin/
+│   └── cot                      # The compiler executable
+├── lib/
+│   └── libcot_runtime.a         # Zig runtime (auto-linked)
+└── std/
+    ├── http.cot                 # HTTP client wrappers
+    ├── fs.cot                   # File system wrappers
+    ├── json.cot                 # JSON parsing wrappers
+    ├── crypto.cot               # Crypto wrappers
+    └── ...
+```
+
+### Step 6: Auto-Linking in Compiler
+
+The Cot compiler automatically links `libcot_runtime.a`:
+
+```zig
+// In driver.zig or linker integration
+
+fn link(objects: []const []const u8, output: []const u8) !void {
+    const cot_home = std.posix.getenv("COT_HOME") orelse "/usr/local/cot";
+    const runtime_lib = try std.fmt.allocPrint(
+        allocator,
+        "{s}/lib/libcot_runtime.a",
+        .{cot_home}
+    );
+
+    var args = std.ArrayList([]const u8).init(allocator);
+    try args.append("cc");
+    for (objects) |obj| {
+        try args.append(obj);
+    }
+    try args.append(runtime_lib);
+    try args.append("-o");
+    try args.append(output);
+
+    // Execute linker
+    var child = std.process.Child.init(args.items, allocator);
+    _ = try child.spawnAndWait();
+}
+```
+
+### Best Practices
+
+1. **Keep Zig runtime thin** - Only wrap functionality that truly benefits from Zig's std
+2. **Prefer pure Cot** - If something can be written efficiently in Cot, do it in Cot
+3. **Stable C ABI** - Don't change function signatures after release; add new functions instead
+4. **Error handling** - Return negative values or null for errors; let Cot wrappers handle error types
+5. **Memory ownership** - Document who owns allocated memory (caller vs callee)
+6. **Buffer sizes** - Use explicit buffer sizes, not Zig slices across FFI boundary
+7. **Null termination** - Use `[*:0]const u8` for C-string compatibility where appropriate
+
+### What Goes in Zig vs Pure Cot
+
+| Category | Zig Runtime | Pure Cot |
+|----------|-------------|----------|
+| HTTP client/server | ✓ (std.http) | Wrappers only |
+| JSON parsing | ✓ (std.json) | Wrappers only |
+| File I/O | ✓ (std.fs) | Wrappers only |
+| Crypto | ✓ (std.crypto) | Wrappers only |
+| Memory allocation | ✓ (allocator) | Uses runtime |
+| String operations | Basic only | Most logic |
+| Data structures | - | ✓ (List, Map, etc.) |
+| Math | - | ✓ (pure computation) |
+| Business logic | - | ✓ (always) |
+
+### Timeline
+
+| Task | Effort | Dependencies |
+|------|--------|--------------|
+| `extern fn` in parser | 0.5 days | - |
+| `extern fn` in type checker | 0.5 days | Parser |
+| External symbol codegen | 0.5 days | Type checker |
+| Auto-link runtime | 0.5 days | Codegen |
+| libcot_runtime.a basics | 2 days | - |
+| std/ Cot wrappers | 2 days | Runtime |
+| **Total** | ~1 week | After self-hosting |
+
+---
+
 ## Current Status
 
 ```
