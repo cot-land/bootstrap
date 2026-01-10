@@ -1,0 +1,6 @@
+// Test simple string concatenation without variables
+// Just two string literals
+fn main() int {
+    var s = "hello ${"world"}";
+    return 42;
+}

@@ -1,32 +1,22 @@
 #!/bin/bash
-# Build Docker image and run x86_64 tests
-# Usage: ./docker_test.sh [--build-image]
+# Quick x86_64 Docker test helper
+# Usage: ./docker_test.sh [test_name]
+# If no test name given, runs all tests
 
 set -e
 
-IMAGE_NAME="cot-x86_64"
-DOCKERFILE="Dockerfile.x86_64"
-
-# Check if we need to build/rebuild the image
-if [ "$1" = "--build-image" ] || [ "$1" = "-b" ]; then
-    echo "Building Docker image..."
-    docker build --platform linux/amd64 -t "$IMAGE_NAME" -f "$DOCKERFILE" .
-    echo "Image built successfully."
-    echo ""
-fi
-
-# Check if image exists
-if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
-    echo "Docker image '$IMAGE_NAME' not found. Building..."
-    docker build --platform linux/amd64 -t "$IMAGE_NAME" -f "$DOCKERFILE" .
-    echo ""
-fi
-
-# Build cot for x86_64
-echo "Building cot for x86_64-linux-gnu..."
+echo "Building cot for x86_64-linux..."
 zig build -Dtarget=x86_64-linux-gnu
-echo ""
 
-# Run tests in Docker
-echo "Running tests in Docker container..."
-docker run --rm --platform linux/amd64 -v "$(pwd):/cot" "$IMAGE_NAME" ./run_tests_x86_64.sh
+if [ -n "$1" ]; then
+    # Run single test
+    echo "Running test: $1"
+    docker run --platform linux/amd64 -v "$(pwd)":/cot -w /cot cot-zig:0.15.2 \
+        sh -c "./zig-out/bin/cot tests/$1.cot -o test 2>/dev/null && \
+               zig cc -o test_out $1.o zig-out/lib/libcot_runtime.a && \
+               ./test_out; echo Exit: \$?"
+else
+    # Run all tests
+    echo "Running all x86_64 tests in Docker..."
+    docker run --platform linux/amd64 -v "$(pwd)":/cot -w /cot cot-zig:0.15.2 ./run_tests_x86_64.sh
+fi

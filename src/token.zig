@@ -15,7 +15,10 @@ pub const Token = enum(u8) {
     identifier, // variable names, function names
     int_literal, // 123, 0xFF
     float_literal, // 3.14, 1e10
-    string_literal, // "hello"
+    string_literal, // "hello" (non-interpolated)
+    string_interp_start, // "text ${ (start of interpolated string)
+    string_interp_mid, // } text ${ (middle part between interpolations)
+    string_interp_end, // } text" (end of interpolated string)
     char_literal, // 'a'
 
     // Operators (single char)
@@ -128,6 +131,9 @@ pub const Token = enum(u8) {
             .int_literal => "integer",
             .float_literal => "float",
             .string_literal => "string",
+            .string_interp_start => "string_interp_start",
+            .string_interp_mid => "string_interp_mid",
+            .string_interp_end => "string_interp_end",
             .char_literal => "char",
             .plus => "+",
             .minus => "-",

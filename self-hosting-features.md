@@ -201,7 +201,7 @@ These features are used extensively in all .cot files and must work first.
 | `println(x)` | Implemented | ir.cot | Print with newline (via libc write) |
 | `print(x)` | Implemented | ir.cot | Print without newline (via libc write) |
 | `@sizeof(T)` | **Gap** | - | Not used in wireframes |
-| `@maxInt(T)` | **Gap** | ast.cot, ir.cot | Max value for int type |
+| `@maxInt(T)` | Implemented | ast.cot, ir.cot | Max value for int type |
 | `@minInt(T)` | **Gap** | - | Min value for int type |
 | `@intCast(T, v)` | **Gap** | ast.cot, types.cot | Type cast |
 
@@ -212,7 +212,7 @@ These features are used extensively in all .cot files and must work first.
 | `import "module"` | **Gap** | All | Module imports |
 | `defer expr` | **Gap** | checker.cot | Deferred execution |
 | Discard `_ = expr` | **Gap** | parser.cot | Ignore return value |
-| String interpolation | **Gap** | errors.cot | `"Value: ${x}"` |
+| String interpolation | Implemented | errors.cot | `"Value: {x}"` |
 
 ---
 
@@ -220,10 +220,10 @@ These features are used extensively in all .cot files and must work first.
 
 Some features depend on others. Suggested implementation order:
 
-### Tier 1 (Foundation) - Partially Complete
+### Tier 1 (Foundation) - Mostly Complete
 1. ~~`len()` built-in~~ - **Done**
 2. Type aliases (`type X = Y`)
-3. `@maxInt(T)` built-in
+3. ~~`@maxInt(T)` built-in~~ - **Done**
 4. Compound assignment (`+=`, etc.)
 
 ### Tier 2 (Core Patterns)
@@ -249,8 +249,8 @@ Some features depend on others. Suggested implementation order:
 3. `try` propagation
 4. `catch` handling
 
-### Tier 6 (Finishing) - Partially Complete
-1. String interpolation
+### Tier 6 (Finishing) - Mostly Complete
+1. ~~String interpolation~~ - **Done**
 2. Import system
 3. `defer`
 4. ~~`print`/`println`~~ - **Done**
@@ -295,7 +295,7 @@ The following features were implemented in recent development sessions:
 ### Codegen
 - **ARM64 (macOS)**: Full Mach-O object file generation with relocations
 - **x86_64 (Linux)**: Full ELF object file generation with relocations
-- 41 tests passing on both architectures
+- 51 tests passing on both architectures
 
 ### Tagged Unions - **Complete**
 - **Union definition**: Parsing `union Name { variant: Type, ... }` syntax
@@ -336,6 +336,23 @@ The following features were implemented in recent development sessions:
 - **Method syntax**: `.push()`, `.get()` work via IR ops
 - **Scratch slot codegen**: Intermediate results saved to stack for multi-operation expressions (e.g., `list.get(0) + list.get(1) + list.get(2)`)
 
+### String Interpolation - **Implemented**
+- **Syntax**: `"Hello {name}!"` embeds variable values in strings
+- **Implementation**: Parser rewrites to `str_concat` operations
+- **Codegen**: Uses `cot_str_concat` runtime function for concatenation
+- **Tests**: `test_interpolation.cot` and `test_interp_var.cot` pass on both platforms
+
+### @maxInt Builtin - **Implemented**
+- **Syntax**: `@maxInt(i8)` returns maximum value for integer type
+- **Compile-time**: Evaluated at compile time to constant
+- **Tests**: `test_maxint.cot` passes on both platforms
+
+### Register Allocator - **Implemented**
+- **Go-style farthest-next-use eviction policy**
+- **Complements StorageManager**: StorageManager provides spill slots, RegAllocator tracks register state
+- **Caller-saved register invalidation**: Properly invalidates registers after runtime function calls (x0-x17 on ARM64, rax/rcx/rdx/rsi/rdi/r8-r11 on x86_64)
+- **Fixes value lifetime bugs**: Values across function calls are correctly reloaded from storage
+
 ---
 
 ## Notes
@@ -360,7 +377,7 @@ The wireframes use `List<T>` and `Map<K,V>` extensively:
 
 **List Progress**: Complete. Native 24-byte header layout with heap allocation via `calloc`. Automatic capacity growth in push. Method syntax (`.push()`, `.get()`) works. Scratch slot mechanism for intermediate results in multi-operation expressions.
 
-**Both Map and List**: 46 tests pass on ARM64 and x86_64. User-defined generics are NOT needed for bootstrap (per spec.md).
+**Both Map and List**: 51 tests pass on ARM64 and x86_64. User-defined generics are NOT needed for bootstrap (per spec.md).
 
 ### Switch Expressions are Everywhere
 
@@ -379,5 +396,10 @@ The switch must work as an expression (returns value) with payload capture.
 4. ~~**List<T> runtime**~~ - **DONE** (runtime library with push/get/len/free)
 5. ~~**List methods**~~ - **DONE** (`.push()`, `.get()` method call syntax works)
 6. ~~**Methods**~~ - **DONE** (`fn method(self: *T)` + UFCS `obj.method()`)
-7. **String interpolation** - `"Error: ${msg}"` syntax
-8. **@maxInt/@minInt** - Integer bounds for type checks
+7. ~~**String interpolation**~~ - **DONE** (`"Error: {msg}"` syntax)
+8. ~~**@maxInt**~~ - **DONE** (Integer bounds for type checks)
+9. **@minInt** - Integer minimum bounds (not yet implemented)
+10. **Type aliases** - `type NodeIndex = u32` syntax
+11. **Import system** - `import "module"` syntax
+12. **Compound assignment** - `+=`, `-=`, etc.
+13. **Optional unwrap** - `.?` and `??` operators

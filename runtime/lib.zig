@@ -8,15 +8,18 @@
 // Import submodules - their `export fn` declarations become symbols
 const map = @import("map.zig");
 const list = @import("list.zig");
+const string = @import("string.zig");
 
 // Reference the modules to ensure they're not optimized away
 comptime {
     _ = map;
     _ = list;
+    _ = string;
 }
 
 test {
     // Run tests from all submodules
     _ = @import("map.zig");
     _ = @import("list.zig");
+    _ = @import("string.zig");
 }

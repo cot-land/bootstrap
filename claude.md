@@ -343,7 +343,66 @@ docker run --platform linux/amd64 -v $(pwd):/cot -w /cot cot-zig:0.15.2 \
 
 # Run full x86_64 test suite in Docker
 docker run --platform linux/amd64 -v $(pwd):/cot -w /cot cot-zig:0.15.2 ./run_tests_x86_64.sh
+
+# Quick helper script (builds x86_64 + runs all Docker tests)
+./docker_test.sh          # Run all x86_64 tests
+./docker_test.sh test_foo # Run single test
 ```
+
+### Quick x86_64 Test Workflow
+
+When implementing new features or fixing bugs, use this minimal workflow:
+
+```bash
+# 1. Build and run native tests
+zig build && ./run_tests.sh
+
+# 2. Build for x86_64 and run Docker tests (ALWAYS do both!)
+zig build -Dtarget=x86_64-linux-gnu && \
+  docker run --platform linux/amd64 -v $(pwd):/cot -w /cot cot-zig:0.15.2 ./run_tests_x86_64.sh
+```
+
+**Do NOT forget x86_64 tests.** Many register allocation and codegen bugs only manifest on x86_64 due to different calling conventions and register layouts.
+
+---
+
+## Register Safety for New Features
+
+When adding operations that call runtime functions or produce multi-register results:
+
+### Rules for Avoiding Register Clobbering
+
+1. **Document register contracts** for each operation:
+   - What registers does it expect inputs in?
+   - What registers does it produce outputs in?
+   - What registers does it clobber (caller-saved)?
+
+2. **Handle nested expressions explicitly**. When an operation's input comes from another operation of the same type (e.g., nested str_concat), the result may already be in registers. Check for this case and move to argument registers if needed.
+
+3. **Test nested expressions**. Always add tests like:
+   - `var a = op1(op1(x, y), z)` - nested same operation
+   - `var a = op2(op1(x, y))` - chained different operations
+
+### Example: str_concat
+
+```
+x86_64:
+- Inputs: rdi=ptr1, rsi=len1, rdx=ptr2, rcx=len2
+- Outputs: rax=ptr, rdx=len
+- When first arg is str_concat result: rax->rdi, rdx->rsi before loading arg2
+
+AArch64:
+- Inputs: x0=ptr1, x1=len1, x2=ptr2, x3=len2
+- Outputs: x0=ptr, x1=len
+- When first arg is str_concat result: already in x0/x1, no move needed
+```
+
+### Future Improvement: Proper Register Allocation
+
+The current naive codegen assumes values are in specific registers. For more complex expressions, implement:
+1. Linear scan register allocation
+2. Spill slots for when registers exhausted
+3. Live range analysis
 
 ---
 

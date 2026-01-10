@@ -527,8 +527,22 @@ pub const TypeRegistry = struct {
         };
     }
 
-    /// Look up a type by name (for struct, enum, and union types).
+    /// Look up a type by name (for struct, enum, union, and basic types).
     pub fn lookupByName(self: *const TypeRegistry, name: []const u8) ?TypeIndex {
+        // Check basic types first
+        if (std.mem.eql(u8, name, "i8")) return I8;
+        if (std.mem.eql(u8, name, "i16")) return I16;
+        if (std.mem.eql(u8, name, "i32")) return I32;
+        if (std.mem.eql(u8, name, "i64")) return I64;
+        if (std.mem.eql(u8, name, "u8")) return U8;
+        if (std.mem.eql(u8, name, "u16")) return U16;
+        if (std.mem.eql(u8, name, "u32")) return U32;
+        if (std.mem.eql(u8, name, "u64")) return U64;
+        if (std.mem.eql(u8, name, "bool")) return BOOL;
+        if (std.mem.eql(u8, name, "string")) return STRING;
+        if (std.mem.eql(u8, name, "void")) return VOID;
+
+        // Check user-defined types
         for (self.types.items, 0..) |t, idx| {
             switch (t) {
                 .struct_type => |st| {

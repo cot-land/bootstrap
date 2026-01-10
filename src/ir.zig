@@ -165,6 +165,11 @@ pub const Op = enum(u8) {
     /// Free list. args[0] = handle
     list_free,
 
+    // ========== String Operations (runtime calls) ==========
+    /// Concatenate two strings. args[0]=str1_ptr, args[1]=str1_len, args[2]=str2_ptr, args[3]=str2_len
+    /// Returns: ptr to new string (len stored at offset 8)
+    str_concat,
+
     // ========== Control Flow ==========
     /// Function call. args[0] = func, args[1..] = arguments
     call,

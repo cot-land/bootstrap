@@ -1,0 +1,8 @@
+// Test @maxInt builtin
+// Expected exit code: 42
+
+fn main() i64 {
+    // @maxInt(i8) returns 127, so 127 - 85 = 42
+    const max_i8 = @maxInt(i8);
+    return max_i8 - 85;
+}

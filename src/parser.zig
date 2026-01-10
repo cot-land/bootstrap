@@ -923,6 +923,9 @@ pub const Parser = struct {
                     },
                 });
             },
+            .string_interp_start => {
+                return try self.parseStringInterp(start);
+            },
             .char_literal => {
                 const value = self.tok.text;
                 self.advance();
@@ -1066,11 +1069,67 @@ pub const Parser = struct {
                     },
                 });
             },
+            // Type keywords as identifiers (for builtins like @maxInt(i8))
+            .kw_i8, .kw_i16, .kw_i32, .kw_i64, .kw_u8, .kw_u16, .kw_u32, .kw_u64 => {
+                const name = self.tok.tok.toString();
+                self.advance();
+                return try self.ast.addNode(.{
+                    .expr = .{
+                        .identifier = .{
+                            .name = name,
+                            .span = Span.init(start, self.tok.span.start),
+                        },
+                    },
+                });
+            },
             else => {
                 self.err.errorWithCode(self.pos(), .E201, "expected expression");
                 return null;
             },
         }
+    }
+
+    /// Parse string interpolation: "text ${expr} more ${expr2} end"
+    fn parseStringInterp(self: *Parser, start: Pos) ParseError!?NodeIndex {
+        var segments = std.ArrayList(ast.StringSegment){ .items = &.{}, .capacity = 0 };
+        defer segments.deinit(self.allocator);
+
+        // First segment: text before first ${ (from string_interp_start token)
+        try segments.append(self.allocator, .{ .text = self.tok.text });
+        self.advance(); // consume string_interp_start
+
+        // Parse expression and more segments
+        while (true) {
+            // Parse the interpolated expression
+            const expr = try self.parseExpr() orelse {
+                self.err.errorWithCode(self.pos(), .E201, "expected expression in string interpolation");
+                return null;
+            };
+            try segments.append(self.allocator, .{ .expr = expr });
+
+            // After expression, scanner returns string_interp_mid or string_interp_end
+            if (self.tok.tok == .string_interp_mid) {
+                try segments.append(self.allocator, .{ .text = self.tok.text });
+                self.advance();
+                // Continue to next expression
+            } else if (self.tok.tok == .string_interp_end) {
+                try segments.append(self.allocator, .{ .text = self.tok.text });
+                self.advance();
+                break; // Done with interpolated string
+            } else {
+                self.err.errorWithCode(self.pos(), .E100, "unterminated string interpolation");
+                return null;
+            }
+        }
+
+        return try self.ast.addNode(.{
+            .expr = .{
+                .string_interp = .{
+                    .segments = try self.allocator.dupe(ast.StringSegment, segments.items),
+                    .span = Span.init(start, self.tok.span.start),
+                },
+            },
+        });
     }
 
     /// Parse if expression: if cond { then } else { else }

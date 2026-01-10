@@ -538,6 +538,7 @@ pub const Checker = struct {
             .block => |b| try self.checkBlock(b),
             .struct_init => |si| try self.checkStructInit(si),
             .new_expr => |ne| try self.checkNewExpr(ne),
+            .string_interp => |si| try self.checkStringInterp(si),
             .type_expr => invalid_type, // Types are not values
             .bad_expr => invalid_type,
         };
@@ -547,6 +548,26 @@ pub const Checker = struct {
     fn checkNewExpr(self: *Checker, ne: ast.NewExpr) CheckError!TypeIndex {
         // Resolve the type being allocated
         return try self.resolveTypeExpr(ne.type_expr);
+    }
+
+    /// Check string interpolation: "text ${expr} more"
+    fn checkStringInterp(self: *Checker, si: ast.StringInterp) CheckError!TypeIndex {
+        // Check all interpolated expressions (they should be convertible to string)
+        for (si.segments) |seg| {
+            switch (seg) {
+                .text => {}, // Plain text segments are always valid
+                .expr => |expr_idx| {
+                    const expr_type = try self.checkExpr(expr_idx);
+                    const t = self.types.get(expr_type);
+                    // Allow integers, strings, and booleans in interpolation
+                    if (!isInteger(t) and t != .basic) {
+                        // For now, allow any type - we'll convert to string at runtime
+                    }
+                },
+            }
+        }
+        // String interpolation always produces a string
+        return TypeRegistry.STRING;
     }
 
     /// Check identifier expression.
@@ -662,6 +683,12 @@ pub const Checker = struct {
                 }
                 if (std.mem.eql(u8, name, "@enumFromInt")) {
                     return self.checkBuiltinEnumFromInt(c);
+                }
+                if (std.mem.eql(u8, name, "@maxInt")) {
+                    return self.checkBuiltinMaxInt(c);
+                }
+                if (std.mem.eql(u8, name, "@minInt")) {
+                    return self.checkBuiltinMinInt(c);
                 }
             }
         }
@@ -847,6 +874,73 @@ pub const Checker = struct {
 
         // Return the enum type
         return enum_type_idx;
+    }
+
+    /// Check builtin @maxInt() function.
+    /// Syntax: @maxInt(IntType)
+    /// Returns i64 (the max value fits in i64 for all types except u64)
+    fn checkBuiltinMaxInt(self: *Checker, c: ast.Call) CheckError!TypeIndex {
+        // @maxInt() takes exactly one argument: a type name
+        if (c.args.len != 1) {
+            self.err.errorWithCode(c.span.start, .E300, "@maxInt() expects exactly one argument: an integer type");
+            return invalid_type;
+        }
+
+        // Argument should be an integer type name (identifier)
+        const type_arg = self.tree.getExpr(c.args[0]);
+        if (type_arg == null or type_arg.? != .identifier) {
+            self.err.errorWithCode(c.span.start, .E300, "@maxInt() argument must be an integer type name");
+            return invalid_type;
+        }
+
+        const type_name = type_arg.?.identifier.name;
+        const type_idx = self.types.lookupByName(type_name) orelse {
+            self.err.errorWithCode(c.span.start, .E301, "unknown type");
+            return invalid_type;
+        };
+
+        const t = self.types.get(type_idx);
+        if (!isInteger(t)) {
+            self.err.errorWithCode(c.span.start, .E300, "@maxInt() argument must be an integer type");
+            return invalid_type;
+        }
+
+        // Return i64 - the result is a compile-time constant that fits in i64
+        // (except for u64 max, which overflows to negative in i64)
+        return TypeRegistry.I64;
+    }
+
+    /// Check builtin @minInt() function.
+    /// Syntax: @minInt(IntType)
+    /// Returns i64 (all min values fit in i64)
+    fn checkBuiltinMinInt(self: *Checker, c: ast.Call) CheckError!TypeIndex {
+        // @minInt() takes exactly one argument: a type name
+        if (c.args.len != 1) {
+            self.err.errorWithCode(c.span.start, .E300, "@minInt() expects exactly one argument: an integer type");
+            return invalid_type;
+        }
+
+        // Argument should be an integer type name (identifier)
+        const type_arg = self.tree.getExpr(c.args[0]);
+        if (type_arg == null or type_arg.? != .identifier) {
+            self.err.errorWithCode(c.span.start, .E300, "@minInt() argument must be an integer type name");
+            return invalid_type;
+        }
+
+        const type_name = type_arg.?.identifier.name;
+        const type_idx = self.types.lookupByName(type_name) orelse {
+            self.err.errorWithCode(c.span.start, .E301, "unknown type");
+            return invalid_type;
+        };
+
+        const t = self.types.get(type_idx);
+        if (!isInteger(t)) {
+            self.err.errorWithCode(c.span.start, .E300, "@minInt() argument must be an integer type");
+            return invalid_type;
+        }
+
+        // Return i64 - the result is a compile-time constant that fits in i64
+        return TypeRegistry.I64;
     }
 
     /// Check index expression.
@@ -2049,6 +2143,7 @@ test "AST expr coverage - exhaustive" {
         .struct_init,
         .new_expr,
         .type_expr,
+        .string_interp,
         .bad_expr,
     };
 
@@ -2070,6 +2165,7 @@ test "AST expr coverage - exhaustive" {
             .struct_init,
             .new_expr,
             .type_expr,
+            .string_interp,
             .bad_expr,
             => true,
         };

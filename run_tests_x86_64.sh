@@ -69,6 +69,9 @@ get_expected() {
         test_list_methods) echo 42 ;;
         test_value_lifetime) echo 42 ;;
         test_method) echo 42 ;;
+        test_maxint) echo 42 ;;
+        test_interpolation) echo 42 ;;
+        test_interp_var) echo 42 ;;
         *) echo "" ;;
     esac
 }

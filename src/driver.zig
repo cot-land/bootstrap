@@ -26,6 +26,7 @@ const x86_64 = @import("codegen/x86_64.zig");
 const aarch64 = @import("codegen/aarch64.zig");
 const object = @import("codegen/object.zig");
 const debug = @import("debug.zig");
+const regalloc = @import("regalloc.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -330,15 +331,24 @@ pub const Driver = struct {
     // Value storage tracking for codegen (prevents value clobbering)
     storage: StorageManager,
 
+    // Register allocator for optimal register assignment (optional, created during codegen)
+    reg_alloc: ?regalloc.RegAllocator = null,
+
     pub fn init(allocator: Allocator, options: CompileOptions) Driver {
         return .{
             .allocator = allocator,
             .options = options,
             .storage = StorageManager.init(allocator),
+            .reg_alloc = null,
         };
     }
 
     pub fn deinit(self: *Driver) void {
+        // Clean up register allocator
+        if (self.reg_alloc) |*ra| {
+            ra.deinit();
+        }
+
         // Clean up storage manager
         self.storage.deinit();
 
@@ -1217,6 +1227,23 @@ pub const Driver = struct {
             return value_id;
         }
 
+        // Handle str_concat - args[0]=str1_ptr, args[1]=str1_len, args[2]=str2_ptr, args[3]=str2_len
+        if (node.op == .str_concat) {
+            const value_id = try func.newValue(.str_concat, node.type_idx, block);
+            var value = func.getValue(value_id);
+            var arg_count: u8 = 0;
+            for (node.args()) |ir_arg_idx| {
+                if (ir_to_ssa.get(ir_arg_idx)) |ssa_arg_id| {
+                    if (arg_count < 4) {
+                        value.args_storage[arg_count] = ssa_arg_id;
+                        arg_count += 1;
+                    }
+                }
+            }
+            value.args_len = arg_count;
+            return value_id;
+        }
+
         // Convert IR op to SSA op
         const ssa_op: ssa.Op = switch (node.op) {
             .const_int => .const_int,
@@ -1264,6 +1291,8 @@ pub const Driver = struct {
             .list_get => .list_get,
             .list_len => .list_len,
             .list_free => .list_free,
+            // String operations
+            .str_concat => .str_concat,
             else => .copy, // Default fallback
         };
 
@@ -1285,6 +1314,83 @@ pub const Driver = struct {
             return func.locals[local_idx].offset;
         }
         return 0;
+    }
+
+    // ========================================================================
+    // Register Allocation: Backward Use Analysis
+    // ========================================================================
+    //
+    // Scans SSA in reverse to build use lists with distances for each value.
+    // This enables the Go-style "farthest next use" eviction policy.
+    //
+    // Distance is measured in instruction units from the end of the function.
+    // Values used later (closer to end) have lower distances.
+    //
+
+    /// Perform backward scan to populate use lists in the register allocator
+    fn analyzeUses(self: *Driver, func: *const ssa.Func) !void {
+        var ra = &(self.reg_alloc orelse return);
+
+        // Calculate total instructions for distance measurement
+        var total_insts: i32 = 0;
+        for (func.blocks.items) |block| {
+            total_insts += @intCast(block.values.items.len);
+        }
+
+        // Scan blocks in reverse order
+        var dist: i32 = 0;
+        var block_idx: usize = func.blocks.items.len;
+        while (block_idx > 0) {
+            block_idx -= 1;
+            const block = func.blocks.items[block_idx];
+
+            // Scan values in reverse order within block
+            var val_idx: usize = block.values.items.len;
+            while (val_idx > 0) {
+                val_idx -= 1;
+                const value_id = block.values.items[val_idx];
+                const value = &func.values.items[value_id];
+
+                // Add uses for each argument of this instruction
+                for (value.args()) |arg_id| {
+                    try ra.addUse(arg_id, dist);
+                }
+
+                // Mark constants as rematerializeable
+                if (value.op == .const_int) {
+                    ra.markRematerializeable(value_id, .const_int, value.aux_int);
+                }
+
+                dist += regalloc.Distance.normal;
+            }
+        }
+
+        if (self.options.debug_codegen) {
+            std.debug.print("  Use analysis: {d} instructions scanned\n", .{total_insts});
+        }
+    }
+
+    /// Initialize or reset register allocator for a function
+    fn initRegAllocForFunc(self: *Driver, func: *const ssa.Func) !void {
+        const call_conv = switch (self.options.target.arch) {
+            .x86_64 => regalloc.x86_64_sysv,
+            .aarch64 => regalloc.aarch64_aapcs,
+        };
+
+        const num_values = func.values.items.len;
+
+        if (self.reg_alloc) |*ra| {
+            // Reset existing allocator
+            try ra.reset(num_values);
+        } else {
+            // Create new allocator with StorageManager integration
+            self.reg_alloc = try regalloc.RegAllocator.initWithStorage(
+                self.allocator,
+                call_conv,
+                num_values,
+                &self.storage,
+            );
+        }
     }
 
     fn generateCode(self: *Driver, ssa_funcs: *std.ArrayList(ssa.Func)) ![]const u8 {
@@ -1403,6 +1509,28 @@ pub const Driver = struct {
                             try addStringToRodata(self.allocator, &rodata_section, &string_offsets, &obj, rodata_idx, key_val);
                         }
                     }
+
+                    // Add strings used by str_concat (both args can be const_string)
+                    if (value.op == .str_concat) {
+                        const concat_args = value.args();
+                        if (concat_args.len > 0) {
+                            const str1_val = func.getValue(concat_args[0]);
+                            try addStringToRodata(self.allocator, &rodata_section, &string_offsets, &obj, rodata_idx, str1_val);
+                        }
+                        if (concat_args.len > 1) {
+                            const str2_val = func.getValue(concat_args[1]);
+                            try addStringToRodata(self.allocator, &rodata_section, &string_offsets, &obj, rodata_idx, str2_val);
+                        }
+                    }
+
+                    // Add strings stored to variables (store of const_string)
+                    if (value.op == .store) {
+                        const store_args = value.args();
+                        if (store_args.len > 1) {
+                            const stored_val = func.getValue(store_args[1]);
+                            try addStringToRodata(self.allocator, &rodata_section, &string_offsets, &obj, rodata_idx, stored_val);
+                        }
+                    }
                 }
             }
         }
@@ -1433,6 +1561,10 @@ pub const Driver = struct {
                 for (ssa_funcs.items) |*func| {
                     // Reset storage manager for this function
                     self.storage.reset();
+
+                    // Initialize register allocator and analyze uses
+                    try self.initRegAllocForFunc(func);
+                    try self.analyzeUses(func);
 
                     const sym_offset = code_buf.pos();
 
@@ -1548,6 +1680,10 @@ pub const Driver = struct {
                     // Reset storage manager for this function
                     self.storage.reset();
 
+                    // Initialize register allocator and analyze uses
+                    try self.initRegAllocForFunc(func);
+                    try self.analyzeUses(func);
+
                     const sym_offset = code_buf.pos();
 
                     // macOS requires underscore prefix for C symbols
@@ -1571,7 +1707,7 @@ pub const Driver = struct {
                         if (value.op == .call or value.op == .map_new or value.op == .map_set or
                             value.op == .map_get or value.op == .map_has or value.op == .map_size or
                             value.op == .map_free or value.op == .list_new or value.op == .list_push or
-                            value.op == .list_get or value.op == .list_free)
+                            value.op == .list_get or value.op == .list_free or value.op == .str_concat)
                         {
                             has_calls = true;
                             break;
@@ -1711,6 +1847,103 @@ pub const Driver = struct {
         return try self.allocator.dupe(u8, path);
     }
 
+    // ========================================================================
+    // Register Allocator Helpers for x86_64
+    // ========================================================================
+
+    /// Load an SSA value into a register, using the register allocator
+    /// Returns the x86_64 register containing the value
+    fn loadX86ValueToReg(self: *Driver, buf: *be.CodeBuffer, func: *ssa.Func, value_id: ssa.ValueID, hint_reg: ?x86_64.Reg) !x86_64.Reg {
+        const value = &func.values.items[value_id];
+        const arg_regs = [_]x86_64.Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
+        const target_reg: x86_64.Reg = hint_reg orelse .rax;
+        const target_reg_num: u5 = @truncate(@intFromEnum(target_reg));
+
+        // Check if value is already in a register (from previous computation)
+        if (self.reg_alloc) |*ra| {
+            const current_regs = ra.getRegs(value_id);
+            if (current_regs != 0) {
+                // Value is already in some register
+                const src_reg_num: u5 = @truncate(@ctz(current_regs));
+                if (src_reg_num == target_reg_num) {
+                    // Already in target register, nothing to do
+                    ra.consumeUse(value_id);
+                    return target_reg;
+                } else {
+                    // Move from current register to target
+                    const src_reg: x86_64.Reg = @enumFromInt(src_reg_num);
+                    try x86_64.movRegReg(buf, target_reg, src_reg);
+                    try ra.allocSpecificReg(value_id, target_reg_num);
+                    ra.consumeUse(value_id);
+                    return target_reg;
+                }
+            }
+        }
+
+        // Value is not in a register, need to load it
+        switch (value.op) {
+            .const_int => {
+                try x86_64.movRegImm64(buf, target_reg, value.aux_int);
+            },
+            .const_bool => {
+                try x86_64.movRegImm64(buf, target_reg, value.aux_int);
+            },
+            .arg => {
+                const param_idx: u32 = @intCast(value.aux_int);
+                if (param_idx < arg_regs.len) {
+                    if (arg_regs[param_idx] != target_reg) {
+                        try x86_64.movRegReg(buf, target_reg, arg_regs[param_idx]);
+                    }
+                }
+            },
+            .load => {
+                const local_idx: usize = @intCast(value.aux_int);
+                const local_offset: i32 = func.locals[local_idx].offset;
+                try x86_64.movRegMem(buf, target_reg, .rbp, local_offset);
+            },
+            else => {
+                // Check storage manager for value location
+                if (self.storage.get(value_id)) |slot| {
+                    try x86_64.movRegMem(buf, target_reg, .rbp, slot);
+                }
+            },
+        }
+
+        // Mark value as now being in target_reg and consume the use
+        if (self.reg_alloc) |*ra| {
+            try ra.allocSpecificReg(value_id, target_reg_num);
+            ra.consumeUse(value_id);
+        }
+
+        return target_reg;
+    }
+
+    /// Record that a value's result is in a register and save to storage
+    fn saveX86Result(self: *Driver, buf: *be.CodeBuffer, value_idx: u32, result_reg: x86_64.Reg) !void {
+        const result_reg_num: u5 = @truncate(@intFromEnum(result_reg));
+
+        // Track in register allocator
+        if (self.reg_alloc) |*ra| {
+            try ra.allocSpecificReg(value_idx, result_reg_num);
+        }
+
+        // Save to storage slot for later use
+        const result_slot = try self.storage.allocate(value_idx);
+        try x86_64.movMemReg(buf, .rbp, result_slot, result_reg);
+    }
+
+    /// Invalidate all caller-saved registers after a function call
+    /// This ensures we don't incorrectly think values are still in clobbered registers
+    fn invalidateX86CallerSaved(self: *Driver) void {
+        if (self.reg_alloc) |*ra| {
+            // System V AMD64 caller-saved registers: rax, rcx, rdx, rsi, rdi, r8-r11
+            const caller_saved = [_]u5{ 0, 1, 2, 6, 7, 8, 9, 10, 11 };
+            for (caller_saved) |reg| {
+                ra.freeReg(reg);
+            }
+        }
+    }
+
     fn generateX86Value(self: *Driver, buf: *be.CodeBuffer, func: *ssa.Func, value: ssa.Value, value_idx: u32) !void {
         // System V AMD64 ABI argument registers
         const arg_regs = [_]x86_64.Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
@@ -1732,151 +1965,100 @@ pub const Driver = struct {
                 }
             },
             .add => {
-                // Binary add: look up both operands
+                // Binary add using register allocator
                 const args = value.args();
                 if (args.len >= 2) {
-                    const left = func.getValue(args[0]);
-                    const right = func.getValue(args[1]);
                     const left_idx = args[0];
                     const right_idx = args[1];
+                    const right = func.getValue(right_idx);
 
-                    // Generate code for left operand -> rax
-                    // Use storage manager to check if value has a saved location
-                    if (self.storage.get(left_idx)) |slot| {
-                        // Value was saved to storage slot - load from there
-                        try x86_64.movRegMem(buf, .rax, .rbp, slot);
-                    } else if (left.op == .arg) {
-                        const param_idx: u32 = @intCast(left.aux_int);
-                        if (param_idx < arg_regs.len) {
-                            try x86_64.movRegReg(buf, .rax, arg_regs[param_idx]);
-                        }
-                    } else if (left.op == .const_int) {
-                        try x86_64.movRegImm64(buf, .rax, left.aux_int);
-                    } else if (left.op == .load) {
-                        // Load from local variable into rax
-                        const local_idx: usize = @intCast(left.aux_int);
-                        const local_offset: i32 = func.locals[local_idx].offset;
-                        try x86_64.movRegMem(buf, .rax, .rbp, local_offset);
-                    }
+                    // Load left operand to rax using allocator
+                    _ = try self.loadX86ValueToReg(buf, func, left_idx, .rax);
 
-                    // Generate code for right operand, then add
-                    // Use storage manager to check if value has a saved location
-                    if (self.storage.get(right_idx)) |slot| {
-                        // Value was saved to storage slot - load into r9 and add
-                        try x86_64.movRegMem(buf, .r9, .rbp, slot);
-                        try x86_64.addRegReg(buf, .rax, .r9);
-                    } else if (right.op == .const_int) {
-                        // add rax, imm32
+                    // For right operand, check if it's a constant for optimization
+                    if (right.op == .const_int and right.aux_int >= -2147483648 and right.aux_int <= 2147483647) {
+                        // add rax, imm32 (more efficient for small constants)
                         try x86_64.addRegImm32(buf, .rax, @intCast(right.aux_int));
-                    } else if (right.op == .arg) {
-                        const param_idx: u32 = @intCast(right.aux_int);
-                        if (param_idx < arg_regs.len) {
-                            try x86_64.addRegReg(buf, .rax, arg_regs[param_idx]);
-                        }
-                    } else if (right.op == .load) {
-                        // Load from local variable into r9 and add
-                        const local_idx: usize = @intCast(right.aux_int);
-                        const local_offset: i32 = func.locals[local_idx].offset;
-                        try x86_64.movRegMem(buf, .r9, .rbp, local_offset);
+                        if (self.reg_alloc) |*ra| ra.consumeUse(right_idx);
+                    } else {
+                        // Load right to r9 and add
+                        _ = try self.loadX86ValueToReg(buf, func, right_idx, .r9);
                         try x86_64.addRegReg(buf, .rax, .r9);
                     }
                 }
 
-                // Save result to storage for use by later operations
-                const result_slot = try self.storage.allocate(value_idx);
-                try x86_64.movMemReg(buf, .rbp, result_slot, .rax);
+                // Save result using allocator
+                try self.saveX86Result(buf, value_idx, .rax);
             },
             .sub => {
-                // Binary subtract: look up both operands
+                // Binary subtract using register allocator
                 const args = value.args();
                 if (args.len >= 2) {
-                    const left = func.getValue(args[0]);
-                    const right = func.getValue(args[1]);
+                    const left_idx = args[0];
+                    const right_idx = args[1];
+                    const right = func.getValue(right_idx);
 
-                    // Generate code for left operand -> rax
-                    if (left.op == .arg) {
-                        const param_idx: u32 = @intCast(left.aux_int);
-                        if (param_idx < arg_regs.len) {
-                            try x86_64.movRegReg(buf, .rax, arg_regs[param_idx]);
-                        }
-                    } else if (left.op == .const_int) {
-                        try x86_64.movRegImm64(buf, .rax, left.aux_int);
-                    }
+                    // Load left operand to rax
+                    _ = try self.loadX86ValueToReg(buf, func, left_idx, .rax);
 
-                    // Generate code for right operand, then subtract
-                    if (right.op == .const_int) {
-                        // sub rax, imm32
+                    // For right operand, check if it's a constant for optimization
+                    if (right.op == .const_int and right.aux_int >= -2147483648 and right.aux_int <= 2147483647) {
                         try x86_64.subRegImm32(buf, .rax, @intCast(right.aux_int));
-                    } else if (right.op == .arg) {
-                        const param_idx: u32 = @intCast(right.aux_int);
-                        if (param_idx < arg_regs.len) {
-                            try x86_64.subRegReg(buf, .rax, arg_regs[param_idx]);
-                        }
+                        if (self.reg_alloc) |*ra| ra.consumeUse(right_idx);
+                    } else {
+                        _ = try self.loadX86ValueToReg(buf, func, right_idx, .r9);
+                        try x86_64.subRegReg(buf, .rax, .r9);
                     }
                 }
+
+                // Save result using allocator
+                try self.saveX86Result(buf, value_idx, .rax);
             },
             .mul => {
-                // Binary multiply: look up both operands
+                // Binary multiply using register allocator
                 const args = value.args();
                 if (args.len >= 2) {
-                    const left = func.getValue(args[0]);
-                    const right = func.getValue(args[1]);
+                    const left_idx = args[0];
+                    const right_idx = args[1];
+                    const right = func.getValue(right_idx);
 
-                    // Generate code for left operand -> rax
-                    if (left.op == .arg) {
-                        const param_idx: u32 = @intCast(left.aux_int);
-                        if (param_idx < arg_regs.len) {
-                            try x86_64.movRegReg(buf, .rax, arg_regs[param_idx]);
-                        }
-                    } else if (left.op == .const_int) {
-                        try x86_64.movRegImm64(buf, .rax, left.aux_int);
-                    }
+                    // Load left operand to rax
+                    _ = try self.loadX86ValueToReg(buf, func, left_idx, .rax);
 
-                    // Generate code for right operand, then multiply
-                    if (right.op == .const_int) {
-                        // imul rax, rax, imm32
+                    // For right operand, check if it's a constant for optimization
+                    if (right.op == .const_int and right.aux_int >= -2147483648 and right.aux_int <= 2147483647) {
                         try x86_64.imulRegRegImm(buf, .rax, .rax, @intCast(right.aux_int));
-                    } else if (right.op == .arg) {
-                        const param_idx: u32 = @intCast(right.aux_int);
-                        if (param_idx < arg_regs.len) {
-                            try x86_64.imulRegReg(buf, .rax, arg_regs[param_idx]);
-                        }
+                        if (self.reg_alloc) |*ra| ra.consumeUse(right_idx);
+                    } else {
+                        _ = try self.loadX86ValueToReg(buf, func, right_idx, .r9);
+                        try x86_64.imulRegReg(buf, .rax, .r9);
                     }
                 }
+
+                // Save result using allocator
+                try self.saveX86Result(buf, value_idx, .rax);
             },
             .div => {
-                // Binary divide: look up both operands
+                // Binary divide using register allocator
                 // IDIV divides RDX:RAX by operand, quotient in RAX
                 const args = value.args();
                 if (args.len >= 2) {
-                    const left = func.getValue(args[0]);
-                    const right = func.getValue(args[1]);
+                    const left_idx = args[0];
+                    const right_idx = args[1];
 
-                    // Generate code for left operand (dividend) -> rax
-                    if (left.op == .arg) {
-                        const param_idx: u32 = @intCast(left.aux_int);
-                        if (param_idx < arg_regs.len) {
-                            try x86_64.movRegReg(buf, .rax, arg_regs[param_idx]);
-                        }
-                    } else if (left.op == .const_int) {
-                        try x86_64.movRegImm64(buf, .rax, left.aux_int);
-                    }
+                    // Load left operand (dividend) to rax
+                    _ = try self.loadX86ValueToReg(buf, func, left_idx, .rax);
 
                     // Sign-extend RAX to RDX:RAX
                     try x86_64.cqo(buf);
 
-                    // Generate code for right operand (divisor), then divide
-                    if (right.op == .const_int) {
-                        // Load divisor to r8, then idiv r8
-                        try x86_64.movRegImm64(buf, .r8, right.aux_int);
-                        try x86_64.idivReg(buf, .r8);
-                    } else if (right.op == .arg) {
-                        const param_idx: u32 = @intCast(right.aux_int);
-                        if (param_idx < arg_regs.len) {
-                            try x86_64.idivReg(buf, arg_regs[param_idx]);
-                        }
-                    }
+                    // Load right operand (divisor) to r8, then divide
+                    _ = try self.loadX86ValueToReg(buf, func, right_idx, .r8);
+                    try x86_64.idivReg(buf, .r8);
                 }
+
+                // Save result using allocator
+                try self.saveX86Result(buf, value_idx, .rax);
             },
             .call => {
                 // Check for builtin print/println
@@ -1918,6 +2100,8 @@ pub const Driver = struct {
                     else
                         value.aux_str;
                     try x86_64.callSymbol(buf, call_func_name);
+                    // Invalidate caller-saved registers since call may have clobbered them
+                    self.invalidateX86CallerSaved();
                     // Return value is in rax - save to storage slot for later use
                     const slot = try self.storage.allocate(value_idx);
                     try x86_64.movMemReg(buf, .rbp, slot, .rax);
@@ -2242,6 +2426,23 @@ pub const Driver = struct {
                         // Store 16-byte union: tag at offset 0, payload at offset 8
                         try x86_64.movMemReg(buf, .rbp, total_offset, .rax);
                         try x86_64.movMemReg(buf, .rbp, total_offset + 8, .rdx);
+                    } else if (val.op == .str_concat) {
+                        // Store 16-byte string: ptr at offset 0, len at offset 8
+                        // str_concat leaves ptr in rax, len in rdx
+                        try x86_64.movMemReg(buf, .rbp, total_offset, .rax);
+                        try x86_64.movMemReg(buf, .rbp, total_offset + 8, .rdx);
+                    } else if (val.op == .const_string) {
+                        // Store 16-byte string literal: load ptr (from rodata) and len (immediate)
+                        const str_content = val.aux_str;
+                        const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
+                            str_content[1 .. str_content.len - 1]
+                        else
+                            str_content;
+                        const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
+                        try x86_64.leaRipSymbol(buf, .rax, sym_name);
+                        try x86_64.movMemReg(buf, .rbp, total_offset, .rax);
+                        try x86_64.movRegImm64(buf, .rax, @intCast(stripped.len));
+                        try x86_64.movMemReg(buf, .rbp, total_offset + 8, .rax);
                     } else {
                         // Get value to store into r8, or use rax directly for ops
                         var use_rax_directly = false;
@@ -2394,6 +2595,7 @@ pub const Driver = struct {
                 try x86_64.movRegImm64(buf, .rsi, 2080); // 32 header + 64*32 slots
                 const calloc_name = if (self.options.target.os == .macos) "_calloc" else "calloc";
                 try x86_64.callSymbol(buf, calloc_name);
+                self.invalidateX86CallerSaved();
                 // rax now has pointer to zeroed map
 
                 // Initialize capacity field at offset 0 to 64
@@ -2456,6 +2658,7 @@ pub const Driver = struct {
 
                 const map_set_name = if (self.options.target.os == .macos) "_cot_native_map_set" else "cot_native_map_set";
                 try x86_64.callSymbol(buf, map_set_name);
+                self.invalidateX86CallerSaved();
                 // Result is in rax
             },
             .map_get => {
@@ -2495,6 +2698,7 @@ pub const Driver = struct {
 
                 const map_get_name = if (self.options.target.os == .macos) "_cot_native_map_get" else "cot_native_map_get";
                 try x86_64.callSymbol(buf, map_get_name);
+                self.invalidateX86CallerSaved();
                 // Result is in rax
             },
             .map_has => {
@@ -2534,6 +2738,7 @@ pub const Driver = struct {
 
                 const map_has_name = if (self.options.target.os == .macos) "_cot_native_map_has" else "cot_native_map_has";
                 try x86_64.callSymbol(buf, map_has_name);
+                self.invalidateX86CallerSaved();
                 // Result is in rax
             },
             .map_size => {
@@ -2552,6 +2757,7 @@ pub const Driver = struct {
                 }
                 const map_size_name = if (self.options.target.os == .macos) "_cot_native_map_size" else "cot_native_map_size";
                 try x86_64.callSymbol(buf, map_size_name);
+                self.invalidateX86CallerSaved();
                 // Result is in rax
             },
             .map_free => {
@@ -2570,6 +2776,7 @@ pub const Driver = struct {
                 }
                 const map_free_name = if (self.options.target.os == .macos) "_cot_native_map_free" else "cot_native_map_free";
                 try x86_64.callSymbol(buf, map_free_name);
+                self.invalidateX86CallerSaved();
             },
             // ========== List Operations (native layout + FFI) ==========
             // List layout (24 bytes):
@@ -2583,6 +2790,7 @@ pub const Driver = struct {
                 try x86_64.movRegImm64(buf, .rsi, 24); // 24-byte header
                 const calloc_name = if (self.options.target.os == .macos) "_calloc" else "calloc";
                 try x86_64.callSymbol(buf, calloc_name);
+                self.invalidateX86CallerSaved();
                 // rax now has pointer to zeroed list header
                 // All fields (elements_ptr=0, length=0, capacity=0) already correct from calloc
             },
@@ -2612,6 +2820,7 @@ pub const Driver = struct {
                 }
                 const list_push_name = if (self.options.target.os == .macos) "_cot_native_list_push" else "cot_native_list_push";
                 try x86_64.callSymbol(buf, list_push_name);
+                self.invalidateX86CallerSaved();
             },
             .list_get => {
                 // Call cot_native_list_get(list, index) - returns element value
@@ -2639,6 +2848,7 @@ pub const Driver = struct {
                 }
                 const list_get_name = if (self.options.target.os == .macos) "_cot_native_list_get" else "cot_native_list_get";
                 try x86_64.callSymbol(buf, list_get_name);
+                self.invalidateX86CallerSaved();
                 // Result is in rax - save to storage for later use
                 const slot = try self.storage.allocate(value_idx);
                 try x86_64.movMemReg(buf, .rbp, slot, .rax);
@@ -2679,6 +2889,65 @@ pub const Driver = struct {
                 }
                 const list_free_name = if (self.options.target.os == .macos) "_cot_native_list_free" else "cot_native_list_free";
                 try x86_64.callSymbol(buf, list_free_name);
+                self.invalidateX86CallerSaved();
+            },
+            .str_concat => {
+                // Call cot_str_concat(ptr1, len1, ptr2, len2)
+                // System V AMD64 ABI: rdi=ptr1, rsi=len1, rdx=ptr2, rcx=len2
+                // Returns: rax=new_ptr, rdx=new_len (struct return)
+                const args = value.args();
+
+                // For now, we expect const_string args with symbol references
+                // Load first string (ptr1 -> rdi, len1 -> rsi)
+                if (args.len > 0) {
+                    const str1_val = func.getValue(args[0]);
+                    if (str1_val.op == .const_string) {
+                        const str_content = str1_val.aux_str;
+                        const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
+                            str_content[1 .. str_content.len - 1]
+                        else
+                            str_content;
+                        const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
+                        try x86_64.leaRipSymbol(buf, .rdi, sym_name);
+                        try x86_64.movRegImm64(buf, .rsi, @intCast(stripped.len));
+                    } else if (str1_val.op == .load or str1_val.op == .copy) {
+                        // Load string from local (ptr at offset, len at offset+8)
+                        const local_idx: u32 = @intCast(str1_val.aux_int);
+                        const offset = self.getLocalOffset(func, local_idx);
+                        try x86_64.movRegMem(buf, .rdi, .rbp, offset); // ptr
+                        try x86_64.movRegMem(buf, .rsi, .rbp, offset + 8); // len
+                    } else if (str1_val.op == .str_concat) {
+                        // Result from previous str_concat is in rax/rdx, move to rdi/rsi
+                        try x86_64.movRegReg(buf, .rdi, .rax); // ptr
+                        try x86_64.movRegReg(buf, .rsi, .rdx); // len
+                    }
+                }
+
+                // Load second string (ptr2 -> rdx, len2 -> rcx)
+                if (args.len > 1) {
+                    const str2_val = func.getValue(args[1]);
+                    if (str2_val.op == .const_string) {
+                        const str_content = str2_val.aux_str;
+                        const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
+                            str_content[1 .. str_content.len - 1]
+                        else
+                            str_content;
+                        const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
+                        try x86_64.leaRipSymbol(buf, .rdx, sym_name);
+                        try x86_64.movRegImm64(buf, .rcx, @intCast(stripped.len));
+                    } else if (str2_val.op == .load or str2_val.op == .copy) {
+                        // Load string from local (ptr at offset, len at offset+8)
+                        const local_idx: u32 = @intCast(str2_val.aux_int);
+                        const offset = self.getLocalOffset(func, local_idx);
+                        try x86_64.movRegMem(buf, .rdx, .rbp, offset); // ptr
+                        try x86_64.movRegMem(buf, .rcx, .rbp, offset + 8); // len
+                    }
+                }
+
+                const str_concat_name = if (self.options.target.os == .macos) "_cot_str_concat" else "cot_str_concat";
+                try x86_64.callSymbol(buf, str_concat_name);
+                self.invalidateX86CallerSaved();
+                // Result: rax = new ptr, rdx = new len
             },
             else => {
                 // Warn about unhandled ops in debug mode
@@ -2904,6 +3173,109 @@ pub const Driver = struct {
         }
     }
 
+    // ========================================================================
+    // Register Allocator Helpers for AArch64
+    // ========================================================================
+
+    /// Load an SSA value into a register for AArch64
+    /// Returns the aarch64 register containing the value
+    fn loadAArch64ValueToReg(self: *Driver, buf: *be.CodeBuffer, func: *ssa.Func, value_id: ssa.ValueID, hint_reg: ?aarch64.Reg) !aarch64.Reg {
+        const value = &func.values.items[value_id];
+        const arg_regs = [_]aarch64.Reg{ .x0, .x1, .x2, .x3, .x4, .x5, .x6, .x7 };
+        const target_reg: aarch64.Reg = hint_reg orelse .x0;
+        const target_reg_num: u5 = @truncate(@intFromEnum(target_reg));
+
+        // Check if value is already in a register (from previous computation)
+        if (self.reg_alloc) |*ra| {
+            const current_regs = ra.getRegs(value_id);
+            if (current_regs != 0) {
+                // Value is already in some register
+                const src_reg_num: u5 = @truncate(@ctz(current_regs));
+                if (src_reg_num == target_reg_num) {
+                    // Already in target register, nothing to do
+                    ra.consumeUse(value_id);
+                    return target_reg;
+                } else {
+                    // Move from current register to target
+                    const src_reg: aarch64.Reg = @enumFromInt(src_reg_num);
+                    try aarch64.movRegReg(buf, target_reg, src_reg);
+                    try ra.allocSpecificReg(value_id, target_reg_num);
+                    ra.consumeUse(value_id);
+                    return target_reg;
+                }
+            }
+        }
+
+        // Value is not in a register, need to load it
+        switch (value.op) {
+            .const_int => {
+                try aarch64.movRegImm64(buf, target_reg, value.aux_int);
+            },
+            .const_bool => {
+                try aarch64.movRegImm64(buf, target_reg, value.aux_int);
+            },
+            .arg => {
+                const param_idx: u32 = @intCast(value.aux_int);
+                if (param_idx < arg_regs.len) {
+                    if (arg_regs[param_idx] != target_reg) {
+                        try aarch64.movRegReg(buf, target_reg, arg_regs[param_idx]);
+                    }
+                }
+            },
+            .load => {
+                const local_idx: usize = @intCast(value.aux_int);
+                const x86_offset: i32 = func.locals[local_idx].offset;
+                const local_offset: i32 = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
+                if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
+                    const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
+                    try aarch64.ldrRegImm(buf, target_reg, .sp, offset_scaled);
+                }
+            },
+            else => {
+                // Check storage manager for value location
+                if (self.storage.get(value_id)) |slot| {
+                    const aarch64_offset = self.storage.aarch64Offset(slot, func.frame_size);
+                    try aarch64.ldrRegImm(buf, target_reg, .sp, aarch64_offset);
+                }
+            },
+        }
+
+        // Mark value as now being in target_reg and consume the use
+        if (self.reg_alloc) |*ra| {
+            try ra.allocSpecificReg(value_id, target_reg_num);
+            ra.consumeUse(value_id);
+        }
+
+        return target_reg;
+    }
+
+    /// Record that a value's result is in a register and save to storage for AArch64
+    fn saveAArch64Result(self: *Driver, buf: *be.CodeBuffer, func: *ssa.Func, value_idx: u32, result_reg: aarch64.Reg) !void {
+        const result_reg_num: u5 = @truncate(@intFromEnum(result_reg));
+
+        // Track in register allocator
+        if (self.reg_alloc) |*ra| {
+            try ra.allocSpecificReg(value_idx, result_reg_num);
+        }
+
+        // Save to storage slot for later use
+        const result_slot = try self.storage.allocate(value_idx);
+        const result_aarch64 = self.storage.aarch64Offset(result_slot, func.frame_size);
+        try aarch64.strRegImm(buf, result_reg, .sp, result_aarch64);
+    }
+
+    /// Invalidate all caller-saved registers after a function call for AArch64
+    fn invalidateAArch64CallerSaved(self: *Driver) void {
+        if (self.reg_alloc) |*ra| {
+            // AAPCS64 caller-saved registers: x0-x18 (x18 is platform register, often callee-saved on Apple)
+            // We invalidate x0-x17 to be safe
+            var i: u5 = 0;
+            while (i <= 17) : (i += 1) {
+                ra.freeReg(i);
+            }
+        }
+    }
+
     fn generateAArch64Value(self: *Driver, buf: *be.CodeBuffer, func: *ssa.Func, value: ssa.Value, value_idx: u32, stack_size: u32, has_calls: bool) !void {
         // AAPCS64 argument registers: x0-x7
         const arg_regs = [_]aarch64.Reg{ .x0, .x1, .x2, .x3, .x4, .x5, .x6, .x7 };
@@ -2918,157 +3290,80 @@ pub const Driver = struct {
                 // Binary add: look up both operands
                 const args = value.args();
                 if (args.len >= 2) {
-                    const left = func.getValue(args[0]);
-                    const right = func.getValue(args[1]);
                     const left_idx = args[0];
                     const right_idx = args[1];
+                    const right = func.getValue(right_idx);
 
-                    // Generate code for left operand -> x0
-                    // Use storage manager to check if value has a saved location
-                    if (self.storage.get(left_idx)) |slot| {
-                        // Value was saved to storage slot - load from there
-                        const aarch64_offset = self.storage.aarch64Offset(slot, func.frame_size);
-                        try aarch64.ldrRegImm(buf, .x0, .sp, aarch64_offset);
-                    } else if (left.op == .arg) {
-                        const param_idx: u32 = @intCast(left.aux_int);
-                        if (param_idx < arg_regs.len and param_idx != 0) {
-                            try aarch64.movRegReg(buf, .x0, arg_regs[param_idx]);
-                        }
-                    } else if (left.op == .const_int) {
-                        try aarch64.movRegImm64(buf, .x0, left.aux_int);
-                    } else if (left.op == .load) {
-                        // Load from local variable into x0
-                        const local_idx: usize = @intCast(left.aux_int);
-                        const x86_offset: i32 = func.locals[local_idx].offset;
-                        const local_offset: i32 = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
-                        if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
-                            const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
-                            try aarch64.ldrRegImm(buf, .x0, .sp, offset_scaled);
-                        }
-                    }
+                    // Load left operand into x0
+                    _ = try self.loadAArch64ValueToReg(buf, func, left_idx, .x0);
 
                     // Generate code for right operand, then add
-                    // Use storage manager to check if value has a saved location
-                    if (self.storage.get(right_idx)) |slot| {
-                        // Value was saved to storage slot - load into x9 and add
-                        const aarch64_offset = self.storage.aarch64Offset(slot, func.frame_size);
-                        try aarch64.ldrRegImm(buf, .x9, .sp, aarch64_offset);
-                        try aarch64.addRegReg(buf, .x0, .x0, .x9);
-                    } else if (right.op == .const_int) {
-                        // add x0, x0, #imm12
-                        const imm: u12 = @intCast(right.aux_int & 0xFFF);
+                    if (right.op == .const_int and right.aux_int >= 0 and right.aux_int <= 4095) {
+                        // add x0, x0, #imm12 (optimization for small constants)
+                        const imm: u12 = @intCast(right.aux_int);
                         try aarch64.addRegImm12(buf, .x0, .x0, imm);
-                    } else if (right.op == .arg) {
-                        const param_idx: u32 = @intCast(right.aux_int);
-                        if (param_idx < arg_regs.len) {
-                            try aarch64.addRegReg(buf, .x0, .x0, arg_regs[param_idx]);
-                        }
-                    } else if (right.op == .load) {
-                        // Load from local variable into x9 and add
-                        const local_idx: usize = @intCast(right.aux_int);
-                        const x86_offset: i32 = func.locals[local_idx].offset;
-                        const local_offset: i32 = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
-                        if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
-                            const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
-                            try aarch64.ldrRegImm(buf, .x9, .sp, offset_scaled);
-                            try aarch64.addRegReg(buf, .x0, .x0, .x9);
-                        }
+                        if (self.reg_alloc) |*ra| ra.consumeUse(right_idx);
+                    } else {
+                        // Load right operand into x9 and add
+                        _ = try self.loadAArch64ValueToReg(buf, func, right_idx, .x9);
+                        try aarch64.addRegReg(buf, .x0, .x0, .x9);
                     }
                 }
 
                 // Save result to storage for use by later operations
-                const result_slot = try self.storage.allocate(value_idx);
-                const result_aarch64 = self.storage.aarch64Offset(result_slot, func.frame_size);
-                try aarch64.strRegImm(buf, .x0, .sp, result_aarch64);
+                try self.saveAArch64Result(buf, func, value_idx, .x0);
             },
             .sub => {
                 // Binary sub: look up both operands
                 const args = value.args();
                 if (args.len >= 2) {
-                    const left = func.getValue(args[0]);
-                    const right = func.getValue(args[1]);
+                    const left_idx = args[0];
+                    const right_idx = args[1];
 
-                    // Generate code for left operand -> x0
-                    if (left.op == .arg) {
-                        const param_idx: u32 = @intCast(left.aux_int);
-                        if (param_idx < arg_regs.len and param_idx != 0) {
-                            try aarch64.movRegReg(buf, .x0, arg_regs[param_idx]);
-                        }
-                    } else if (left.op == .const_int) {
-                        try aarch64.movRegImm64(buf, .x0, left.aux_int);
-                    }
-
-                    // Generate code for right operand, then sub
-                    if (right.op == .const_int) {
-                        // Load right into x8, then sub x0, x0, x8
-                        try aarch64.movRegImm64(buf, .x8, right.aux_int);
-                        try aarch64.subRegReg(buf, .x0, .x0, .x8);
-                    } else if (right.op == .arg) {
-                        const param_idx: u32 = @intCast(right.aux_int);
-                        if (param_idx < arg_regs.len) {
-                            try aarch64.subRegReg(buf, .x0, .x0, arg_regs[param_idx]);
-                        }
-                    }
+                    // Load left operand into x0
+                    _ = try self.loadAArch64ValueToReg(buf, func, left_idx, .x0);
+                    // Load right operand into x9, then sub
+                    _ = try self.loadAArch64ValueToReg(buf, func, right_idx, .x9);
+                    try aarch64.subRegReg(buf, .x0, .x0, .x9);
                 }
+
+                // Save result to storage
+                try self.saveAArch64Result(buf, func, value_idx, .x0);
             },
             .mul => {
                 // Binary mul: look up both operands
                 const args = value.args();
                 if (args.len >= 2) {
-                    const left = func.getValue(args[0]);
-                    const right = func.getValue(args[1]);
+                    const left_idx = args[0];
+                    const right_idx = args[1];
 
-                    // Generate code for left operand -> x0
-                    if (left.op == .const_int) {
-                        try aarch64.movRegImm64(buf, .x0, left.aux_int);
-                    } else if (left.op == .arg) {
-                        const param_idx: u32 = @intCast(left.aux_int);
-                        if (param_idx < arg_regs.len and param_idx != 0) {
-                            try aarch64.movRegReg(buf, .x0, arg_regs[param_idx]);
-                        }
-                    }
-
-                    // Generate code for right operand -> x8, then mul
-                    if (right.op == .const_int) {
-                        try aarch64.movRegImm64(buf, .x8, right.aux_int);
-                        try aarch64.mulRegReg(buf, .x0, .x0, .x8);
-                    } else if (right.op == .arg) {
-                        const param_idx: u32 = @intCast(right.aux_int);
-                        if (param_idx < arg_regs.len) {
-                            try aarch64.mulRegReg(buf, .x0, .x0, arg_regs[param_idx]);
-                        }
-                    }
+                    // Load left operand into x0
+                    _ = try self.loadAArch64ValueToReg(buf, func, left_idx, .x0);
+                    // Load right operand into x9, then mul
+                    _ = try self.loadAArch64ValueToReg(buf, func, right_idx, .x9);
+                    try aarch64.mulRegReg(buf, .x0, .x0, .x9);
                 }
+
+                // Save result to storage
+                try self.saveAArch64Result(buf, func, value_idx, .x0);
             },
             .div => {
                 // Binary div: look up both operands
                 // AArch64 uses SDIV for signed division
                 const args = value.args();
                 if (args.len >= 2) {
-                    const left = func.getValue(args[0]);
-                    const right = func.getValue(args[1]);
+                    const left_idx = args[0];
+                    const right_idx = args[1];
 
-                    // Generate code for left operand -> x0
-                    if (left.op == .const_int) {
-                        try aarch64.movRegImm64(buf, .x0, left.aux_int);
-                    } else if (left.op == .arg) {
-                        const param_idx: u32 = @intCast(left.aux_int);
-                        if (param_idx < arg_regs.len and param_idx != 0) {
-                            try aarch64.movRegReg(buf, .x0, arg_regs[param_idx]);
-                        }
-                    }
-
-                    // Generate code for right operand -> x8, then div
-                    if (right.op == .const_int) {
-                        try aarch64.movRegImm64(buf, .x8, right.aux_int);
-                        try aarch64.sdivRegReg(buf, .x0, .x0, .x8);
-                    } else if (right.op == .arg) {
-                        const param_idx: u32 = @intCast(right.aux_int);
-                        if (param_idx < arg_regs.len) {
-                            try aarch64.sdivRegReg(buf, .x0, .x0, arg_regs[param_idx]);
-                        }
-                    }
+                    // Load left operand into x0
+                    _ = try self.loadAArch64ValueToReg(buf, func, left_idx, .x0);
+                    // Load right operand into x9, then div
+                    _ = try self.loadAArch64ValueToReg(buf, func, right_idx, .x9);
+                    try aarch64.sdivRegReg(buf, .x0, .x0, .x9);
                 }
+
+                // Save result to storage
+                try self.saveAArch64Result(buf, func, value_idx, .x0);
             },
             .call => {
                 // Check for builtin print/println
@@ -3116,6 +3411,8 @@ pub const Driver = struct {
                     else
                         value.aux_str;
                     try aarch64.callSymbol(buf, call_func_name);
+                    // Invalidate caller-saved registers since call may have clobbered them
+                    self.invalidateAArch64CallerSaved();
                     // Return value is in x0 - save to storage for later use
                     const slot = try self.storage.allocate(value_idx);
                     const aarch64_offset = self.storage.aarch64Offset(slot, func.frame_size);
@@ -3337,6 +3634,33 @@ pub const Driver = struct {
                             const payload_offset: u12 = tag_offset + 1; // +8 bytes
                             try aarch64.strRegImm(buf, .x0, .sp, tag_offset); // store tag
                             try aarch64.strRegImm(buf, .x1, .sp, payload_offset); // store payload
+                        }
+                    } else if (val.op == .str_concat) {
+                        // Store 16-byte string: ptr at offset 0, len at offset 8
+                        // str_concat leaves ptr in x0, len in x1
+                        if (total_offset >= 0 and @mod(total_offset, 8) == 0) {
+                            const ptr_offset: u12 = @intCast(@divExact(total_offset, 8));
+                            const len_offset: u12 = ptr_offset + 1; // +8 bytes
+                            try aarch64.strRegImm(buf, .x0, .sp, ptr_offset); // store ptr
+                            try aarch64.strRegImm(buf, .x1, .sp, len_offset); // store len
+                        }
+                    } else if (val.op == .const_string) {
+                        // Store 16-byte string literal: load ptr (from rodata) and len (immediate)
+                        const str_content = val.aux_str;
+                        const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
+                            str_content[1 .. str_content.len - 1]
+                        else
+                            str_content;
+                        const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
+                        try aarch64.loadSymbolAddr(buf, .x0, sym_name);
+                        if (total_offset >= 0 and @mod(total_offset, 8) == 0) {
+                            const ptr_offset: u12 = @intCast(@divExact(total_offset, 8));
+                            try aarch64.strRegImm(buf, .x0, .sp, ptr_offset); // store ptr
+                        }
+                        try aarch64.movRegImm64(buf, .x0, @intCast(stripped.len));
+                        if (total_offset >= 0 and @mod(total_offset, 8) == 0) {
+                            const len_offset: u12 = @as(u12, @intCast(@divExact(total_offset, 8))) + 1;
+                            try aarch64.strRegImm(buf, .x0, .sp, len_offset); // store len
                         }
                     } else {
                         // Regular 8-byte store
@@ -3722,6 +4046,7 @@ pub const Driver = struct {
                 try aarch64.movRegImm64(buf, .x1, 2080); // 32 header + 64*32 slots
                 const calloc_name = if (self.options.target.os == .macos) "_calloc" else "calloc";
                 try aarch64.callSymbol(buf, calloc_name);
+                self.invalidateAArch64CallerSaved();
                 // x0 now has pointer to zeroed map
 
                 // Initialize capacity field at offset 0 to 64
@@ -3792,6 +4117,7 @@ pub const Driver = struct {
 
                 const map_set_name = if (self.options.target.os == .macos) "_cot_native_map_set" else "cot_native_map_set";
                 try aarch64.callSymbol(buf, map_set_name);
+                self.invalidateAArch64CallerSaved();
                 // Result is in x0
             },
             .map_get => {
@@ -3835,6 +4161,7 @@ pub const Driver = struct {
 
                 const map_get_name = if (self.options.target.os == .macos) "_cot_native_map_get" else "cot_native_map_get";
                 try aarch64.callSymbol(buf, map_get_name);
+                self.invalidateAArch64CallerSaved();
                 // Result is in x0
             },
             .map_has => {
@@ -3878,6 +4205,7 @@ pub const Driver = struct {
 
                 const map_has_name = if (self.options.target.os == .macos) "_cot_native_map_has" else "cot_native_map_has";
                 try aarch64.callSymbol(buf, map_has_name);
+                self.invalidateAArch64CallerSaved();
                 // Result is in x0
             },
             .map_size => {
@@ -3901,6 +4229,7 @@ pub const Driver = struct {
                 }
                 const map_size_name = if (self.options.target.os == .macos) "_cot_native_map_size" else "cot_native_map_size";
                 try aarch64.callSymbol(buf, map_size_name);
+                self.invalidateAArch64CallerSaved();
                 // Result is in x0
             },
             .map_free => {
@@ -3924,6 +4253,7 @@ pub const Driver = struct {
                 }
                 const map_free_name = if (self.options.target.os == .macos) "_cot_native_map_free" else "cot_native_map_free";
                 try aarch64.callSymbol(buf, map_free_name);
+                self.invalidateAArch64CallerSaved();
             },
             // ========== List Operations (native layout + FFI) ==========
             // List layout (24 bytes):
@@ -3937,6 +4267,7 @@ pub const Driver = struct {
                 try aarch64.movRegImm64(buf, .x1, 24); // 24-byte header
                 const calloc_name = if (self.options.target.os == .macos) "_calloc" else "calloc";
                 try aarch64.callSymbol(buf, calloc_name);
+                self.invalidateAArch64CallerSaved();
                 // x0 now has pointer to zeroed list header
                 // All fields (elements_ptr=0, length=0, capacity=0) already correct from calloc
             },
@@ -3974,6 +4305,7 @@ pub const Driver = struct {
                 }
                 const list_push_name = if (self.options.target.os == .macos) "_cot_native_list_push" else "cot_native_list_push";
                 try aarch64.callSymbol(buf, list_push_name);
+                self.invalidateAArch64CallerSaved();
             },
             .list_get => {
                 // Call cot_native_list_get(list, index) - returns element value
@@ -4009,6 +4341,7 @@ pub const Driver = struct {
                 }
                 const list_get_name = if (self.options.target.os == .macos) "_cot_native_list_get" else "cot_native_list_get";
                 try aarch64.callSymbol(buf, list_get_name);
+                self.invalidateAArch64CallerSaved();
                 // Result is in x0 - save to storage for later use
                 const slot = try self.storage.allocate(value_idx);
                 const aarch64_offset = self.storage.aarch64Offset(slot, func.frame_size);
@@ -4055,6 +4388,68 @@ pub const Driver = struct {
                 }
                 const list_free_name = if (self.options.target.os == .macos) "_cot_native_list_free" else "cot_native_list_free";
                 try aarch64.callSymbol(buf, list_free_name);
+                self.invalidateAArch64CallerSaved();
+            },
+            .str_concat => {
+                // Call cot_str_concat(ptr1, len1, ptr2, len2)
+                // AAPCS64: x0=ptr1, x1=len1, x2=ptr2, x3=len2
+                // Returns: x0=new_ptr, x1=new_len (struct return)
+                const args = value.args();
+
+                // Load first string (ptr1 -> x0, len1 -> x1)
+                if (args.len > 0) {
+                    const str1_val = func.getValue(args[0]);
+                    if (str1_val.op == .const_string) {
+                        const str_content = str1_val.aux_str;
+                        const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
+                            str_content[1 .. str_content.len - 1]
+                        else
+                            str_content;
+                        const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
+                        try aarch64.loadSymbolAddr(buf, .x0, sym_name);
+                        try aarch64.movRegImm64(buf, .x1, @intCast(stripped.len));
+                    } else if (str1_val.op == .load or str1_val.op == .copy) {
+                        // Load string from local (ptr at offset, len at offset+8)
+                        const local_idx: u32 = @intCast(str1_val.aux_int);
+                        const x86_offset = self.getLocalOffset(func, local_idx);
+                        const local_offset = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
+                        if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
+                            const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
+                            try aarch64.ldrRegImm(buf, .x0, .sp, offset_scaled); // ptr
+                            try aarch64.ldrRegImm(buf, .x1, .sp, offset_scaled + 1); // len (next 8 bytes)
+                        }
+                    }
+                }
+
+                // Load second string (ptr2 -> x2, len2 -> x3)
+                if (args.len > 1) {
+                    const str2_val = func.getValue(args[1]);
+                    if (str2_val.op == .const_string) {
+                        const str_content = str2_val.aux_str;
+                        const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
+                            str_content[1 .. str_content.len - 1]
+                        else
+                            str_content;
+                        const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
+                        try aarch64.loadSymbolAddr(buf, .x2, sym_name);
+                        try aarch64.movRegImm64(buf, .x3, @intCast(stripped.len));
+                    } else if (str2_val.op == .load or str2_val.op == .copy) {
+                        // Load string from local (ptr at offset, len at offset+8)
+                        const local_idx: u32 = @intCast(str2_val.aux_int);
+                        const x86_offset = self.getLocalOffset(func, local_idx);
+                        const local_offset = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
+                        if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
+                            const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
+                            try aarch64.ldrRegImm(buf, .x2, .sp, offset_scaled); // ptr
+                            try aarch64.ldrRegImm(buf, .x3, .sp, offset_scaled + 1); // len
+                        }
+                    }
+                }
+
+                const str_concat_name = if (self.options.target.os == .macos) "_cot_str_concat" else "cot_str_concat";
+                try aarch64.callSymbol(buf, str_concat_name);
+                self.invalidateAArch64CallerSaved();
+                // Result: x0 = new ptr, x1 = new len
             },
             else => {
                 // Warn about unhandled ops in debug mode
@@ -4343,6 +4738,8 @@ test "IR op coverage - exhaustive" {
         .map_new, .map_set, .map_get, .map_has, .map_size, .map_free,
         // List operations
         .list_new, .list_push, .list_get, .list_len, .list_free,
+        // String operations
+        .str_concat,
         // Control Flow
         .call, .ret, .jump, .branch, .phi, .select,
         // Conversions
@@ -4364,6 +4761,7 @@ test "IR op coverage - exhaustive" {
             .union_init, .union_tag, .union_payload,
             .map_new, .map_set, .map_get, .map_has, .map_size, .map_free,
             .list_new, .list_push, .list_get, .list_len, .list_free,
+            .str_concat,
             .call, .ret, .jump, .branch, .phi, .select,
             .convert, .ptr_cast,
             .nop,
@@ -4401,6 +4799,8 @@ test "SSA op coverage - exhaustive" {
         .map_new, .map_set, .map_get, .map_has, .map_size, .map_free,
         // List operations
         .list_new, .list_push, .list_get, .list_len, .list_free,
+        // String operations
+        .str_concat,
         // Function
         .call, .arg,
         // ARC
@@ -4423,6 +4823,7 @@ test "SSA op coverage - exhaustive" {
             .union_init, .union_tag, .union_payload,
             .map_new, .map_set, .map_get, .map_has, .map_size, .map_free,
             .list_new, .list_push, .list_get, .list_len, .list_free,
+            .str_concat,
             .call, .arg,
             .retain, .release,
             .ret, .jump, .branch, .@"unreachable",

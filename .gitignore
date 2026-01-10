@@ -21,6 +21,10 @@ test_map
 test_ret
 test_union
 test_union_exec
+test_interp
+test_list
+test_maxint
+test_method
 
 # Editor/IDE
 *.swp

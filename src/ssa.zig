@@ -151,6 +151,9 @@ pub const Op = enum(u8) {
     // Free list. args[0] = handle
     list_free,
 
+    // String operations
+    str_concat,
+
     // Function
     call,
     arg,

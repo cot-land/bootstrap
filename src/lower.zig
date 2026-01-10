@@ -771,10 +771,128 @@ pub const Lowerer = struct {
             .paren => |paren| self.lowerExpr(paren.inner),
             .struct_init => |si| self.lowerStructInit(si),
             .new_expr => |ne| self.lowerNewExpr(ne),
+            .string_interp => |si| self.lowerStringInterp(si),
             .block => ir.null_node,  // Block expressions not yet implemented
             .type_expr => ir.null_node,  // Type expressions don't produce runtime values
             .bad_expr => ir.null_node,  // Skip invalid expressions
         };
+    }
+
+    /// Lower string interpolation by converting to nested str_concat calls.
+    /// "a ${x} b" -> str_concat(str_concat("a ", x), " b")
+    /// Following Roc's design: process left-to-right, building nested concats.
+    fn lowerStringInterp(self: *Lowerer, si: ast.StringInterp) Allocator.Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+
+        // Filter out empty text segments first
+        var non_empty_segments = std.ArrayList(ast.StringSegment){ .items = &.{}, .capacity = 0 };
+        defer non_empty_segments.deinit(self.allocator);
+
+        for (si.segments) |segment| {
+            switch (segment) {
+                .text => |raw_text| {
+                    // Check if segment would be empty after cleanup
+                    var text = raw_text;
+                    if (text.len > 0 and (text[0] == '"' or text[0] == '}')) {
+                        text = text[1..];
+                    }
+                    if (text.len >= 2 and text[text.len - 2] == '$' and text[text.len - 1] == '{') {
+                        text = text[0 .. text.len - 2];
+                    } else if (text.len > 0 and text[text.len - 1] == '"') {
+                        text = text[0 .. text.len - 1];
+                    }
+                    // Only include non-empty text segments
+                    if (text.len > 0) {
+                        try non_empty_segments.append(self.allocator, segment);
+                    }
+                },
+                .expr => {
+                    // Always include expression segments
+                    try non_empty_segments.append(self.allocator, segment);
+                },
+            }
+        }
+
+        // Empty interpolation returns empty string
+        if (non_empty_segments.items.len == 0) {
+            const empty = ir.Node.init(.const_string, TypeRegistry.STRING, Span.fromPos(Pos.zero))
+                .withAuxStr("\"\"");
+            return try fb.emit(empty);
+        }
+
+        // Single segment - just return it directly
+        if (non_empty_segments.items.len == 1) {
+            return try self.lowerStringSegment(non_empty_segments.items[0]);
+        }
+
+        // Multiple segments: build nested str_concat calls left-to-right
+        // "a ${x} b" becomes: str_concat(str_concat("a ", x), " b")
+        var result = try self.lowerStringSegment(non_empty_segments.items[0]);
+
+        for (non_empty_segments.items[1..]) |segment| {
+            const seg_node = try self.lowerStringSegment(segment);
+
+            // Create str_concat(result, seg_node)
+            var concat_node = ir.Node.init(.str_concat, TypeRegistry.STRING, si.span);
+            concat_node.args_storage[0] = result;
+            concat_node.args_storage[1] = seg_node;
+            concat_node.args_len = 2;
+
+            result = try fb.emit(concat_node);
+        }
+
+        return result;
+    }
+
+    /// Helper to lower a single string segment (text or expression)
+    fn lowerStringSegment(self: *Lowerer, segment: ast.StringSegment) Allocator.Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+
+        switch (segment) {
+            .text => |raw_text| {
+                // Clean up segment text from scanner artifacts:
+                // - string_interp_start: starts with ", ends with ${
+                // - string_interp_mid: starts with }, ends with ${
+                // - string_interp_end: starts with }, ends with "
+                var text = raw_text;
+
+                // Strip leading " (first segment)
+                if (text.len > 0 and text[0] == '"') {
+                    text = text[1..];
+                }
+                // Strip leading } (middle/end segment)
+                else if (text.len > 0 and text[0] == '}') {
+                    text = text[1..];
+                }
+
+                // Strip trailing ${ (first/middle segment)
+                if (text.len >= 2 and text[text.len - 2] == '$' and text[text.len - 1] == '{') {
+                    text = text[0 .. text.len - 2];
+                }
+                // Strip trailing " (end segment)
+                else if (text.len > 0 and text[text.len - 1] == '"') {
+                    text = text[0 .. text.len - 1];
+                }
+
+                // Skip empty segments
+                if (text.len == 0) {
+                    // Return a placeholder empty string node
+                    const node = ir.Node.init(.const_string, TypeRegistry.STRING, Span.fromPos(Pos.zero))
+                        .withAuxStr("\"\"");
+                    return try fb.emit(node);
+                }
+
+                // Wrap with quotes for const_string format
+                const quoted = try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{text});
+                const node = ir.Node.init(.const_string, TypeRegistry.STRING, Span.fromPos(Pos.zero))
+                    .withAuxStr(quoted);
+                return try fb.emit(node);
+            },
+            .expr => |expr_idx| {
+                // Lower the expression - must be a string type (like Roc)
+                return try self.lowerExpr(expr_idx);
+            },
+        }
     }
 
     fn lowerNewExpr(self: *Lowerer, ne: ast.NewExpr) Allocator.Error!ir.NodeIndex {
@@ -1086,6 +1204,16 @@ pub const Lowerer = struct {
             return self.lowerBuiltinEnumFromInt(call);
         }
 
+        // Handle builtin @maxInt()
+        if (std.mem.eql(u8, func_name, "@maxInt")) {
+            return self.lowerBuiltinMaxInt(call);
+        }
+
+        // Handle builtin @minInt()
+        if (std.mem.eql(u8, func_name, "@minInt")) {
+            return self.lowerBuiltinMinInt(call);
+        }
+
         // Lower arguments for regular call
         var args = std.ArrayList(ir.NodeIndex){ .items = &.{}, .capacity = 0 };
         defer args.deinit(self.allocator);
@@ -1296,6 +1424,81 @@ pub const Lowerer = struct {
         // Fallback
         _ = fb;
         return value_node;
+    }
+
+    /// Lower builtin @maxInt() - compile-time evaluation of integer max value
+    fn lowerBuiltinMaxInt(self: *Lowerer, call: ast.Call) Allocator.Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+
+        if (call.args.len != 1) return ir.null_node;
+
+        // Get the type argument
+        const type_arg = self.tree.getExpr(call.args[0]);
+        if (type_arg == null or type_arg.? != .identifier) return ir.null_node;
+
+        const type_name = type_arg.?.identifier.name;
+        const type_idx = self.type_reg.lookupByName(type_name) orelse return ir.null_node;
+
+        const t = self.type_reg.get(type_idx);
+        if (t != .basic) return ir.null_node;
+
+        const basic = t.basic;
+
+        // Compute max value based on integer type
+        const max_value: i64 = switch (basic) {
+            .i8_type => 127,
+            .i16_type => 32767,
+            .i32_type => 2147483647,
+            .i64_type => 9223372036854775807,
+            .u8_type => 255,
+            .u16_type => 65535,
+            .u32_type => @as(i64, 4294967295),
+            .u64_type => @bitCast(@as(u64, 18446744073709551615)), // Will be treated as unsigned
+            else => return ir.null_node,
+        };
+
+        log.debug("  @maxInt({s}) = {d}", .{ type_name, max_value });
+
+        // Use i64 as result type since these are compile-time constants
+        const node = ir.Node.init(.const_int, TypeRegistry.I64, Span.fromPos(Pos.zero))
+            .withAux(max_value);
+        return try fb.emit(node);
+    }
+
+    /// Lower builtin @minInt() - compile-time evaluation of integer min value
+    fn lowerBuiltinMinInt(self: *Lowerer, call: ast.Call) Allocator.Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+
+        if (call.args.len != 1) return ir.null_node;
+
+        // Get the type argument
+        const type_arg = self.tree.getExpr(call.args[0]);
+        if (type_arg == null or type_arg.? != .identifier) return ir.null_node;
+
+        const type_name = type_arg.?.identifier.name;
+        const type_idx = self.type_reg.lookupByName(type_name) orelse return ir.null_node;
+
+        const t = self.type_reg.get(type_idx);
+        if (t != .basic) return ir.null_node;
+
+        const basic = t.basic;
+
+        // Compute min value based on integer type
+        const min_value: i64 = switch (basic) {
+            .i8_type => -128,
+            .i16_type => -32768,
+            .i32_type => -2147483648,
+            .i64_type => -9223372036854775808,
+            .u8_type, .u16_type, .u32_type, .u64_type => 0, // Unsigned types have min of 0
+            else => return ir.null_node,
+        };
+
+        log.debug("  @minInt({s}) = {d}", .{ type_name, min_value });
+
+        // Use i64 as result type since these are compile-time constants
+        const node = ir.Node.init(.const_int, TypeRegistry.I64, Span.fromPos(Pos.zero))
+            .withAux(min_value);
+        return try fb.emit(node);
     }
 
     /// Lower union construction: UnionType.variant(payload)
@@ -2045,11 +2248,18 @@ pub const Lowerer = struct {
                         return self.inferTypeFromExpr(p.inner);
                     },
 
-                    // Call - check for union construction
+                    // Call - check for union construction or builtins
                     .call => |c| {
-                        // Check if this is a union constructor call (Type.variant(payload))
                         const callee_expr = self.tree.getExpr(c.callee);
                         if (callee_expr) |ce| {
+                            // Check for @maxInt/@minInt builtins (return i64)
+                            if (ce == .identifier) {
+                                const name = ce.identifier.name;
+                                if (std.mem.eql(u8, name, "@maxInt") or std.mem.eql(u8, name, "@minInt")) {
+                                    return TypeRegistry.I64;
+                                }
+                            }
+                            // Check if this is a union constructor call (Type.variant(payload))
                             if (ce == .field_access) {
                                 const fa = ce.field_access;
                                 const base_expr = self.tree.getExpr(fa.base);
@@ -2118,6 +2328,9 @@ pub const Lowerer = struct {
                         }
                         return TypeRegistry.VOID;
                     },
+
+                    // String interpolation always returns string type
+                    .string_interp => return TypeRegistry.STRING,
 
                     else => return TypeRegistry.VOID,
                 }

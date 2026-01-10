@@ -159,6 +159,8 @@ pub const Expr = union(enum) {
     struct_init: StructInit,
     // Heap allocation: new Map<K,V>(), new List<T>()
     new_expr: NewExpr,
+    // String interpolation: "text ${expr} more"
+    string_interp: StringInterp,
     // Type expressions
     type_expr: TypeExpr,
     // For error recovery
@@ -181,6 +183,7 @@ pub const Expr = union(enum) {
             .block => |e| e.span,
             .struct_init => |e| e.span,
             .new_expr => |e| e.span,
+            .string_interp => |e| e.span,
             .type_expr => |e| e.span,
             .bad_expr => |e| e.span,
         };
@@ -190,6 +193,20 @@ pub const Expr = union(enum) {
 /// Variable or type name
 pub const Identifier = struct {
     name: []const u8,
+    span: Span,
+};
+
+/// String interpolation segment
+pub const StringSegment = union(enum) {
+    /// Plain text (includes quotes from original token)
+    text: []const u8,
+    /// Interpolated expression
+    expr: NodeIndex,
+};
+
+/// Interpolated string: "text ${expr} more ${expr2} end"
+pub const StringInterp = struct {
+    segments: []const StringSegment,
     span: Span,
 };
 

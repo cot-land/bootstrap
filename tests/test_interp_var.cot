@@ -1,0 +1,8 @@
+// Test string interpolation with variables
+// Uses a string variable in interpolation
+// expected: 42
+fn main() int {
+    var name = "world";
+    var greeting = "hello ${name}!";
+    return 42;
+}
