@@ -78,6 +78,7 @@ get_expected() {
         test_compound_sub) echo 42 ;;
         test_compound_mul) echo 42 ;;
         test_coalesce) echo 42 ;;
+        test_var_assign) echo 42 ;;
         *) echo "" ;;
     esac
 }

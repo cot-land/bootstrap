@@ -2488,8 +2488,13 @@ pub const Driver = struct {
                             if (idx < arg_regs.len) {
                                 try x86_64.movRegReg(buf, .r8, arg_regs[idx]);
                             }
+                        } else if (val.op == .load) {
+                            // Load from local's stack slot - load ops don't emit code themselves
+                            const src_local_idx: usize = @intCast(val.aux_int);
+                            const src_offset: i32 = func.locals[src_local_idx].offset;
+                            try x86_64.movRegMem(buf, .r8, .rbp, src_offset);
                         } else if (val.op == .add or val.op == .sub or val.op == .mul or val.op == .div or
-                            val.op == .load or val.op == .call or val.op == .field or val.op == .index or
+                            val.op == .call or val.op == .field or val.op == .index or
                             val.op == .slice_index or val.op == .union_payload or
                             val.op == .map_new or val.op == .map_get or val.op == .map_has or val.op == .map_size or
                             val.op == .list_new or val.op == .list_get or val.op == .list_len)
@@ -3721,8 +3726,17 @@ pub const Driver = struct {
                             if (idx < arg_regs.len) {
                                 try aarch64.movRegReg(buf, .x8, arg_regs[idx]);
                             }
+                        } else if (val.op == .load) {
+                            // Load from local's stack slot - load ops don't emit code themselves
+                            const src_local_idx: usize = @intCast(val.aux_int);
+                            const src_x86_offset: i32 = func.locals[src_local_idx].offset;
+                            const src_offset: i32 = FrameLayout.aarch64LocalOffset(src_x86_offset, func.frame_size);
+                            if (src_offset >= 0 and @mod(src_offset, 8) == 0) {
+                                const src_scaled: u12 = @intCast(@divExact(src_offset, 8));
+                                try aarch64.ldrRegImm(buf, .x8, .sp, src_scaled);
+                            }
                         } else if (val.op == .add or val.op == .sub or val.op == .mul or val.op == .div or
-                            val.op == .load or val.op == .call or val.op == .field or val.op == .index or
+                            val.op == .call or val.op == .field or val.op == .index or
                             val.op == .slice_index or val.op == .union_payload or
                             val.op == .map_new or val.op == .map_get or val.op == .map_has or val.op == .map_size or
                             val.op == .list_new or val.op == .list_get or val.op == .list_len)
