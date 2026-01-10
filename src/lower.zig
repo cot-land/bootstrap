@@ -2191,7 +2191,31 @@ pub const Lowerer = struct {
                     }
                 } else {
                     // Non-union switch - compare values directly
-                    const val = try self.lowerExpr(val_idx);
+                    // Check for short-form enum variant (e.g., .kw_fn in switch)
+                    var val: ir.NodeIndex = ir.null_node;
+                    const val_node = self.tree.getNode(val_idx);
+                    if (val_node == .expr and val_node.expr == .field_access) {
+                        const fa = val_node.expr.field_access;
+                        // Check if this is a short-form field access (base == null_node)
+                        if (fa.base == ast.null_node) {
+                            // Infer type from switch subject and look up enum variant
+                            if (subject_type == .enum_type) {
+                                const et = subject_type.enum_type;
+                                for (et.variants) |variant| {
+                                    if (std.mem.eql(u8, variant.name, fa.field)) {
+                                        const const_node = ir.Node.init(.const_int, et.backing_type, Span.fromPos(Pos.zero))
+                                            .withAux(variant.value);
+                                        val = try fb.emit(const_node);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Fall back to normal lowering if not handled above
+                    if (val == ir.null_node) {
+                        val = try self.lowerExpr(val_idx);
+                    }
                     // Generate comparison: subject == val
                     const cmp = ir.Node.init(.eq, TypeRegistry.BOOL, Span.fromPos(Pos.zero))
                         .withArgs(&.{ subject, val });

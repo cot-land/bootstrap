@@ -1622,7 +1622,7 @@ pub const Driver = struct {
                     defer branch_patches.deinit(self.allocator);
 
                     // Track block positions (byte offset where each block starts)
-                    var block_positions: [64]u32 = undefined;
+                    var block_positions: [256]u32 = undefined;
                     const num_blocks = func.blocks.items.len;
 
                     // Debug: show function being generated
@@ -1763,7 +1763,7 @@ pub const Driver = struct {
                     defer branch_patches.deinit(self.allocator);
 
                     // Track block positions (byte offset where each block starts)
-                    var block_positions: [64]u32 = undefined;
+                    var block_positions: [256]u32 = undefined;
                     const num_blocks = func.blocks.items.len;
 
                     // Debug: show function being generated

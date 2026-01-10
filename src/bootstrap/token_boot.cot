@@ -1,0 +1,194 @@
+// Token definitions for cot bootstrap.
+// Simplified version using only currently-supported features.
+//
+// Changes from original:
+// - Standalone functions instead of methods on enums
+// - Function-based keyword lookup instead of const Map
+
+// Token represents a lexical token in the cot language.
+enum Token: u8 {
+    // Special tokens
+    eof,
+    invalid,
+
+    // Literals and identifiers
+    identifier,
+    int_literal,
+    float_literal,
+    string_literal,
+    char_literal,
+
+    // Operators (single char)
+    plus,
+    minus,
+    star,
+    slash,
+    percent,
+    ampersand,
+    pipe,
+    caret,
+    tilde,
+    bang,
+    equal,
+    less,
+    greater,
+    dot,
+    question,
+    at,
+
+    // Operators (multi char)
+    plus_equal,
+    minus_equal,
+    star_equal,
+    slash_equal,
+    percent_equal,
+    ampersand_equal,
+    pipe_equal,
+    caret_equal,
+    equal_equal,
+    bang_equal,
+    less_equal,
+    greater_equal,
+    less_less,
+    greater_greater,
+    dot_dot,
+    dot_star,
+    question_question,
+    question_dot,
+    arrow,
+
+    // Delimiters
+    lparen,
+    rparen,
+    lbracket,
+    rbracket,
+    lbrace,
+    rbrace,
+    comma,
+    colon,
+    semicolon,
+
+    // Keywords
+    kw_fn,
+    kw_var,
+    kw_let,
+    kw_const,
+    kw_struct,
+    kw_if,
+    kw_else,
+    kw_while,
+    kw_for,
+    kw_in,
+    kw_return,
+    kw_break,
+    kw_continue,
+    kw_defer,
+    kw_import,
+    kw_new,
+    kw_null,
+    kw_true,
+    kw_false,
+
+    // Logical operators as keywords
+    kw_and,
+    kw_or,
+    kw_not,
+
+    // Type keywords
+    kw_int,
+    kw_float,
+    kw_bool,
+    kw_string,
+    kw_byte,
+
+    // Sized type keywords
+    kw_i8,
+    kw_i16,
+    kw_i32,
+    kw_i64,
+    kw_u8,
+    kw_u16,
+    kw_u32,
+    kw_u64,
+    kw_f32,
+    kw_f64,
+}
+
+// Operator precedence levels (higher = binds tighter).
+enum Precedence: u8 {
+    none = 0,
+    or_prec = 1,
+    and_prec = 2,
+    compare = 3,
+    add = 4,
+    mul = 5,
+    unary = 6,
+}
+
+// Returns true if token is a keyword.
+fn tokenIsKeyword(t: Token) bool {
+    return @intFromEnum(t) >= @intFromEnum(Token.kw_fn)
+}
+
+// Returns the binary operator precedence for a token.
+fn binaryPrecedence(tok: Token) Precedence {
+    return switch tok {
+        .kw_or => Precedence.or_prec,
+        .kw_and => Precedence.and_prec,
+        .equal_equal, .bang_equal, .less, .less_equal, .greater, .greater_equal => Precedence.compare,
+        .plus, .minus, .pipe, .caret => Precedence.add,
+        .star, .slash, .percent, .ampersand, .less_less, .greater_greater => Precedence.mul,
+        else => Precedence.none,
+    }
+}
+
+// Look up a keyword by name. Returns Token.invalid if not a keyword.
+fn lookupKeyword(name: string) Token {
+    if name == "fn" { return Token.kw_fn }
+    if name == "var" { return Token.kw_var }
+    if name == "let" { return Token.kw_let }
+    if name == "const" { return Token.kw_const }
+    if name == "struct" { return Token.kw_struct }
+    if name == "if" { return Token.kw_if }
+    if name == "else" { return Token.kw_else }
+    if name == "while" { return Token.kw_while }
+    if name == "for" { return Token.kw_for }
+    if name == "in" { return Token.kw_in }
+    if name == "return" { return Token.kw_return }
+    if name == "break" { return Token.kw_break }
+    if name == "continue" { return Token.kw_continue }
+    if name == "defer" { return Token.kw_defer }
+    if name == "import" { return Token.kw_import }
+    if name == "new" { return Token.kw_new }
+    if name == "null" { return Token.kw_null }
+    if name == "true" { return Token.kw_true }
+    if name == "false" { return Token.kw_false }
+    if name == "and" { return Token.kw_and }
+    if name == "or" { return Token.kw_or }
+    if name == "not" { return Token.kw_not }
+    if name == "int" { return Token.kw_int }
+    if name == "float" { return Token.kw_float }
+    if name == "bool" { return Token.kw_bool }
+    if name == "string" { return Token.kw_string }
+    if name == "byte" { return Token.kw_byte }
+    if name == "i8" { return Token.kw_i8 }
+    if name == "i16" { return Token.kw_i16 }
+    if name == "i32" { return Token.kw_i32 }
+    if name == "i64" { return Token.kw_i64 }
+    if name == "u8" { return Token.kw_u8 }
+    if name == "u16" { return Token.kw_u16 }
+    if name == "u32" { return Token.kw_u32 }
+    if name == "u64" { return Token.kw_u64 }
+    if name == "f32" { return Token.kw_f32 }
+    if name == "f64" { return Token.kw_f64 }
+    return Token.invalid
+}
+
+// Simple test: return 42 if keyword lookup works
+fn main() i64 {
+    const t: Token = lookupKeyword("fn")
+    if t == Token.kw_fn {
+        return 42
+    }
+    return 1
+}
