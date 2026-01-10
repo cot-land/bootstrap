@@ -2089,24 +2089,42 @@ pub const Driver = struct {
                     try x86_64.cmpRegImm32(buf, .r10, 0);
                 }
             },
-            // Map operations - call runtime library functions
+            // Map operations - native codegen implementation
+            // Map layout:
+            //   Header (32 bytes): capacity (8), size (8), seed (8), unused (8)
+            //   Slots (64 x 32 bytes = 2048 bytes): meta (1), pad (7), key_ptr (8), key_len (8), value (8)
+            //   Total: 2080 bytes
+            // Slot meta: 0 = empty, 1 = occupied, 2 = deleted
             .map_new => {
-                // Call cot_map_new() - no arguments, returns handle in rax
-                const map_new_name = if (self.options.target.os == .macos) "_cot_map_new" else "cot_map_new";
-                try x86_64.callSymbol(buf, map_new_name);
-                // Result is in rax
+                // Call calloc(1, 2080) to allocate zeroed map
+                // System V AMD64 ABI: rdi=nmemb, rsi=size
+                try x86_64.movRegImm64(buf, .rdi, 1);
+                try x86_64.movRegImm64(buf, .rsi, 2080); // 32 header + 64*32 slots
+                const calloc_name = if (self.options.target.os == .macos) "_calloc" else "calloc";
+                try x86_64.callSymbol(buf, calloc_name);
+                // rax now has pointer to zeroed map
+
+                // Initialize capacity field at offset 0 to 64
+                try x86_64.movRegImm64(buf, .rcx, 64);
+                try x86_64.movMemReg(buf, .rax, 0, .rcx); // [rax+0] = 64
+
+                // size at offset 8 is already 0 from calloc
+                // seed at offset 16 - initialize to FNV offset basis for consistent hashing
+                try x86_64.movRegImm64(buf, .rcx, @as(i64, @bitCast(@as(u64, 0xcbf29ce484222325))));
+                try x86_64.movMemReg(buf, .rax, 16, .rcx); // [rax+16] = FNV offset
+
+                // Result (map pointer) is in rax
             },
             .map_set => {
-                // Call cot_map_set(handle, key_ptr, key_len, value) - 4 args
-                // System V AMD64 ABI: rdi=handle, rsi=key_ptr, rdx=key_len, rcx=value
+                // Call cot_native_map_set(map, key_ptr, key_len, value) - 4 args
+                // System V AMD64 ABI: rdi=map, rsi=key_ptr, rdx=key_len, rcx=value
                 // Lowerer emits: args[0]=handle, args[1]=key, args[2]=value
                 const args = value.args();
 
-                // Load handle from local into rdi
+                // Load map pointer from local into rdi
                 if (args.len > 0) {
                     const handle_val = func.getValue(args[0]);
                     if (handle_val.op == .load or handle_val.op == .copy) {
-                        // Load from stack slot
                         const local_idx: u32 = @intCast(handle_val.aux_int);
                         const offset = self.getLocalOffset(func, local_idx);
                         try x86_64.movRegMem(buf, .rdi, .rbp, offset);
@@ -2144,17 +2162,17 @@ pub const Driver = struct {
                     }
                 }
 
-                const map_set_name = if (self.options.target.os == .macos) "_cot_map_set" else "cot_map_set";
+                const map_set_name = if (self.options.target.os == .macos) "_cot_native_map_set" else "cot_native_map_set";
                 try x86_64.callSymbol(buf, map_set_name);
                 // Result is in rax
             },
             .map_get => {
-                // Call cot_map_get(handle, key_ptr, key_len) - 3 args
-                // System V AMD64 ABI: rdi=handle, rsi=key_ptr, rdx=key_len
+                // Call cot_native_map_get(map, key_ptr, key_len) - 3 args
+                // System V AMD64 ABI: rdi=map, rsi=key_ptr, rdx=key_len
                 // Lowerer emits: args[0]=handle, args[1]=key
                 const args = value.args();
 
-                // Load handle from local into rdi
+                // Load map pointer from local into rdi
                 if (args.len > 0) {
                     const handle_val = func.getValue(args[0]);
                     if (handle_val.op == .load or handle_val.op == .copy) {
@@ -2183,17 +2201,17 @@ pub const Driver = struct {
                     }
                 }
 
-                const map_get_name = if (self.options.target.os == .macos) "_cot_map_get" else "cot_map_get";
+                const map_get_name = if (self.options.target.os == .macos) "_cot_native_map_get" else "cot_native_map_get";
                 try x86_64.callSymbol(buf, map_get_name);
                 // Result is in rax
             },
             .map_has => {
-                // Call cot_map_has(handle, key_ptr, key_len) - 3 args
-                // System V AMD64 ABI: rdi=handle, rsi=key_ptr, rdx=key_len
+                // Call cot_native_map_has(map, key_ptr, key_len) - 3 args
+                // System V AMD64 ABI: rdi=map, rsi=key_ptr, rdx=key_len
                 // Lowerer emits: args[0]=handle, args[1]=key
                 const args = value.args();
 
-                // Load handle from local into rdi
+                // Load map pointer from local into rdi
                 if (args.len > 0) {
                     const handle_val = func.getValue(args[0]);
                     if (handle_val.op == .load or handle_val.op == .copy) {
@@ -2222,12 +2240,12 @@ pub const Driver = struct {
                     }
                 }
 
-                const map_has_name = if (self.options.target.os == .macos) "_cot_map_has" else "cot_map_has";
+                const map_has_name = if (self.options.target.os == .macos) "_cot_native_map_has" else "cot_native_map_has";
                 try x86_64.callSymbol(buf, map_has_name);
                 // Result is in rax
             },
             .map_size => {
-                // Call cot_map_size(handle) - 1 arg
+                // Call cot_native_map_size(map) - 1 arg
                 // Lowerer emits: args[0]=handle
                 const args = value.args();
                 if (args.len > 0) {
@@ -2240,12 +2258,12 @@ pub const Driver = struct {
                         try x86_64.movRegImm64(buf, .rdi, handle_val.aux_int);
                     }
                 }
-                const map_size_name = if (self.options.target.os == .macos) "_cot_map_size" else "cot_map_size";
+                const map_size_name = if (self.options.target.os == .macos) "_cot_native_map_size" else "cot_native_map_size";
                 try x86_64.callSymbol(buf, map_size_name);
                 // Result is in rax
             },
             .map_free => {
-                // Call cot_map_free(handle) - 1 arg, no return
+                // Call cot_native_map_free(map) - 1 arg, no return
                 // Lowerer emits: args[0]=handle
                 const args = value.args();
                 if (args.len > 0) {
@@ -2258,7 +2276,7 @@ pub const Driver = struct {
                         try x86_64.movRegImm64(buf, .rdi, handle_val.aux_int);
                     }
                 }
-                const map_free_name = if (self.options.target.os == .macos) "_cot_map_free" else "cot_map_free";
+                const map_free_name = if (self.options.target.os == .macos) "_cot_native_map_free" else "cot_native_map_free";
                 try x86_64.callSymbol(buf, map_free_name);
             },
             else => {
@@ -3216,24 +3234,42 @@ pub const Driver = struct {
                     try aarch64.cmpRegImm12(buf, .x10, 0);
                 }
             },
-            // Map operations - call runtime library functions
+            // Map operations - native codegen implementation
+            // Map layout:
+            //   Header (32 bytes): capacity (8), size (8), seed (8), unused (8)
+            //   Slots (64 x 32 bytes = 2048 bytes): meta (1), pad (7), key_ptr (8), key_len (8), value (8)
+            //   Total: 2080 bytes
+            // Slot meta: 0 = empty, 1 = occupied, 2 = deleted
             .map_new => {
-                // Call cot_map_new() - no arguments, returns handle in x0
-                const map_new_name = if (self.options.target.os == .macos) "_cot_map_new" else "cot_map_new";
-                try aarch64.callSymbol(buf, map_new_name);
-                // Result is in x0
+                // Call calloc(1, 2080) to allocate zeroed map
+                // AArch64 ABI: x0=nmemb, x1=size
+                try aarch64.movRegImm64(buf, .x0, 1);
+                try aarch64.movRegImm64(buf, .x1, 2080); // 32 header + 64*32 slots
+                const calloc_name = if (self.options.target.os == .macos) "_calloc" else "calloc";
+                try aarch64.callSymbol(buf, calloc_name);
+                // x0 now has pointer to zeroed map
+
+                // Initialize capacity field at offset 0 to 64
+                try aarch64.movRegImm64(buf, .x1, 64);
+                try aarch64.strRegImm(buf, .x1, .x0, 0); // [x0+0] = 64
+
+                // size at offset 8 is already 0 from calloc
+                // seed at offset 16 - initialize to FNV offset basis
+                try aarch64.movRegImm64(buf, .x1, @as(i64, @bitCast(@as(u64, 0xcbf29ce484222325))));
+                try aarch64.strRegImm(buf, .x1, .x0, 2); // [x0+16] = FNV offset (offset is scaled by 8)
+
+                // Result (map pointer) is in x0
             },
             .map_set => {
-                // Call cot_map_set(handle, key_ptr, key_len, value) - 4 args
-                // AArch64 ABI: x0=handle, x1=key_ptr, x2=key_len, x3=value
+                // Call cot_native_map_set(map, key_ptr, key_len, value) - 4 args
+                // AArch64 ABI: x0=map, x1=key_ptr, x2=key_len, x3=value
                 // Lowerer emits: args[0]=handle, args[1]=key, args[2]=value
                 const args = value.args();
 
-                // Load handle from local into x0
+                // Load map pointer from local into x0
                 if (args.len > 0) {
                     const handle_val = func.getValue(args[0]);
                     if (handle_val.op == .load or handle_val.op == .copy) {
-                        // Use centralized offset calculation to prevent memory corruption
                         const local_idx: u32 = @intCast(handle_val.aux_int);
                         const x86_offset = self.getLocalOffset(func, local_idx);
                         const local_offset = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
@@ -3279,21 +3315,20 @@ pub const Driver = struct {
                     }
                 }
 
-                const map_set_name = if (self.options.target.os == .macos) "_cot_map_set" else "cot_map_set";
+                const map_set_name = if (self.options.target.os == .macos) "_cot_native_map_set" else "cot_native_map_set";
                 try aarch64.callSymbol(buf, map_set_name);
                 // Result is in x0
             },
             .map_get => {
-                // Call cot_map_get(handle, key_ptr, key_len) - 3 args
-                // AArch64 ABI: x0=handle, x1=key_ptr, x2=key_len
+                // Call cot_native_map_get(map, key_ptr, key_len) - 3 args
+                // AArch64 ABI: x0=map, x1=key_ptr, x2=key_len
                 // Lowerer emits: args[0]=handle, args[1]=key
                 const args = value.args();
 
-                // Load handle from local into x0
+                // Load map pointer from local into x0
                 if (args.len > 0) {
                     const handle_val = func.getValue(args[0]);
                     if (handle_val.op == .load or handle_val.op == .copy) {
-                        // Use centralized offset calculation to prevent memory corruption
                         const local_idx: u32 = @intCast(handle_val.aux_int);
                         const x86_offset = self.getLocalOffset(func, local_idx);
                         const local_offset = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
@@ -3323,21 +3358,20 @@ pub const Driver = struct {
                     }
                 }
 
-                const map_get_name = if (self.options.target.os == .macos) "_cot_map_get" else "cot_map_get";
+                const map_get_name = if (self.options.target.os == .macos) "_cot_native_map_get" else "cot_native_map_get";
                 try aarch64.callSymbol(buf, map_get_name);
                 // Result is in x0
             },
             .map_has => {
-                // Call cot_map_has(handle, key_ptr, key_len) - 3 args
-                // AArch64 ABI: x0=handle, x1=key_ptr, x2=key_len
+                // Call cot_native_map_has(map, key_ptr, key_len) - 3 args
+                // AArch64 ABI: x0=map, x1=key_ptr, x2=key_len
                 // Lowerer emits: args[0]=handle, args[1]=key
                 const args = value.args();
 
-                // Load handle from local into x0
+                // Load map pointer from local into x0
                 if (args.len > 0) {
                     const handle_val = func.getValue(args[0]);
                     if (handle_val.op == .load or handle_val.op == .copy) {
-                        // Use centralized offset calculation to prevent memory corruption
                         const local_idx: u32 = @intCast(handle_val.aux_int);
                         const x86_offset = self.getLocalOffset(func, local_idx);
                         const local_offset = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
@@ -3367,19 +3401,18 @@ pub const Driver = struct {
                     }
                 }
 
-                const map_has_name = if (self.options.target.os == .macos) "_cot_map_has" else "cot_map_has";
+                const map_has_name = if (self.options.target.os == .macos) "_cot_native_map_has" else "cot_native_map_has";
                 try aarch64.callSymbol(buf, map_has_name);
                 // Result is in x0
             },
             .map_size => {
-                // Call cot_map_size(handle) - 1 arg
+                // Call cot_native_map_size(map) - 1 arg
                 // Lowerer emits: args[0]=handle
                 const args = value.args();
 
                 if (args.len > 0) {
                     const handle_val = func.getValue(args[0]);
                     if (handle_val.op == .load or handle_val.op == .copy) {
-                        // Use centralized offset calculation to prevent memory corruption
                         const local_idx: u32 = @intCast(handle_val.aux_int);
                         const x86_offset = self.getLocalOffset(func, local_idx);
                         const local_offset = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
@@ -3391,19 +3424,18 @@ pub const Driver = struct {
                         try aarch64.movRegImm64(buf, .x0, handle_val.aux_int);
                     }
                 }
-                const map_size_name = if (self.options.target.os == .macos) "_cot_map_size" else "cot_map_size";
+                const map_size_name = if (self.options.target.os == .macos) "_cot_native_map_size" else "cot_native_map_size";
                 try aarch64.callSymbol(buf, map_size_name);
                 // Result is in x0
             },
             .map_free => {
-                // Call cot_map_free(handle) - 1 arg, no return
+                // Call cot_native_map_free(map) - 1 arg, no return
                 // Lowerer emits: args[0]=handle
                 const args = value.args();
 
                 if (args.len > 0) {
                     const handle_val = func.getValue(args[0]);
                     if (handle_val.op == .load or handle_val.op == .copy) {
-                        // Use centralized offset calculation to prevent memory corruption
                         const local_idx: u32 = @intCast(handle_val.aux_int);
                         const x86_offset = self.getLocalOffset(func, local_idx);
                         const local_offset = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
@@ -3415,7 +3447,7 @@ pub const Driver = struct {
                         try aarch64.movRegImm64(buf, .x0, handle_val.aux_int);
                     }
                 }
-                const map_free_name = if (self.options.target.os == .macos) "_cot_map_free" else "cot_map_free";
+                const map_free_name = if (self.options.target.os == .macos) "_cot_native_map_free" else "cot_native_map_free";
                 try aarch64.callSymbol(buf, map_free_name);
             },
             else => {

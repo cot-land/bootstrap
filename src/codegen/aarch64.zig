@@ -528,6 +528,37 @@ pub fn stpPostIndex(buf: *CodeBuffer, rt: Reg, rt2: Reg, rn: Reg, imm7: i7) !voi
     try emit32(buf, loadStorePair(0b10, false, 0b01, false, uimm7, rt2, rn, rt));
 }
 
+/// LDRB Wd, [Xn, #imm] - Load byte with zero extension to 64-bit
+pub fn ldrbRegImm(buf: *CodeBuffer, rt: Reg, rn: Reg, offset: u12) !void {
+    // size=00 (byte), V=0, opc=01 (load)
+    try emit32(buf, loadStoreUnsignedOffset(0b00, false, 0b01, offset, rn, rt));
+}
+
+/// STRB Wd, [Xn, #imm] - Store low byte of register
+pub fn strbRegImm(buf: *CodeBuffer, rt: Reg, rn: Reg, offset: u12) !void {
+    // size=00 (byte), V=0, opc=00 (store)
+    try emit32(buf, loadStoreUnsignedOffset(0b00, false, 0b00, offset, rn, rt));
+}
+
+/// LDRB Wd, [Xn, Xm] - Load byte with register offset
+pub fn ldrbRegReg(buf: *CodeBuffer, rt: Reg, rn: Reg, rm: Reg) !void {
+    // Load/store register (register offset): LDRB Wt, [Xn, Xm]
+    // size=00, V=0, opc=01, Rm, option=011 (LSL), S=0, Rn, Rt
+    const inst: u32 = (0b00 << 30) | // size=00 (byte)
+        (0b111 << 27) | // fixed
+        (0b0 << 26) | // V=0 (not SIMD)
+        (0b00 << 24) | // fixed
+        (0b01 << 22) | // opc=01 (LDR)
+        (0b1 << 21) | // fixed
+        (@as(u32, @intFromEnum(rm)) << 16) | // Rm
+        (0b011 << 13) | // option=011 (LSL)
+        (0b0 << 12) | // S=0 (no shift)
+        (0b10 << 10) | // fixed
+        (@as(u32, @intFromEnum(rn)) << 5) | // Rn
+        @as(u32, @intFromEnum(rt)); // Rt
+    try emit32(buf, inst);
+}
+
 // ============================================================================
 // Branch Instructions
 // ============================================================================

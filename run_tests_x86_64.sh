@@ -62,6 +62,8 @@ get_expected() {
         test_enum_from_int) echo 20 ;;
         test_union) echo 42 ;;
         test_union_switch) echo 42 ;;
+        test_map_new) echo 42 ;;
+        test_map_methods) echo 42 ;;
         *) echo "" ;;
     esac
 }
@@ -93,7 +95,16 @@ for test_file in tests/test_*.cot; do
     fi
 
     # Link with zig cc (provides C runtime, consistent with cot linker)
-    if ! zig cc -o test_out "${name}.o" 2>/dev/null; then
+    # Include runtime library for FFI functions if it exists
+    RUNTIME_LIB="./zig-out/lib/libcot_runtime.a"
+    if [ -f "$RUNTIME_LIB" ]; then
+        if ! zig cc -o test_out "${name}.o" "$RUNTIME_LIB" 2>/dev/null; then
+            echo "FAIL $name (link failed)"
+            FAIL=$((FAIL + 1))
+            rm -f "${name}.o"
+            continue
+        fi
+    elif ! zig cc -o test_out "${name}.o" 2>/dev/null; then
         echo "FAIL $name (link failed)"
         FAIL=$((FAIL + 1))
         rm -f "${name}.o"

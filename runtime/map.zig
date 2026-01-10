@@ -652,3 +652,275 @@ test "map null handle safety" {
     try std.testing.expectEqual(@as(i64, 0), cot_map_set(null, "key".ptr, 3, 42));
     cot_map_free(null); // Should not crash
 }
+
+// ============================================================================
+// Native Layout FFI Helpers
+// ============================================================================
+//
+// Native map layout (allocated by codegen via calloc):
+//   Header (32 bytes at offset 0):
+//     - capacity: u64 (offset 0)
+//     - size: u64 (offset 8)
+//     - seed: u64 (offset 16) - FNV offset basis, unused currently
+//     - unused: u64 (offset 24)
+//   Slots (starting at offset 32, each slot is 32 bytes):
+//     - meta: u8 (offset 0) - 0=empty, 1=occupied, 2=deleted
+//     - padding: 7 bytes
+//     - key_ptr: u64 (offset 8)
+//     - key_len: u64 (offset 16)
+//     - value: i64 (offset 24)
+
+const NativeHeader = extern struct {
+    capacity: u64,
+    size: u64,
+    seed: u64,
+    unused: u64,
+};
+
+const NativeSlot = extern struct {
+    meta: u8,
+    _pad: [7]u8,
+    key_ptr: u64,
+    key_len: u64,
+    value: i64,
+};
+
+fn getNativeSlots(map: [*]u8) [*]NativeSlot {
+    return @ptrCast(@alignCast(map + 32)); // Slots start after 32-byte header
+}
+
+fn getNativeHeader(map: [*]u8) *NativeHeader {
+    return @ptrCast(@alignCast(map));
+}
+
+/// FNV-1a hash for native layout
+fn fnvHash(key_ptr: [*]const u8, key_len: u64) u64 {
+    var hash: u64 = 0xcbf29ce484222325; // FNV offset basis
+    var i: u64 = 0;
+    while (i < key_len) : (i += 1) {
+        hash ^= key_ptr[i];
+        hash *%= 0x100000001b3; // FNV prime
+    }
+    return hash;
+}
+
+/// Native map set - works with codegen-allocated layout
+/// map: pointer to native map (from calloc)
+/// key_ptr: pointer to key string
+/// key_len: length of key
+/// value: value to store
+/// Returns 1 on success, 0 on failure (map full)
+export fn cot_native_map_set(map: ?[*]u8, key_ptr: [*]const u8, key_len: u64, value: i64) i64 {
+    const m = map orelse return 0;
+    const header = getNativeHeader(m);
+    const slots = getNativeSlots(m);
+    const capacity = header.capacity;
+
+    if (capacity == 0) return 0;
+
+    const hash = fnvHash(key_ptr, key_len);
+    var idx = hash % capacity;
+    var probes: u64 = 0;
+
+    // Linear probe to find empty slot or existing key
+    while (probes < capacity) {
+        const slot = &slots[idx];
+
+        if (slot.meta == 0 or slot.meta == 2) {
+            // Empty or deleted slot - insert here
+            // Copy key string (allocate new storage for it)
+            const key_copy = std.heap.c_allocator.alloc(u8, key_len) catch return 0;
+            @memcpy(key_copy, key_ptr[0..key_len]);
+
+            slot.meta = 1; // occupied
+            slot.key_ptr = @intFromPtr(key_copy.ptr);
+            slot.key_len = key_len;
+            slot.value = value;
+            header.size += 1;
+            return 1;
+        }
+
+        if (slot.meta == 1) {
+            // Occupied slot - check if same key
+            if (slot.key_len == key_len) {
+                const existing_key: [*]const u8 = @ptrFromInt(slot.key_ptr);
+                if (std.mem.eql(u8, existing_key[0..key_len], key_ptr[0..key_len])) {
+                    // Same key - update value
+                    slot.value = value;
+                    return 1;
+                }
+            }
+        }
+
+        // Collision - linear probe
+        idx = (idx + 1) % capacity;
+        probes += 1;
+    }
+
+    // Map is full
+    return 0;
+}
+
+/// Native map get - works with codegen-allocated layout
+/// Returns value if found, MIN_INT if not found
+export fn cot_native_map_get(map: ?[*]u8, key_ptr: [*]const u8, key_len: u64) i64 {
+    const m = map orelse return std.math.minInt(i64);
+    const header = getNativeHeader(m);
+    const slots = getNativeSlots(m);
+    const capacity = header.capacity;
+
+    if (capacity == 0) return std.math.minInt(i64);
+
+    const hash = fnvHash(key_ptr, key_len);
+    var idx = hash % capacity;
+    var probes: u64 = 0;
+
+    while (probes < capacity) {
+        const slot = &slots[idx];
+
+        if (slot.meta == 0) {
+            // Empty slot - key not found
+            return std.math.minInt(i64);
+        }
+
+        if (slot.meta == 1 and slot.key_len == key_len) {
+            const existing_key: [*]const u8 = @ptrFromInt(slot.key_ptr);
+            if (std.mem.eql(u8, existing_key[0..key_len], key_ptr[0..key_len])) {
+                return slot.value;
+            }
+        }
+
+        // Continue probing (skip tombstones too)
+        idx = (idx + 1) % capacity;
+        probes += 1;
+    }
+
+    return std.math.minInt(i64);
+}
+
+/// Native map has - check if key exists
+/// Returns 1 if found, 0 if not
+export fn cot_native_map_has(map: ?[*]u8, key_ptr: [*]const u8, key_len: u64) i64 {
+    const m = map orelse return 0;
+    const header = getNativeHeader(m);
+    const slots = getNativeSlots(m);
+    const capacity = header.capacity;
+
+    if (capacity == 0) return 0;
+
+    const hash = fnvHash(key_ptr, key_len);
+    var idx = hash % capacity;
+    var probes: u64 = 0;
+
+    while (probes < capacity) {
+        const slot = &slots[idx];
+
+        if (slot.meta == 0) {
+            return 0; // Empty - not found
+        }
+
+        if (slot.meta == 1 and slot.key_len == key_len) {
+            const existing_key: [*]const u8 = @ptrFromInt(slot.key_ptr);
+            if (std.mem.eql(u8, existing_key[0..key_len], key_ptr[0..key_len])) {
+                return 1;
+            }
+        }
+
+        idx = (idx + 1) % capacity;
+        probes += 1;
+    }
+
+    return 0;
+}
+
+/// Native map size - get number of entries
+export fn cot_native_map_size(map: ?[*]u8) i64 {
+    const m = map orelse return 0;
+    const header = getNativeHeader(m);
+    return @intCast(header.size);
+}
+
+/// Native map free - free map and all keys
+export fn cot_native_map_free(map: ?[*]u8) void {
+    const m = map orelse return;
+    const header = getNativeHeader(m);
+    const slots = getNativeSlots(m);
+    const capacity = header.capacity;
+
+    // Free all key strings
+    var i: u64 = 0;
+    while (i < capacity) : (i += 1) {
+        if (slots[i].meta == 1) {
+            const key_ptr: [*]u8 = @ptrFromInt(slots[i].key_ptr);
+            const key_len = slots[i].key_len;
+            std.heap.c_allocator.free(key_ptr[0..key_len]);
+        }
+    }
+
+    // Free the map itself (was allocated via calloc)
+    // Total size: 32 header + capacity * 32 slots
+    const total_size = 32 + capacity * 32;
+    std.heap.c_allocator.free(m[0..total_size]);
+}
+
+// ============================================================================
+// Native Layout Tests
+// ============================================================================
+
+test "native map basic operations" {
+    // Allocate map like codegen does
+    const allocator = std.heap.c_allocator;
+    const capacity: u64 = 64;
+    const total_size: usize = 32 + @as(usize, capacity) * 32; // header + slots
+    const map = allocator.alloc(u8, total_size) catch return error.OutOfMemory;
+    @memset(map, 0);
+
+    // Initialize header like codegen does
+    const header: *NativeHeader = @ptrCast(@alignCast(map.ptr));
+    header.capacity = capacity;
+    header.size = 0;
+    header.seed = 0xcbf29ce484222325;
+
+    // Test basic operations
+    const key = "hello";
+    try std.testing.expectEqual(@as(i64, 0), cot_native_map_has(map.ptr, key.ptr, key.len));
+
+    _ = cot_native_map_set(map.ptr, key.ptr, key.len, 42);
+    try std.testing.expectEqual(@as(i64, 1), cot_native_map_has(map.ptr, key.ptr, key.len));
+    try std.testing.expectEqual(@as(i64, 42), cot_native_map_get(map.ptr, key.ptr, key.len));
+    try std.testing.expectEqual(@as(i64, 1), cot_native_map_size(map.ptr));
+
+    // Update
+    _ = cot_native_map_set(map.ptr, key.ptr, key.len, 100);
+    try std.testing.expectEqual(@as(i64, 100), cot_native_map_get(map.ptr, key.ptr, key.len));
+    try std.testing.expectEqual(@as(i64, 1), cot_native_map_size(map.ptr)); // Size unchanged
+
+    // Free
+    cot_native_map_free(map.ptr);
+}
+
+test "native map multiple entries" {
+    const allocator = std.heap.c_allocator;
+    const capacity: u64 = 64;
+    const total_size: usize = 32 + @as(usize, capacity) * 32;
+    const map = allocator.alloc(u8, total_size) catch return error.OutOfMemory;
+    @memset(map, 0);
+
+    const header: *NativeHeader = @ptrCast(@alignCast(map.ptr));
+    header.capacity = capacity;
+
+    const keys = [_][]const u8{ "one", "two", "three", "four", "five" };
+    const values = [_]i64{ 1, 2, 3, 4, 5 };
+
+    for (keys, values) |k, v| {
+        _ = cot_native_map_set(map.ptr, k.ptr, k.len, v);
+    }
+
+    try std.testing.expectEqual(@as(i64, 5), cot_native_map_size(map.ptr));
+
+    for (keys, values) |k, v| {
+        try std.testing.expectEqual(v, cot_native_map_get(map.ptr, k.ptr, k.len));
+    }
+
+    cot_native_map_free(map.ptr);
+}
