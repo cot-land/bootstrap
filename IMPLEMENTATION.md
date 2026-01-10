@@ -178,7 +178,14 @@ Features that can wait until after self-hosting.
 
 ## Phase 5: Standard Library via Zig FFI
 
-After self-hosting, Cot needs a standard library (HTTP, crypto, JSON, file I/O, etc.). Rather than rewriting everything from scratch, we can leverage Zig's battle-tested `std` library via C ABI exports.
+After self-hosting, Cot needs a standard library (HTTP, crypto, JSON, file I/O, etc.). Rather than rewriting everything from scratch, we leverage Zig's battle-tested `std` library via C ABI exports.
+
+### Design Principles
+
+1. **Zig for the hard stuff** - HTTP, crypto, JSON parsing, async I/O
+2. **Pure Cot for everything else** - Data structures, algorithms, business logic
+3. **Thin FFI layer** - Runtime only wraps what truly benefits from Zig's std
+4. **Explicit memory ownership** - Clear rules for who allocates/frees
 
 ### Architecture Overview
 
@@ -186,18 +193,26 @@ After self-hosting, Cot needs a standard library (HTTP, crypto, JSON, file I/O, 
 ┌─────────────────────────────────────────────────────────────┐
 │                     Cot Application                          │
 │   import "std/http"                                          │
-│   http.get("https://example.com")                            │
+│   const resp = http.get("https://example.com")?             │
 └─────────────────────────────────────────────────────────────┘
                               │
-                              │ calls extern fn
+                              │ calls Cot wrapper (high-level API)
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                     std/http.cot                             │
+│   (Pure Cot - error handling, Result types, ergonomics)     │
+│                                                              │
+│   pub fn get(url: string) Result(Response, HttpError)       │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              │ calls extern fn (C ABI)
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                    libcot_runtime.a                          │
 │   (Zig implementation, exported via C ABI)                   │
 │                                                              │
 │   export fn cot_http_get(...) callconv(.C) i64              │
-│   export fn cot_json_parse(...) callconv(.C) *JsonValue     │
-│   export fn cot_file_read(...) callconv(.C) i64             │
+│   export fn cot_file_read_alloc(...) callconv(.C) i64       │
 └─────────────────────────────────────────────────────────────┘
                               │
                               │ uses internally
@@ -208,64 +223,273 @@ After self-hosting, Cot needs a standard library (HTTP, crypto, JSON, file I/O, 
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### Step 1: Create Zig Runtime Library
+### Memory Ownership Conventions
+
+**Rule 1: Caller allocates output buffers**
+```cot
+// Caller provides buffer, runtime fills it
+extern fn cot_file_read(path: *u8, out_buf: *u8, buf_len: i64) i64
+```
+
+**Rule 2: Runtime owns opaque handles**
+```cot
+// Runtime allocates, caller must free with paired function
+extern fn cot_json_parse(data: *u8, len: i64) ?*JsonHandle
+extern fn cot_json_free(handle: *JsonHandle) void
+```
+
+**Rule 3: Runtime-allocated data uses explicit alloc functions**
+```cot
+// For large/unknown-size data, runtime allocates
+extern fn cot_file_read_alloc(path: *u8, out_ptr: **u8, out_len: *i64) i64
+extern fn cot_free(ptr: *u8, len: i64) void
+```
+
+**Rule 4: Strings are always ptr+len pairs (no null termination assumption)**
+```cot
+// Runtime receives ptr+len, not null-terminated strings
+extern fn cot_http_post(url: *u8, url_len: i64, body: *u8, body_len: i64, ...) i64
+```
+
+### Error Handling Strategy
+
+**Runtime level:** Return error codes (negative values) or null pointers
+```zig
+// In cot_runtime.zig
+export fn cot_file_read(...) callconv(.C) i64 {
+    // Returns: >= 0 for bytes read, negative for error code
+    //   -1 = file not found
+    //   -2 = permission denied
+    //   -3 = I/O error
+}
+```
+
+**Cot wrapper level:** Convert to Result/Error types
+```cot
+// In std/fs.cot
+pub const FsError = enum {
+    not_found,
+    permission_denied,
+    io_error,
+    unknown,
+}
+
+pub fn read_file(path: string) Result(string, FsError) {
+    var buf: [1048576]u8 = undefined
+    const result = cot_file_read(path.ptr, &buf, 1048576)
+
+    if (result == -1) return .{ .err = .not_found }
+    if (result == -2) return .{ .err = .permission_denied }
+    if (result < 0) return .{ .err = .io_error }
+
+    return .{ .ok = string.from_bytes(buf[0..result]) }
+}
+```
+
+### Step 1: extern fn Syntax
+
+All `extern fn` declarations use C calling convention implicitly:
+
+```cot
+// External function declaration (no body, C ABI assumed)
+extern fn cot_http_get(url: *u8, url_len: i64, out: *u8, out_len: i64) i64
+extern fn cot_json_parse(data: *u8, len: i64) ?*JsonHandle
+extern fn cot_sha256(data: *u8, len: i64, out: *u8) void
+
+// Usage - called like any other function
+fn example() {
+    var buf: [4096]u8 = undefined
+    const len = cot_http_get("https://api.example.com".ptr, 23, &buf, 4096)
+}
+```
+
+**Compiler implementation:**
+1. **Parser:** `extern fn name(params) return_type` (no body)
+2. **Type checker:** Validate parameter types are FFI-compatible (primitives, pointers)
+3. **Codegen:** Emit external symbol reference (relocation, no code)
+4. **Linker:** Resolve against libcot_runtime.a
+
+### Step 2: Zig Runtime Library
 
 **File:** `runtime/cot_runtime.zig`
 
 ```zig
 const std = @import("std");
 
-// Use C allocator for FFI compatibility
 const allocator = std.heap.c_allocator;
+
+// ============================================================
+// Error Codes (documented, stable across versions)
+// ============================================================
+
+pub const ERR_NOT_FOUND: i64 = -1;
+pub const ERR_PERMISSION: i64 = -2;
+pub const ERR_IO: i64 = -3;
+pub const ERR_INVALID: i64 = -4;
+pub const ERR_TIMEOUT: i64 = -5;
+pub const ERR_NO_MEMORY: i64 = -6;
+pub const ERR_BUFFER_TOO_SMALL: i64 = -7;
+
+// ============================================================
+// File I/O
+// ============================================================
+
+/// Read file into caller-provided buffer
+/// Returns: bytes read (>= 0), or negative error code
+export fn cot_file_read(
+    path_ptr: [*]const u8,
+    path_len: usize,
+    out_buf: [*]u8,
+    buf_len: usize,
+) callconv(.C) i64 {
+    const path = path_ptr[0..path_len];
+
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        return switch (err) {
+            error.FileNotFound => ERR_NOT_FOUND,
+            error.AccessDenied => ERR_PERMISSION,
+            else => ERR_IO,
+        };
+    };
+    defer file.close();
+
+    const bytes_read = file.read(out_buf[0..buf_len]) catch return ERR_IO;
+    return @intCast(bytes_read);
+}
+
+/// Read entire file, runtime allocates buffer
+/// Caller must free with cot_free(out_ptr, out_len)
+export fn cot_file_read_alloc(
+    path_ptr: [*]const u8,
+    path_len: usize,
+    out_ptr: *[*]u8,
+    out_len: *usize,
+) callconv(.C) i64 {
+    const path = path_ptr[0..path_len];
+
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        return switch (err) {
+            error.FileNotFound => ERR_NOT_FOUND,
+            error.AccessDenied => ERR_PERMISSION,
+            else => ERR_IO,
+        };
+    };
+    defer file.close();
+
+    const content = file.readToEndAlloc(allocator, 1024 * 1024 * 100) catch return ERR_IO;
+    out_ptr.* = content.ptr;
+    out_len.* = content.len;
+    return @intCast(content.len);
+}
+
+export fn cot_file_write(
+    path_ptr: [*]const u8,
+    path_len: usize,
+    data_ptr: [*]const u8,
+    data_len: usize,
+) callconv(.C) i64 {
+    const path = path_ptr[0..path_len];
+    const data = data_ptr[0..data_len];
+
+    const file = std.fs.cwd().createFile(path, .{}) catch |err| {
+        return switch (err) {
+            error.AccessDenied => ERR_PERMISSION,
+            else => ERR_IO,
+        };
+    };
+    defer file.close();
+
+    file.writeAll(data) catch return ERR_IO;
+    return @intCast(data_len);
+}
+
+export fn cot_file_exists(
+    path_ptr: [*]const u8,
+    path_len: usize,
+) callconv(.C) bool {
+    const path = path_ptr[0..path_len];
+    std.fs.cwd().access(path, .{}) catch return false;
+    return true;
+}
 
 // ============================================================
 // HTTP Client
 // ============================================================
 
 export fn cot_http_get(
-    url_ptr: [*:0]const u8,
+    url_ptr: [*]const u8,
+    url_len: usize,
     out_buf: [*]u8,
     buf_len: usize,
 ) callconv(.C) i64 {
-    const url = std.mem.span(url_ptr);
+    const url = url_ptr[0..url_len];
 
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
     var response = client.fetch(allocator, .{
         .url = url,
-    }) catch return -1;
+    }) catch |err| {
+        return switch (err) {
+            error.ConnectionRefused => ERR_IO,
+            error.Timeout => ERR_TIMEOUT,
+            else => ERR_IO,
+        };
+    };
     defer response.deinit();
 
     const body = response.body orelse return 0;
-    const copy_len = @min(body.len, buf_len);
-    @memcpy(out_buf[0..copy_len], body[0..copy_len]);
+    if (body.len > buf_len) return ERR_BUFFER_TOO_SMALL;
 
-    return @intCast(copy_len);
+    @memcpy(out_buf[0..body.len], body);
+    return @intCast(body.len);
 }
 
-export fn cot_http_post(
-    url_ptr: [*:0]const u8,
-    body_ptr: [*]const u8,
-    body_len: usize,
-    out_buf: [*]u8,
-    out_len: usize,
+/// HTTP GET with runtime-allocated response
+export fn cot_http_get_alloc(
+    url_ptr: [*]const u8,
+    url_len: usize,
+    out_ptr: *[*]u8,
+    out_len: *usize,
+    out_status: *i32,
 ) callconv(.C) i64 {
-    // Implementation using std.http.Client
-    _ = url_ptr; _ = body_ptr; _ = body_len; _ = out_buf; _ = out_len;
-    return -1; // TODO
+    const url = url_ptr[0..url_len];
+
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    var response = client.fetch(allocator, .{
+        .url = url,
+    }) catch return ERR_IO;
+    // Don't defer deinit - we're giving body ownership to caller
+
+    out_status.* = @intFromEnum(response.status);
+
+    if (response.body) |body| {
+        // Dupe the body so we can deinit the response
+        const owned = allocator.dupe(u8, body) catch return ERR_NO_MEMORY;
+        out_ptr.* = owned.ptr;
+        out_len.* = owned.len;
+        response.deinit();
+        return @intCast(owned.len);
+    }
+
+    response.deinit();
+    out_ptr.* = undefined;
+    out_len.* = 0;
+    return 0;
 }
 
 // ============================================================
-// JSON
+// JSON (Opaque Handle Pattern)
 // ============================================================
 
-pub const JsonValue = opaque {};
+pub const JsonHandle = opaque {};
 
 export fn cot_json_parse(
     json_ptr: [*]const u8,
     json_len: usize,
-) callconv(.C) ?*JsonValue {
+) callconv(.C) ?*JsonHandle {
     const json_str = json_ptr[0..json_len];
     const parsed = std.json.parseFromSlice(
         std.json.Value,
@@ -274,71 +498,42 @@ export fn cot_json_parse(
         .{},
     ) catch return null;
 
-    // Store parsed value and return opaque pointer
     const result = allocator.create(std.json.Parsed(std.json.Value)) catch return null;
     result.* = parsed;
     return @ptrCast(result);
 }
 
-export fn cot_json_free(value: ?*JsonValue) callconv(.C) void {
-    if (value) |v| {
-        const parsed: *std.json.Parsed(std.json.Value) = @ptrCast(@alignCast(v));
+export fn cot_json_free(handle: ?*JsonHandle) callconv(.C) void {
+    if (handle) |h| {
+        const parsed: *std.json.Parsed(std.json.Value) = @ptrCast(@alignCast(h));
         parsed.deinit();
         allocator.destroy(parsed);
     }
 }
 
 export fn cot_json_get_string(
-    value: *JsonValue,
-    key_ptr: [*:0]const u8,
+    handle: *JsonHandle,
+    key_ptr: [*]const u8,
+    key_len: usize,
     out_buf: [*]u8,
     buf_len: usize,
 ) callconv(.C) i64 {
-    _ = value; _ = key_ptr; _ = out_buf; _ = buf_len;
-    return -1; // TODO: implement object field access
+    const parsed: *std.json.Parsed(std.json.Value) = @ptrCast(@alignCast(handle));
+    const key = key_ptr[0..key_len];
+
+    if (parsed.value != .object) return ERR_INVALID;
+    const val = parsed.value.object.get(key) orelse return ERR_NOT_FOUND;
+    if (val != .string) return ERR_INVALID;
+
+    const str = val.string;
+    if (str.len > buf_len) return ERR_BUFFER_TOO_SMALL;
+
+    @memcpy(out_buf[0..str.len], str);
+    return @intCast(str.len);
 }
 
 // ============================================================
-// File I/O
-// ============================================================
-
-export fn cot_file_read(
-    path_ptr: [*:0]const u8,
-    out_buf: [*]u8,
-    buf_len: usize,
-) callconv(.C) i64 {
-    const path = std.mem.span(path_ptr);
-
-    const file = std.fs.cwd().openFile(path, .{}) catch return -1;
-    defer file.close();
-
-    const bytes_read = file.read(out_buf[0..buf_len]) catch return -1;
-    return @intCast(bytes_read);
-}
-
-export fn cot_file_write(
-    path_ptr: [*:0]const u8,
-    data_ptr: [*]const u8,
-    data_len: usize,
-) callconv(.C) i64 {
-    const path = std.mem.span(path_ptr);
-    const data = data_ptr[0..data_len];
-
-    const file = std.fs.cwd().createFile(path, .{}) catch return -1;
-    defer file.close();
-
-    file.writeAll(data) catch return -1;
-    return @intCast(data_len);
-}
-
-export fn cot_file_exists(path_ptr: [*:0]const u8) callconv(.C) bool {
-    const path = std.mem.span(path_ptr);
-    std.fs.cwd().access(path, .{}) catch return false;
-    return true;
-}
-
-// ============================================================
-// Crypto (Hashing)
+// Crypto
 // ============================================================
 
 export fn cot_sha256(
@@ -352,53 +547,30 @@ export fn cot_sha256(
 }
 
 // ============================================================
-// Memory Management (for Cot heap objects)
+// Memory Management
 // ============================================================
 
-export fn cot_alloc(size: usize) callconv(.C) ?*anyopaque {
+export fn cot_alloc(size: usize) callconv(.C) ?[*]u8 {
     const mem = allocator.alloc(u8, size) catch return null;
     return mem.ptr;
 }
 
-export fn cot_free(ptr: ?*anyopaque, size: usize) callconv(.C) void {
+export fn cot_free(ptr: ?[*]u8, size: usize) callconv(.C) void {
     if (ptr) |p| {
-        const slice: [*]u8 = @ptrCast(p);
-        allocator.free(slice[0..size]);
+        allocator.free(p[0..size]);
     }
 }
 
 export fn cot_realloc(
-    ptr: ?*anyopaque,
+    ptr: ?[*]u8,
     old_size: usize,
     new_size: usize,
-) callconv(.C) ?*anyopaque {
+) callconv(.C) ?[*]u8 {
     if (ptr) |p| {
-        const old_slice: [*]u8 = @ptrCast(p);
-        const new_mem = allocator.realloc(old_slice[0..old_size], new_size) catch return null;
+        const new_mem = allocator.realloc(p[0..old_size], new_size) catch return null;
         return new_mem.ptr;
     }
     return cot_alloc(new_size);
-}
-
-// ============================================================
-// String Utilities
-// ============================================================
-
-export fn cot_string_concat(
-    a_ptr: [*]const u8,
-    a_len: usize,
-    b_ptr: [*]const u8,
-    b_len: usize,
-    out_ptr: [*]u8,
-    out_cap: usize,
-) callconv(.C) i64 {
-    const total = a_len + b_len;
-    if (total > out_cap) return -1;
-
-    @memcpy(out_ptr[0..a_len], a_ptr[0..a_len]);
-    @memcpy(out_ptr[a_len..total], b_ptr[0..b_len]);
-
-    return @intCast(total);
 }
 
 // ============================================================
@@ -417,133 +589,194 @@ export fn cot_println(ptr: [*]const u8, len: usize) callconv(.C) void {
 }
 ```
 
-### Step 2: Build the Runtime Library
+### Step 3: Cot Standard Library Wrappers
 
-**File:** `runtime/build.zig`
-
-```zig
-const std = @import("std");
-
-pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
-
-    // Build as static library with C ABI
-    const lib = b.addStaticLibrary(.{
-        .name = "cot_runtime",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("cot_runtime.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-
-    // Install to lib/ directory
-    b.installArtifact(lib);
-
-    // Also generate C header (optional, for documentation)
-    // The actual interface is documented in cot's std/ modules
-}
-```
-
-**Build commands:**
-```bash
-cd runtime
-zig build -Doptimize=ReleaseFast
-# Produces: zig-out/lib/libcot_runtime.a
-```
-
-### Step 3: Cot Language Support for extern fn
-
-**Cot syntax for external functions:**
+**File:** `std/error.cot`
 
 ```cot
-// Declare external function (implemented in libcot_runtime.a)
-extern fn cot_http_get(url: *u8, out: *u8, len: i64) i64
-extern fn cot_file_read(path: *u8, out: *u8, len: i64) i64
-extern fn cot_sha256(data: *u8, len: i64, out: *u8) void
+// Common error types used across std library
 
-// Usage in Cot code
-fn fetch(url: string) string {
-    var buf: [65536]u8 = undefined
-    const len = cot_http_get(url.ptr, &buf, 65536)
-    if (len < 0) {
-        return ""
-    }
-    return string.from_bytes(buf[0..len])
-}
-```
-
-**Implementation in compiler:**
-
-1. **Parser:** Recognize `extern fn` declarations (no body)
-2. **Type checker:** Validate extern function signatures
-3. **Codegen:** Emit external symbol reference (no code generation for extern)
-4. **Linker:** Link against libcot_runtime.a
-
-### Step 4: Standard Library Wrappers (Pure Cot)
-
-**File:** `std/http.cot`
-
-```cot
-// High-level HTTP API wrapping low-level extern functions
-
-extern fn cot_http_get(url: *u8, out: *u8, len: i64) i64
-
-pub struct Response {
-    status: i64,
-    body: string,
+pub const IoError = enum {
+    not_found,
+    permission_denied,
+    io_error,
+    timeout,
+    buffer_too_small,
+    unknown,
 }
 
-pub fn get(url: string) ?Response {
-    var buf: [1048576]u8 = undefined  // 1MB buffer
-    const len = cot_http_get(url.ptr, &buf, 1048576)
+// Generic Result type (until we have generics, use specific versions)
+pub struct ResultString {
+    ok: ?string,
+    err: ?IoError,
 
-    if (len < 0) {
-        return null
+    pub fn is_ok(self: ResultString) bool {
+        return self.ok != null
     }
 
-    return Response{
-        .status = 200,
-        .body = string.from_bytes(buf[0..len]),
+    pub fn unwrap(self: ResultString) string {
+        return self.ok.?
     }
-}
-
-pub fn post(url: string, body: string) ?Response {
-    // TODO: implement using cot_http_post
-    _ = url
-    _ = body
-    return null
 }
 ```
 
 **File:** `std/fs.cot`
 
 ```cot
-// File system operations
+import "std/error"
 
-extern fn cot_file_read(path: *u8, out: *u8, len: i64) i64
-extern fn cot_file_write(path: *u8, data: *u8, len: i64) i64
-extern fn cot_file_exists(path: *u8) bool
+extern fn cot_file_read(path: *u8, path_len: i64, out: *u8, out_len: i64) i64
+extern fn cot_file_read_alloc(path: *u8, path_len: i64, out_ptr: **u8, out_len: *i64) i64
+extern fn cot_file_write(path: *u8, path_len: i64, data: *u8, data_len: i64) i64
+extern fn cot_file_exists(path: *u8, path_len: i64) bool
+extern fn cot_free(ptr: *u8, len: i64) void
 
-pub fn read_file(path: string) ?string {
-    var buf: [1048576]u8 = undefined
-    const len = cot_file_read(path.ptr, &buf, 1048576)
-
-    if (len < 0) {
-        return null
-    }
-
-    return string.from_bytes(buf[0..len])
+fn error_from_code(code: i64) IoError {
+    if (code == -1) return .not_found
+    if (code == -2) return .permission_denied
+    if (code == -7) return .buffer_too_small
+    return .io_error
 }
 
-pub fn write_file(path: string, content: string) bool {
-    const result = cot_file_write(path.ptr, content.ptr, content.len)
-    return result >= 0
+/// Read file contents (up to 1MB)
+pub fn read_file(path: string) ResultString {
+    var buf: [1048576]u8 = undefined
+    const result = cot_file_read(path.ptr, path.len, &buf, 1048576)
+
+    if (result < 0) {
+        return .{ .ok = null, .err = error_from_code(result) }
+    }
+
+    return .{ .ok = string.from_bytes(buf[0..result]), .err = null }
+}
+
+/// Read file of any size (runtime allocates)
+pub fn read_file_alloc(path: string) ResultString {
+    var ptr: *u8 = undefined
+    var len: i64 = 0
+    const result = cot_file_read_alloc(path.ptr, path.len, &ptr, &len)
+
+    if (result < 0) {
+        return .{ .ok = null, .err = error_from_code(result) }
+    }
+
+    // Note: caller is responsible for freeing via string.deinit()
+    return .{ .ok = string.from_owned(ptr, len), .err = null }
+}
+
+pub fn write_file(path: string, content: string) ?IoError {
+    const result = cot_file_write(path.ptr, path.len, content.ptr, content.len)
+    if (result < 0) return error_from_code(result)
+    return null
 }
 
 pub fn exists(path: string) bool {
-    return cot_file_exists(path.ptr)
+    return cot_file_exists(path.ptr, path.len)
+}
+```
+
+**File:** `std/http.cot`
+
+```cot
+import "std/error"
+
+extern fn cot_http_get(url: *u8, url_len: i64, out: *u8, out_len: i64) i64
+extern fn cot_http_get_alloc(url: *u8, url_len: i64, out_ptr: **u8, out_len: *i64, status: *i32) i64
+
+pub struct Response {
+    status: i32,
+    body: string,
+}
+
+pub struct ResultResponse {
+    ok: ?Response,
+    err: ?IoError,
+}
+
+/// HTTP GET (up to 1MB response)
+pub fn get(url: string) ResultResponse {
+    var buf: [1048576]u8 = undefined
+    const result = cot_http_get(url.ptr, url.len, &buf, 1048576)
+
+    if (result < 0) {
+        return .{ .ok = null, .err = error_from_code(result) }
+    }
+
+    return .{
+        .ok = Response{ .status = 200, .body = string.from_bytes(buf[0..result]) },
+        .err = null
+    }
+}
+
+/// HTTP GET (any size response, runtime allocates)
+pub fn get_alloc(url: string) ResultResponse {
+    var ptr: *u8 = undefined
+    var len: i64 = 0
+    var status: i32 = 0
+    const result = cot_http_get_alloc(url.ptr, url.len, &ptr, &len, &status)
+
+    if (result < 0) {
+        return .{ .ok = null, .err = error_from_code(result) }
+    }
+
+    return .{
+        .ok = Response{ .status = status, .body = string.from_owned(ptr, len) },
+        .err = null
+    }
+}
+
+fn error_from_code(code: i64) IoError {
+    if (code == -5) return .timeout
+    if (code == -7) return .buffer_too_small
+    return .io_error
+}
+```
+
+### Step 4: Compiler Integration
+
+**Auto-linking with opt-out:**
+
+```bash
+# Normal compilation - auto-links runtime
+cot build app.cot -o app
+
+# Disable auto-linking (for debugging or custom runtime)
+cot build app.cot -o app --no-runtime
+
+# Explicit runtime path
+cot build app.cot -o app --runtime=/path/to/libcot_runtime.a
+```
+
+**Implementation in driver.zig:**
+
+```zig
+fn link(self: *Driver, objects: []const []const u8, output: []const u8) !void {
+    var args = std.ArrayList([]const u8).init(self.allocator);
+    defer args.deinit();
+
+    try args.append("cc");
+    for (objects) |obj| {
+        try args.append(obj);
+    }
+
+    // Auto-link runtime unless --no-runtime specified
+    if (!self.options.no_runtime) {
+        const runtime_path = self.options.runtime_path orelse blk: {
+            const cot_home = std.posix.getenv("COT_HOME") orelse "/usr/local/cot";
+            break :blk try std.fmt.allocPrint(
+                self.allocator,
+                "{s}/lib/libcot_runtime.a",
+                .{cot_home}
+            );
+        };
+        try args.append(runtime_path);
+    }
+
+    try args.append("-o");
+    try args.append(output);
+
+    var child = std.process.Child.init(args.items, self.allocator);
+    _ = try child.spawnAndWait();
 }
 ```
 
@@ -556,6 +789,7 @@ cot/
 ├── lib/
 │   └── libcot_runtime.a         # Zig runtime (auto-linked)
 └── std/
+    ├── error.cot                # Common error types
     ├── http.cot                 # HTTP client wrappers
     ├── fs.cot                   # File system wrappers
     ├── json.cot                 # JSON parsing wrappers
@@ -563,58 +797,19 @@ cot/
     └── ...
 ```
 
-### Step 6: Auto-Linking in Compiler
-
-The Cot compiler automatically links `libcot_runtime.a`:
-
-```zig
-// In driver.zig or linker integration
-
-fn link(objects: []const []const u8, output: []const u8) !void {
-    const cot_home = std.posix.getenv("COT_HOME") orelse "/usr/local/cot";
-    const runtime_lib = try std.fmt.allocPrint(
-        allocator,
-        "{s}/lib/libcot_runtime.a",
-        .{cot_home}
-    );
-
-    var args = std.ArrayList([]const u8).init(allocator);
-    try args.append("cc");
-    for (objects) |obj| {
-        try args.append(obj);
-    }
-    try args.append(runtime_lib);
-    try args.append("-o");
-    try args.append(output);
-
-    // Execute linker
-    var child = std.process.Child.init(args.items, allocator);
-    _ = try child.spawnAndWait();
-}
-```
-
-### Best Practices
-
-1. **Keep Zig runtime thin** - Only wrap functionality that truly benefits from Zig's std
-2. **Prefer pure Cot** - If something can be written efficiently in Cot, do it in Cot
-3. **Stable C ABI** - Don't change function signatures after release; add new functions instead
-4. **Error handling** - Return negative values or null for errors; let Cot wrappers handle error types
-5. **Memory ownership** - Document who owns allocated memory (caller vs callee)
-6. **Buffer sizes** - Use explicit buffer sizes, not Zig slices across FFI boundary
-7. **Null termination** - Use `[*:0]const u8` for C-string compatibility where appropriate
-
 ### What Goes in Zig vs Pure Cot
 
 | Category | Zig Runtime | Pure Cot |
 |----------|-------------|----------|
-| HTTP client/server | ✓ (std.http) | Wrappers only |
-| JSON parsing | ✓ (std.json) | Wrappers only |
-| File I/O | ✓ (std.fs) | Wrappers only |
+| HTTP client/server | ✓ (std.http) | Wrappers + Response types |
+| JSON parsing | ✓ (std.json) | Wrappers + typed access |
+| File I/O | ✓ (std.fs) | Wrappers + Result types |
 | Crypto | ✓ (std.crypto) | Wrappers only |
 | Memory allocation | ✓ (allocator) | Uses runtime |
-| String operations | Basic only | Most logic |
-| Data structures | - | ✓ (List, Map, etc.) |
+| String operations | concat only | Most logic (split, trim, etc.) |
+| Data structures | - | ✓ (List, Map, Set, etc.) |
 | Math | - | ✓ (pure computation) |
+| Error types | codes only | ✓ (enums, Result types) |
 | Business logic | - | ✓ (always) |
 
 ### Timeline
@@ -624,9 +819,10 @@ fn link(objects: []const []const u8, output: []const u8) !void {
 | `extern fn` in parser | 0.5 days | - |
 | `extern fn` in type checker | 0.5 days | Parser |
 | External symbol codegen | 0.5 days | Type checker |
-| Auto-link runtime | 0.5 days | Codegen |
-| libcot_runtime.a basics | 2 days | - |
-| std/ Cot wrappers | 2 days | Runtime |
+| Auto-link + --no-runtime | 0.5 days | Codegen |
+| libcot_runtime.a (file, print) | 1 day | - |
+| libcot_runtime.a (http, json, crypto) | 2 days | - |
+| std/ Cot wrappers + Result types | 2 days | Runtime |
 | **Total** | ~1 week | After self-hosting |
 
 ---
