@@ -306,6 +306,22 @@ pub const Checker = struct {
                     false,
                 ));
             },
+            .type_alias => |t| {
+                if (self.scope.isDefined(t.name)) {
+                    self.errRedefined(t.span.start, t.name);
+                    return;
+                }
+                // Resolve the target type
+                const target_type = self.resolveTypeExpr(t.target_type) catch invalid_type;
+                // Define as type name pointing to target type
+                try self.scope.define(Symbol.init(
+                    t.name,
+                    .type_name,
+                    target_type,
+                    idx,
+                    false,
+                ));
+            },
             .bad_decl => {},
         }
     }
@@ -387,6 +403,7 @@ pub const Checker = struct {
             .struct_decl => {}, // Already processed in collectDecl
             .enum_decl => {}, // Already processed in collectDecl
             .union_decl => {}, // Already processed in collectDecl
+            .type_alias => {}, // Already processed in collectDecl
             .bad_decl => {},
         }
     }

@@ -67,9 +67,9 @@ Running with `--debug-codegen` will show warnings for any unhandled SSA operatio
 
 **Test Counts:**
 - 135+ Zig embedded tests (unit tests in source files)
-- 52 binary tests (.cot test files)
+- 53 binary tests (.cot test files)
 
-**Both ARM64 and x86_64** - 52/52 tests pass
+**Both ARM64 and x86_64** - 53/53 tests pass
 
 | Test File | Expected | ARM64 | x86_64 |
 |-----------|----------|-------|--------|
@@ -113,8 +113,9 @@ Running with `--debug-codegen` will show warnings for any unhandled SSA operatio
 | test_minint.cot (@minInt builtin) | 42 | PASS | PASS |
 | test_interpolation.cot (string interpolation) | 42 | PASS | PASS |
 | test_interp_var.cot (interpolation with variables) | 42 | PASS | PASS |
+| test_type_alias.cot (type alias declaration) | 42 | PASS | PASS |
 
-**All tests pass** - conditionals, while loops, string comparisons, switch expressions, slice indexing, for-in loops, tagged unions with payload capture, Map<K,V>, List<T>, value lifetime preservation, methods, @maxInt, @minInt, and string interpolation all working.
+**All tests pass** - conditionals, while loops, string comparisons, switch expressions, slice indexing, for-in loops, tagged unions with payload capture, Map<K,V>, List<T>, value lifetime preservation, methods, @maxInt, @minInt, string interpolation, and type aliases all working.
 
 ### Testing Commands
 

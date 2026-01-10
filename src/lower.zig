@@ -96,6 +96,7 @@ pub const Lowerer = struct {
             .struct_decl => |struct_decl| try self.lowerStructDecl(struct_decl),
             .enum_decl => {}, // Type-only, no codegen needed
             .union_decl => {}, // Type-only, no codegen needed
+            .type_alias => {}, // Type-only, no codegen needed
             .bad_decl => {}, // Skip invalid declarations
         }
     }

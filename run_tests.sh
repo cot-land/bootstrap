@@ -73,6 +73,7 @@ get_expected() {
         test_minint) echo 42 ;;
         test_interpolation) echo 42 ;;
         test_interp_var) echo 42 ;;
+        test_type_alias) echo 42 ;;
         *) echo "" ;;
     esac
 }

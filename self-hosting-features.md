@@ -3,7 +3,7 @@
 This document tracks language features required for self-hosting the cot compiler.
 Features are extracted from the .cot wireframe files in `src/`.
 
-**Last Updated:** 2026-01-11
+**Last Updated:** 2026-01-11 (type aliases implemented)
 
 ## Legend
 
@@ -29,7 +29,7 @@ These features are used extensively in all .cot files and must work first.
 | `void` | Implemented | All | Void type |
 | `var` declarations | Implemented | All | Mutable variables |
 | `const` declarations | Implemented | All | Immutable constants |
-| `type` aliases | **Gap** | ast.cot, types.cot | `type NodeIndex = u32` |
+| `type` aliases | Implemented | ast.cot, types.cot | `type NodeIndex = u32` |
 
 ### Struct Types
 
@@ -220,9 +220,9 @@ These features are used extensively in all .cot files and must work first.
 
 Some features depend on others. Suggested implementation order:
 
-### Tier 1 (Foundation) - Mostly Complete
+### Tier 1 (Foundation) - Complete
 1. ~~`len()` built-in~~ - **Done**
-2. Type aliases (`type X = Y`)
+2. ~~Type aliases (`type X = Y`)~~ - **Done**
 3. ~~`@maxInt(T)` built-in~~ - **Done**
 4. Compound assignment (`+=`, etc.)
 
@@ -353,6 +353,13 @@ The following features were implemented in recent development sessions:
 - **Caller-saved register invalidation**: Properly invalidates registers after runtime function calls (x0-x17 on ARM64, rax/rcx/rdx/rsi/rdi/r8-r11 on x86_64)
 - **Fixes value lifetime bugs**: Values across function calls are correctly reloaded from storage
 
+### Type Aliases - **Implemented**
+- **Syntax**: `type MyInt = i64` creates a transparent alias
+- **Parsing**: Added `kw_type` token and `parseTypeAlias()` in parser
+- **Type checking**: Alias resolved to target type at definition time
+- **Codegen**: No codegen needed - purely a type-system feature
+- **Tests**: `test_type_alias.cot` passes on both platforms
+
 ---
 
 ## Notes
@@ -399,7 +406,12 @@ The switch must work as an expression (returns value) with payload capture.
 7. ~~**String interpolation**~~ - **DONE** (`"Error: {msg}"` syntax)
 8. ~~**@maxInt**~~ - **DONE** (Integer bounds for type checks)
 9. ~~**@minInt**~~ - **DONE** (Integer minimum bounds)
-10. **Type aliases** - `type NodeIndex = u32` syntax
-11. **Import system** - `import "module"` syntax
-12. **Compound assignment** - `+=`, `-=`, etc.
-13. **Optional unwrap** - `.?` and `??` operators
+10. ~~**Type aliases**~~ - **DONE** (`type NodeIndex = u32` syntax)
+11. **Compound assignment** - `+=`, `-=`, etc.
+12. **Optional unwrap** - `.?` and `??` operators
+
+### Post-Bootstrap Features
+
+These features are deferred until after self-hosting is complete:
+
+13. **Import system** - `import "module"` syntax (use file concatenation for bootstrap)

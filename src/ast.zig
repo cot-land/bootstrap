@@ -48,6 +48,7 @@ pub const Decl = union(enum) {
     struct_decl: StructDecl,
     enum_decl: EnumDecl,
     union_decl: UnionDecl,
+    type_alias: TypeAliasDecl,
     // For error recovery
     bad_decl: BadDecl,
 
@@ -59,6 +60,7 @@ pub const Decl = union(enum) {
             .struct_decl => |d| d.span,
             .enum_decl => |d| d.span,
             .union_decl => |d| d.span,
+            .type_alias => |d| d.span,
             .bad_decl => |d| d.span,
         };
     }
@@ -135,6 +137,14 @@ pub const UnionDecl = struct {
 pub const UnionVariant = struct {
     name: []const u8,
     type_expr: ?NodeIndex, // null = no payload (unit variant)
+    span: Span,
+};
+
+/// type Name = TargetType
+/// Type alias declaration - creates a transparent alias (not a distinct type)
+pub const TypeAliasDecl = struct {
+    name: []const u8,
+    target_type: NodeIndex, // the type being aliased
     span: Span,
 };
 

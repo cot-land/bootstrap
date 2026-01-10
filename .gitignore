@@ -40,3 +40,4 @@ test_method
 *.tmp
 /zig-x86_64-linux-0.15.2
 test_minint
+test_type_alias

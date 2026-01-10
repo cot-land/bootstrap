@@ -176,6 +176,7 @@ pub const Parser = struct {
             .kw_struct => try self.parseStructDecl(),
             .kw_enum => try self.parseEnumDecl(),
             .kw_union => try self.parseUnionDecl(),
+            .kw_type => try self.parseTypeAlias(),
             else => {
                 self.syntaxError("expected declaration");
                 return null;
@@ -442,6 +443,43 @@ pub const Parser = struct {
                 .union_decl = .{
                     .name = name,
                     .variants = try self.allocator.dupe(ast.UnionVariant, variants.items),
+                    .span = Span.init(start, self.tok.span.start),
+                },
+            },
+        });
+    }
+
+    /// Parse type alias declaration: type Name = TargetType
+    fn parseTypeAlias(self: *Parser) !?NodeIndex {
+        const start = self.pos();
+        self.advance(); // consume 'type'
+
+        // Type alias name (must be identifier)
+        if (!self.check(.identifier)) {
+            self.err.errorWithCode(self.pos(), .E203, "expected type alias name");
+            return null;
+        }
+        const name = self.tok.text;
+        self.advance();
+
+        // Equals sign
+        if (!self.expect(.equal)) {
+            self.syntaxError("expected '=' after type alias name");
+            return null;
+        }
+
+        // Target type expression
+        const target_type = try self.parseType();
+        if (target_type == null) {
+            self.syntaxError("expected type after '='");
+            return null;
+        }
+
+        return try self.ast.addNode(.{
+            .decl = .{
+                .type_alias = .{
+                    .name = name,
+                    .target_type = target_type.?,
                     .span = Span.init(start, self.tok.span.start),
                 },
             },
