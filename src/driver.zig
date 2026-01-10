@@ -785,6 +785,26 @@ pub const Driver = struct {
             return value_id;
         }
 
+        // Handle slice_index - slice element access
+        // args[0] = slice local index (raw), args[1] = index value (SSA ref), aux = elem_size
+        if (node.op == .slice_index) {
+            const value_id = try func.newValue(.slice_index, node.type_idx, block);
+            var value = func.getValue(value_id);
+            // args[0] is raw slice local index
+            if (node.args_len > 0) {
+                value.args_storage[0] = node.args()[0];  // slice local index (raw)
+            }
+            // args[1] is IR node ID for index that needs SSA conversion
+            if (node.args_len > 1) {
+                if (ir_to_ssa.get(node.args()[1])) |ssa_val| {
+                    value.args_storage[1] = ssa_val;  // index value (SSA ref)
+                }
+            }
+            value.args_len = 2;
+            value.aux_int = node.aux;  // element size
+            return value_id;
+        }
+
         // Handle store - args[0] = local index (raw), args[1] = value (SSA ref)
         if (node.op == .store) {
             const value_id = try func.newValue(.store, node.type_idx, block);
@@ -1486,6 +1506,53 @@ pub const Driver = struct {
                     try x86_64.subRegReg(buf, .rdx, .r9);
                 }
             },
+            .slice_index => {
+                // Slice indexing: load ptr from slice, compute ptr + index*elem_size, load value
+                // args[0] = slice local index (raw), args[1] = index value (SSA ref)
+                // aux_int = element size
+                // Result: rax = value at slice[index]
+                const args = value.args();
+                if (args.len >= 2) {
+                    const local_idx = args[0];
+                    const idx_val_id = args[1];
+                    const idx_val = func.getValue(idx_val_id);
+                    const elem_size: i64 = value.aux_int;
+
+                    // Get slice's stack offset (slice is ptr+len, 16 bytes)
+                    const local_offset: i32 = func.locals[@intCast(local_idx)].offset;
+
+                    // Load slice ptr (first 8 bytes) into rax
+                    try x86_64.movRegMem(buf, .rax, .rbp, local_offset);
+
+                    // Get index value into r9
+                    if (idx_val.op == .const_int) {
+                        try x86_64.movRegImm64(buf, .r9, idx_val.aux_int);
+                    } else if (idx_val.op == .arg) {
+                        const idx: u32 = @intCast(idx_val.aux_int);
+                        if (idx < arg_regs.len) {
+                            try x86_64.movRegReg(buf, .r9, arg_regs[idx]);
+                        }
+                    } else if (idx_val.op == .load) {
+                        const idx_local: usize = @intCast(idx_val.aux_int);
+                        const idx_offset: i32 = func.locals[idx_local].offset;
+                        try x86_64.movRegMem(buf, .r9, .rbp, idx_offset);
+                    } else {
+                        // Assume index is in rax, save ptr first
+                        try x86_64.movRegReg(buf, .r10, .rax);
+                        try x86_64.movRegMem(buf, .rax, .rbp, local_offset);
+                        try x86_64.movRegReg(buf, .r9, .r10);
+                    }
+
+                    // Multiply index by element size: imul r9, r9, elem_size
+                    try x86_64.imulRegRegImm(buf, .r9, .r9, @intCast(elem_size));
+
+                    // Add to ptr: add rax, r9
+                    try x86_64.addRegReg(buf, .rax, .r9);
+
+                    // Load value from computed address: mov rax, [rax]
+                    try x86_64.movRegMem(buf, .rax, .rax, 0);
+                }
+            },
             .store => {
                 // Store value to local at optional field offset
                 // args[0] = local index, args[1] = value, aux_int = field offset
@@ -1516,7 +1583,8 @@ pub const Driver = struct {
                                 try x86_64.movRegReg(buf, .r8, arg_regs[idx]);
                             }
                         } else if (val.op == .add or val.op == .sub or val.op == .mul or val.op == .div or
-                            val.op == .load or val.op == .call or val.op == .field or val.op == .index)
+                            val.op == .load or val.op == .call or val.op == .field or val.op == .index or
+                            val.op == .slice_index)
                         {
                             // Operations that leave result in rax - store directly
                             use_rax_directly = true;
@@ -1962,7 +2030,8 @@ pub const Driver = struct {
                                 try aarch64.movRegReg(buf, .x8, arg_regs[idx]);
                             }
                         } else if (val.op == .add or val.op == .sub or val.op == .mul or val.op == .div or
-                            val.op == .load or val.op == .call or val.op == .field or val.op == .index)
+                            val.op == .load or val.op == .call or val.op == .field or val.op == .index or
+                            val.op == .slice_index)
                         {
                             // Operations that leave result in x0 - store directly
                             use_x0_directly = true;
@@ -2098,6 +2167,60 @@ pub const Driver = struct {
                     try aarch64.mulRegReg(buf, .x11, .x9, .x11);
                     // Then: x0 = base + x11
                     try aarch64.addRegReg(buf, .x0, .x8, .x11);
+                }
+            },
+            .slice_index => {
+                // Slice indexing: load ptr from slice, compute ptr + index*elem_size, load value
+                // args[0] = slice local index (raw), args[1] = index value (SSA ref)
+                // aux_int = element size
+                // Result: x0 = value at slice[index]
+                const args = value.args();
+                if (args.len >= 2) {
+                    const local_idx = args[0];
+                    const idx_val_id = args[1];
+                    const idx_val = func.getValue(idx_val_id);
+                    const elem_size: i64 = value.aux_int;
+
+                    // Get slice's stack offset (convert x86 negative to ARM64 positive)
+                    const x86_offset: i32 = func.locals[@intCast(local_idx)].offset;
+                    const local_offset: i32 = @as(i32, @intCast(func.frame_size)) + x86_offset;
+
+                    // Load slice ptr (first 8 bytes) into x8
+                    if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
+                        const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
+                        try aarch64.ldrRegImm(buf, .x8, .sp, offset_scaled);
+                    }
+
+                    // Get index value into x9
+                    if (idx_val.op == .const_int) {
+                        try aarch64.movRegImm64(buf, .x9, idx_val.aux_int);
+                    } else if (idx_val.op == .arg) {
+                        const idx: u32 = @intCast(idx_val.aux_int);
+                        if (idx < arg_regs.len) {
+                            try aarch64.movRegReg(buf, .x9, arg_regs[idx]);
+                        }
+                    } else if (idx_val.op == .load) {
+                        const idx_local: usize = @intCast(idx_val.aux_int);
+                        const idx_x86_offset: i32 = func.locals[idx_local].offset;
+                        const idx_sp_offset: i32 = @as(i32, @intCast(func.frame_size)) + idx_x86_offset;
+                        if (idx_sp_offset >= 0 and @mod(idx_sp_offset, 8) == 0) {
+                            const idx_scaled: u12 = @intCast(@divExact(idx_sp_offset, 8));
+                            try aarch64.ldrRegImm(buf, .x9, .sp, idx_scaled);
+                        }
+                    } else {
+                        // Assume result is in x0 from previous computation
+                        try aarch64.movRegReg(buf, .x9, .x0);
+                    }
+
+                    // Multiply index by element size: x9 = x9 * elem_size
+                    try aarch64.movRegImm64(buf, .x10, elem_size);
+                    try aarch64.mulRegReg(buf, .x9, .x9, .x10);
+
+                    // Add to ptr: x8 = x8 + x9
+                    try aarch64.addRegReg(buf, .x8, .x8, .x9);
+
+                    // Load value from [x8]: ldr x0, [x8, #0]
+                    try aarch64.ldrRegImm(buf, .x0, .x8, 0);
                 }
             },
             else => {

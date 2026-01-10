@@ -895,7 +895,7 @@ pub const Lowerer = struct {
             if (fb.lookupLocal(ident.name)) |local_idx| {
                 const local = fb.locals.items[local_idx];
 
-                // Check if local is an array type
+                // Check if local is an array or slice type
                 const local_type = self.type_reg.get(local.type_idx);
                 if (local_type == .array) {
                     const arr = local_type.array;
@@ -927,6 +927,21 @@ pub const Lowerer = struct {
                         .withAux(@intCast(elem_size));
                     log.debug("  array index (dynamic): elem_size={d}", .{elem_size});
                     return try fb.emit(addr_node);
+                } else if (local_type == .slice) {
+                    // Slice indexing: slice is ptr+len at local, need to load ptr, then index
+                    const slice_type = local_type.slice;
+                    const elem_size: u32 = self.type_reg.sizeOf(slice_type.elem);
+
+                    // Lower the index expression
+                    const idx_node = try self.lowerExpr(index.index);
+
+                    // Emit slice_index op
+                    // args[0] = slice local index, args[1] = index value, aux = elem_size
+                    const slice_idx_node = ir.Node.init(.slice_index, slice_type.elem, Span.fromPos(Pos.zero))
+                        .withArgs(&.{ @intCast(local_idx), idx_node })
+                        .withAux(@intCast(elem_size));
+                    log.debug("  slice index: local={d}, elem_size={d}", .{ local_idx, elem_size });
+                    return try fb.emit(slice_idx_node);
                 }
             }
         }

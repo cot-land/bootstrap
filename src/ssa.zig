@@ -106,6 +106,11 @@ pub const Op = enum(u8) {
     // aux_int = element size
     slice_make,
 
+    // Slice indexing
+    // args[0] = slice local index (raw), args[1] = index value (SSA ref)
+    // aux_int = element size
+    slice_index,
+
     // Function
     call,
     arg,

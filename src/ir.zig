@@ -128,6 +128,8 @@ pub const Op = enum(u8) {
     index,
     /// Slice operation. args[0] = array, args[1] = start, args[2] = end
     slice,
+    /// Index into slice. args[0] = slice local, args[1] = index. aux = elem_size
+    slice_index,
 
     // ========== Control Flow ==========
     /// Function call. args[0] = func, args[1..] = arguments

@@ -50,6 +50,7 @@ get_expected() {
         test_slice) echo 42 ;;
         test_slice_len) echo 3 ;;
         test_slice_len2) echo 3 ;;
+        test_slice_index) echo 30 ;;
         test_sub) echo 42 ;;
         test_mul) echo 42 ;;
         test_div) echo 42 ;;

@@ -37,7 +37,7 @@ Build a complete compiler in Zig that can compile simple cot programs.
 - [x] Dynamic array indexing (runtime index) - ARM64 working, x86_64 has stack layout issues with large arrays
 - [x] Slice support (compile-time) - arr[i:j] syntax, len() constant folding
 - [x] Slice support (runtime) - ptr+len storage (16 bytes), len() on slice variables
-- [ ] Slice indexing (runtime) - s[i] access
+- [x] Slice indexing (runtime) - s[i] access
 - [ ] Standard library basics (print, memory)
 
 **Automated Test Runner**
@@ -57,7 +57,7 @@ Running with `--debug-codegen` will show warnings for any unhandled SSA operatio
 
 ### Verified Test Results (January 2026)
 
-**Both ARM64 and x86_64** - 22/32 tests pass
+**Both ARM64 and x86_64** - 33/33 tests pass
 
 | Test File | Expected | ARM64 | x86_64 |
 |-----------|----------|-------|--------|
@@ -84,10 +84,7 @@ Running with `--debug-codegen` will show warnings for any unhandled SSA operatio
 | test_mul.cot (6 * 7) | 42 | PASS | PASS |
 | test_div.cot (84 / 2) | 42 | PASS | PASS |
 
-**Compile Failures (10 tests - missing compiler features)**
-- test_if*.cot, test_ne.cot, test_nested_if.cot - conditionals not implemented
-- test_while*.cot - while loops not implemented
-- test_streq*.cot, test_strne.cot - string comparison not implemented
+**All tests pass** - conditionals, while loops, and string comparisons now working.
 
 ### Testing Commands
 
