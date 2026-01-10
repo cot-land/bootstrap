@@ -295,7 +295,7 @@ The following features were implemented in recent development sessions:
 ### Codegen
 - **ARM64 (macOS)**: Full Mach-O object file generation with relocations
 - **x86_64 (Linux)**: Full ELF object file generation with relocations
-- 57 tests passing on both architectures
+- 58 tests passing on both architectures
 
 ### Tagged Unions - **Complete**
 - **Union definition**: Parsing `union Name { variant: Type, ... }` syntax
@@ -405,7 +405,7 @@ The wireframes use `List<T>` and `Map<K,V>` extensively:
 
 **List Progress**: Complete. Native 24-byte header layout with heap allocation via `calloc`. Automatic capacity growth in push. Method syntax (`.push()`, `.get()`) works. Scratch slot mechanism for intermediate results in multi-operation expressions.
 
-**Both Map and List**: 57 tests pass on ARM64 and x86_64. User-defined generics are NOT needed for bootstrap (per spec.md).
+**Both Map and List**: 58 tests pass on ARM64 and x86_64. User-defined generics are NOT needed for bootstrap (per spec.md).
 
 ### Switch Expressions are Everywhere
 

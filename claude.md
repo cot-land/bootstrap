@@ -285,7 +285,7 @@ docker run --platform linux/amd64 -v $(pwd):/cot -w /cot cot-zig:0.15.2 ./run_te
 
 **Current test counts:**
 - 135+ Zig embedded tests (unit tests in source files)
-- 57 binary tests (.cot test files)
+- 58 binary tests (.cot test files)
 
 ### Exhaustive Switches for New Features
 
