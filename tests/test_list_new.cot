@@ -1,0 +1,7 @@
+// Test List<T> creation
+fn main() i64 {
+    var list = new List<i64>();
+    // If list_new works, we get a non-zero pointer from calloc
+    // Return 42 as success indicator (can't check pointer directly)
+    return 42;
+}

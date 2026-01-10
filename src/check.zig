@@ -899,6 +899,34 @@ pub const Checker = struct {
                 self.errUndefined(f.span.start, f.field);
                 return invalid_type;
             },
+            .list_type => |lt| {
+                // List method access: list.push, list.get, list.len
+                if (std.mem.eql(u8, f.field, "push")) {
+                    // push(value) returns void
+                    const params = try self.allocator.alloc(types.FuncParam, 1);
+                    params[0] = .{ .name = "value", .type_idx = lt.elem };
+                    return try self.types.add(.{ .func = .{
+                        .params = params,
+                        .return_type = TypeRegistry.VOID,
+                    } });
+                } else if (std.mem.eql(u8, f.field, "get")) {
+                    // get(index) returns element type
+                    const params = try self.allocator.alloc(types.FuncParam, 1);
+                    params[0] = .{ .name = "index", .type_idx = TypeRegistry.INT };
+                    return try self.types.add(.{ .func = .{
+                        .params = params,
+                        .return_type = lt.elem,
+                    } });
+                } else if (std.mem.eql(u8, f.field, "len")) {
+                    // len() returns int
+                    return try self.types.add(.{ .func = .{
+                        .params = &.{},
+                        .return_type = TypeRegistry.INT,
+                    } });
+                }
+                self.errUndefined(f.span.start, f.field);
+                return invalid_type;
+            },
             else => {
                 self.err.errorWithCode(f.span.start, .E303, "cannot access field on this type");
                 return invalid_type;

@@ -789,9 +789,10 @@ pub const Lowerer = struct {
                         return try fb.emit(node);
                     },
                     .list => {
-                        // TODO: new List<T>() -> emit list_new
-                        const node = ir.Node.init(.const_int, TypeRegistry.INT, ne.span)
-                            .withAux(0);
+                        // new List<T>() -> emit list_new
+                        // Returns a pointer/handle to the list
+                        const node = ir.Node.init(.list_new, TypeRegistry.INT, ne.span);
+                        log.debug("  list_new", .{});
                         return try fb.emit(node);
                     },
                     else => {},
@@ -1015,6 +1016,9 @@ pub const Lowerer = struct {
                             if (local_type == .map_type) {
                                 log.debug("  map method call: {s}.{s}", .{ var_name, fa.field });
                                 return self.lowerMapMethodCall(call, fa.field, @intCast(local_idx));
+                            } else if (local_type == .list_type) {
+                                log.debug("  list method call: {s}.{s}", .{ var_name, fa.field });
+                                return self.lowerListMethodCall(call, fa.field, @intCast(local_idx));
                             }
                         }
                     }
@@ -1384,6 +1388,64 @@ pub const Lowerer = struct {
             return try fb.emit(node);
         } else {
             log.debug("  unknown map method: {s}", .{method_name});
+            return ir.null_node;
+        }
+    }
+
+    /// Lower List method calls: list.push(v), list.get(i), list.len()
+    fn lowerListMethodCall(
+        self: *Lowerer,
+        call: ast.Call,
+        method_name: []const u8,
+        local_idx: u32,
+    ) Allocator.Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+
+        // Load the list handle
+        const list_handle = try fb.emitLocalLoad(local_idx, TypeRegistry.INT, Span.fromPos(Pos.zero));
+
+        if (std.mem.eql(u8, method_name, "push")) {
+            // list.push(value) -> list_push(handle, value)
+            if (call.args.len != 1) {
+                log.debug("  list.push() expects 1 argument, got {d}", .{call.args.len});
+                return ir.null_node;
+            }
+
+            const value_node = try self.lowerExpr(call.args[0]);
+
+            const node = ir.Node.init(.list_push, TypeRegistry.VOID, Span.fromPos(Pos.zero))
+                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ list_handle, value_node }));
+
+            log.debug("  list.push() -> list_push IR op", .{});
+            return try fb.emit(node);
+        } else if (std.mem.eql(u8, method_name, "get")) {
+            // list.get(index) -> list_get(handle, index)
+            if (call.args.len != 1) {
+                log.debug("  list.get() expects 1 argument, got {d}", .{call.args.len});
+                return ir.null_node;
+            }
+
+            const index_node = try self.lowerExpr(call.args[0]);
+
+            const node = ir.Node.init(.list_get, TypeRegistry.INT, Span.fromPos(Pos.zero))
+                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ list_handle, index_node }));
+
+            log.debug("  list.get() -> list_get IR op", .{});
+            return try fb.emit(node);
+        } else if (std.mem.eql(u8, method_name, "len")) {
+            // list.len() -> list_len(handle)
+            if (call.args.len != 0) {
+                log.debug("  list.len() expects 0 arguments, got {d}", .{call.args.len});
+                return ir.null_node;
+            }
+
+            const node = ir.Node.init(.list_len, TypeRegistry.INT, Span.fromPos(Pos.zero))
+                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{list_handle}));
+
+            log.debug("  list.len() -> list_len IR op", .{});
+            return try fb.emit(node);
+        } else {
+            log.debug("  unknown list method: {s}", .{method_name});
             return ir.null_node;
         }
     }

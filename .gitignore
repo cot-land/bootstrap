@@ -12,6 +12,15 @@ ignored
 test_slice
 test_slice_len
 test_slice_len2
+map_test
+simple_test
+test_enum_from_int_out
+test_enum_out
+test_exe
+test_map
+test_ret
+test_union
+test_union_exec
 
 # Editor/IDE
 *.swp
@@ -25,3 +34,4 @@ test_slice_len2
 
 # Temporary test artifacts
 *.tmp
+/zig-x86_64-linux-0.15.2

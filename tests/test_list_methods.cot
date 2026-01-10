@@ -1,0 +1,9 @@
+// Test List<T> push and get methods
+fn main() i64 {
+    var list = new List<i64>();
+    list.push(10);
+    list.push(20);
+    list.push(12);
+    // Return sum of all elements: 10 + 20 + 12 = 42
+    return list.get(0) + list.get(1) + list.get(2);
+}

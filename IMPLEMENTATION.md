@@ -67,9 +67,9 @@ Running with `--debug-codegen` will show warnings for any unhandled SSA operatio
 
 **Test Counts:**
 - 135+ Zig embedded tests (unit tests in source files)
-- 41 binary tests (.cot test files)
+- 47 binary tests (.cot test files)
 
-**Both ARM64 and x86_64** - 41/41 tests pass (41 + 1 skip)
+**Both ARM64 and x86_64** - 47/47 tests pass
 
 | Test File | Expected | ARM64 | x86_64 |
 |-----------|----------|-------|--------|
@@ -102,8 +102,14 @@ Running with `--debug-codegen` will show warnings for any unhandled SSA operatio
 | test_for_slice.cot (for x in slice) | 90 | PASS | PASS |
 | test_union.cot (union construction) | 42 | PASS | PASS |
 | test_union_switch.cot (switch with payload capture) | 42 | PASS | PASS |
+| test_map_new.cot (map allocation) | 42 | PASS | PASS |
+| test_map_methods.cot (map set/get/has) | 42 | PASS | PASS |
+| test_list_new.cot (list allocation) | 42 | PASS | PASS |
+| test_list_simple.cot (list push/get) | 42 | PASS | PASS |
+| test_list_methods.cot (list operations) | 42 | PASS | PASS |
+| test_value_lifetime.cot (intermediate value preservation) | 42 | PASS | PASS |
 
-**All tests pass** - conditionals, while loops, string comparisons, switch expressions, slice indexing, for-in loops, and tagged unions with payload capture now working.
+**All tests pass** - conditionals, while loops, string comparisons, switch expressions, slice indexing, for-in loops, tagged unions with payload capture, Map<K,V>, List<T>, and value lifetime preservation all working.
 
 ### Testing Commands
 

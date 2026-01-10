@@ -151,6 +151,18 @@ pub const Op = enum(u8) {
     /// Free map. args[0] = handle
     map_free,
 
+    // ========== List Operations (native layout + FFI) ==========
+    /// Create new list. Returns handle pointer.
+    list_new,
+    /// Push element. args[0] = handle, args[1] = value
+    list_push,
+    /// Get element by index. args[0] = handle, args[1] = index
+    list_get,
+    /// Get list length. args[0] = handle
+    list_len,
+    /// Free list. args[0] = handle
+    list_free,
+
     // ========== Control Flow ==========
     /// Function call. args[0] = func, args[1..] = arguments
     call,
@@ -187,6 +199,8 @@ pub const Op = enum(u8) {
             .store, .call, .ret, .jump, .branch => true,
             // Map operations modify heap state
             .map_new, .map_set, .map_free => true,
+            // List operations modify heap state
+            .list_new, .list_push, .list_free => true,
             else => false,
         };
     }

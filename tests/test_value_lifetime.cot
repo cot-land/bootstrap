@@ -1,0 +1,40 @@
+// Test that intermediate values aren't clobbered across multiple operations
+// This is a stress test for value lifetime management in codegen
+// Pattern: multiple value-producing operations combined in expressions
+
+fn get_ten() i64 {
+    return 10;
+}
+
+fn get_twenty() i64 {
+    return 20;
+}
+
+fn get_twelve() i64 {
+    return 12;
+}
+
+fn main() i64 {
+    // Pattern 1: Multiple function calls combined
+    // Each call produces a value that must survive until the add
+    var sum1 = get_ten() + get_twenty() + get_twelve();
+
+    // Pattern 2: Nested expressions with multiple temps
+    var sum2 = (get_ten() + get_twenty()) + get_twelve();
+
+    // Pattern 3: Mixed with constants
+    var sum3 = get_ten() + 20 + get_twelve();
+
+    // All three should equal 42
+    if sum1 != 42 {
+        return 1;
+    }
+    if sum2 != 42 {
+        return 2;
+    }
+    if sum3 != 42 {
+        return 3;
+    }
+
+    return 42;
+}

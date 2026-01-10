@@ -137,6 +137,18 @@ pub const Op = enum(u8) {
     // Free map. args[0] = handle
     map_free,
 
+    // List operations (native layout + FFI helpers)
+    // Create new list. Returns pointer to header.
+    list_new,
+    // Push element. args[0] = handle, args[1] = value
+    list_push,
+    // Get element by index. args[0] = handle, args[1] = index
+    list_get,
+    // Get list length. args[0] = handle
+    list_len,
+    // Free list. args[0] = handle
+    list_free,
+
     // Function
     call,
     arg,

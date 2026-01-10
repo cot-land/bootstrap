@@ -88,6 +88,101 @@ pub const FrameLayout = struct {
 };
 
 // ============================================================================
+// Storage Manager - Tracks where each SSA value is stored
+// ============================================================================
+//
+// This replaces ad-hoc scratch slot handling with systematic value tracking.
+// Every value-producing operation gets a stack slot allocated automatically.
+// When a value is needed as an operand, we load from its assigned slot.
+//
+// Benefits:
+// - No more forgetting to handle new value-producing ops
+// - Prevents value clobbering across function calls
+// - Serves as blueprint for self-hosted cot compiler
+//
+// Design inspired by Roc's storage.rs pattern.
+//
+pub const StorageManager = struct {
+    // Maps value_id -> stack offset (negative offset from rbp for x86_64)
+    value_storage: std.AutoHashMap(u32, i32),
+    // Next available scratch slot offset (grows more negative)
+    // Starts at -0x80 to leave room for locals above
+    next_slot: i32,
+    // Allocator for the hash map
+    allocator: std.mem.Allocator,
+
+    // Scratch area starts at -0x80 from rbp (leaves 128 bytes for locals)
+    pub const SCRATCH_BASE: i32 = -0x80;
+    // Each slot is 8 bytes
+    pub const SLOT_SIZE: i32 = 8;
+
+    pub fn init(allocator: std.mem.Allocator) StorageManager {
+        return .{
+            .value_storage = std.AutoHashMap(u32, i32).init(allocator),
+            .next_slot = SCRATCH_BASE,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *StorageManager) void {
+        self.value_storage.deinit();
+    }
+
+    /// Reset for a new function
+    pub fn reset(self: *StorageManager) void {
+        self.value_storage.clearRetainingCapacity();
+        self.next_slot = SCRATCH_BASE;
+    }
+
+    /// Allocate storage for a value. Returns the stack offset.
+    /// Idempotent - if already allocated, returns existing slot.
+    pub fn allocate(self: *StorageManager, value_id: u32) !i32 {
+        if (self.value_storage.get(value_id)) |existing| {
+            return existing;
+        }
+        const slot = self.next_slot;
+        self.next_slot -= SLOT_SIZE;
+        try self.value_storage.put(value_id, slot);
+        return slot;
+    }
+
+    /// Get storage for a value. Returns null if not allocated.
+    pub fn get(self: *const StorageManager, value_id: u32) ?i32 {
+        return self.value_storage.get(value_id);
+    }
+
+    /// Check if a value has storage allocated
+    pub fn has(self: *const StorageManager, value_id: u32) bool {
+        return self.value_storage.contains(value_id);
+    }
+
+    /// Get the minimum stack size needed for scratch slots
+    /// (positive value, represents how far below rbp we go)
+    pub fn requiredStackSize(self: *const StorageManager) u32 {
+        // next_slot is negative, e.g., -0x100 means we need 0x100 bytes
+        const used = SCRATCH_BASE - self.next_slot;
+        // Add base offset (0x80) plus some padding
+        return @intCast(@max(128, @as(u32, @intCast(-SCRATCH_BASE)) + @as(u32, @intCast(used))));
+    }
+
+    /// Convert x86_64 offset to AArch64 sp-relative offset
+    /// For scratch slots: offset is negative, we convert to positive sp-relative
+    /// Scratch slots are placed AFTER locals to avoid overlap
+    pub fn aarch64Offset(self: *const StorageManager, x86_offset: i32, frame_size: u32) u12 {
+        _ = self;
+        // x86 offset: -0x80 - index * 8
+        // So index = (SCRATCH_BASE - x86_offset) / SLOT_SIZE
+        const index: i32 = @divExact(SCRATCH_BASE - x86_offset, SLOT_SIZE);
+
+        // AArch64 layout: [sp+0]=fp, [sp+8]=lr, [sp+16..frame_size+16]=locals
+        // Put scratch AFTER locals to avoid overlap
+        // base = (frame_size / 8) + 2 (2 = 16 bytes for saved fp/lr, divided by 8)
+        const base: u12 = @intCast(@divExact(@as(i32, @intCast(frame_size)), 8) + 2);
+        return base + @as(u12, @intCast(index));
+    }
+};
+
+// ============================================================================
 // Compilation Options (Zig pattern: single config struct)
 // ============================================================================
 
@@ -230,14 +325,21 @@ pub const Driver = struct {
     err_reporter: ?*errors.ErrorReporter = null,
     current_phase: Phase = .read,
 
+    // Value storage tracking for codegen (prevents value clobbering)
+    storage: StorageManager,
+
     pub fn init(allocator: Allocator, options: CompileOptions) Driver {
         return .{
             .allocator = allocator,
             .options = options,
+            .storage = StorageManager.init(allocator),
         };
     }
 
     pub fn deinit(self: *Driver) void {
+        // Clean up storage manager
+        self.storage.deinit();
+
         if (self.src) |s| {
             s.deinit();
             self.allocator.destroy(s);
@@ -1018,6 +1120,72 @@ pub const Driver = struct {
             return value_id;
         }
 
+        // Handle list_new - no args, creates new list
+        if (node.op == .list_new) {
+            const value_id = try func.newValue(.list_new, node.type_idx, block);
+            return value_id;
+        }
+
+        // Handle list_push - args[0]=handle, args[1]=value
+        if (node.op == .list_push) {
+            const value_id = try func.newValue(.list_push, node.type_idx, block);
+            var value = func.getValue(value_id);
+            var arg_count: u8 = 0;
+            for (node.args()) |ir_arg_idx| {
+                if (ir_to_ssa.get(ir_arg_idx)) |ssa_arg_id| {
+                    if (arg_count < 2) {
+                        value.args_storage[arg_count] = ssa_arg_id;
+                        arg_count += 1;
+                    }
+                }
+            }
+            value.args_len = arg_count;
+            return value_id;
+        }
+
+        // Handle list_get - args[0]=handle, args[1]=index
+        if (node.op == .list_get) {
+            const value_id = try func.newValue(.list_get, node.type_idx, block);
+            var value = func.getValue(value_id);
+            var arg_count: u8 = 0;
+            for (node.args()) |ir_arg_idx| {
+                if (ir_to_ssa.get(ir_arg_idx)) |ssa_arg_id| {
+                    if (arg_count < 2) {
+                        value.args_storage[arg_count] = ssa_arg_id;
+                        arg_count += 1;
+                    }
+                }
+            }
+            value.args_len = arg_count;
+            return value_id;
+        }
+
+        // Handle list_len - args[0]=handle
+        if (node.op == .list_len) {
+            const value_id = try func.newValue(.list_len, node.type_idx, block);
+            var value = func.getValue(value_id);
+            if (node.args_len > 0) {
+                if (ir_to_ssa.get(node.args()[0])) |ssa_val| {
+                    value.args_storage[0] = ssa_val;
+                    value.args_len = 1;
+                }
+            }
+            return value_id;
+        }
+
+        // Handle list_free - args[0]=handle
+        if (node.op == .list_free) {
+            const value_id = try func.newValue(.list_free, node.type_idx, block);
+            var value = func.getValue(value_id);
+            if (node.args_len > 0) {
+                if (ir_to_ssa.get(node.args()[0])) |ssa_val| {
+                    value.args_storage[0] = ssa_val;
+                    value.args_len = 1;
+                }
+            }
+            return value_id;
+        }
+
         // Convert IR op to SSA op
         const ssa_op: ssa.Op = switch (node.op) {
             .const_int => .const_int,
@@ -1058,6 +1226,12 @@ pub const Driver = struct {
             .map_has => .map_has,
             .map_size => .map_size,
             .map_free => .map_free,
+            // List operations (pass through to SSA)
+            .list_new => .list_new,
+            .list_push => .list_push,
+            .list_get => .list_get,
+            .list_len => .list_len,
+            .list_free => .list_free,
             else => .copy, // Default fallback
         };
 
@@ -1225,6 +1399,9 @@ pub const Driver = struct {
                 defer backend.deinit();
 
                 for (ssa_funcs.items) |*func| {
+                    // Reset storage manager for this function
+                    self.storage.reset();
+
                     const sym_offset = code_buf.pos();
 
                     // macOS requires underscore prefix for C symbols
@@ -1245,8 +1422,9 @@ pub const Driver = struct {
                     // Emit function prologue: push rbp; mov rbp, rsp; sub rsp, frame_size
                     try x86_64.pushReg(&code_buf, .rbp);
                     try x86_64.movRegReg(&code_buf, .rbp, .rsp);
-                    // Reserve stack space using computed frame size (or minimum 16)
-                    const stack_size: i32 = @intCast(@max(16, func.frame_size));
+                    // Reserve stack space using computed frame size (or minimum 512)
+                    // Increased minimum to provide scratch space for intermediate results
+                    const stack_size: i32 = @intCast(@max(512, func.frame_size));
                     try x86_64.subRegImm32(&code_buf, .rsp, stack_size);
 
                     // Track branch positions for patching
@@ -1324,6 +1502,9 @@ pub const Driver = struct {
                 defer backend.deinit();
 
                 for (ssa_funcs.items) |*func| {
+                    // Reset storage manager for this function
+                    self.storage.reset();
+
                     const sym_offset = code_buf.pos();
 
                     // macOS requires underscore prefix for C symbols
@@ -1346,15 +1527,17 @@ pub const Driver = struct {
                     for (func.values.items) |value| {
                         if (value.op == .call or value.op == .map_new or value.op == .map_set or
                             value.op == .map_get or value.op == .map_has or value.op == .map_size or
-                            value.op == .map_free)
+                            value.op == .map_free or value.op == .list_new or value.op == .list_push or
+                            value.op == .list_get or value.op == .list_free)
                         {
                             has_calls = true;
                             break;
                         }
                     }
 
-                    // Calculate stack size using computed frame size (or minimum 32)
-                    const stack_size: u32 = @intCast(@max(32, func.frame_size));
+                    // Calculate stack size using computed frame size (or minimum 128)
+                    // Increased minimum to provide scratch space for intermediate results
+                    const stack_size: u32 = @intCast(@max(128, func.frame_size));
 
                     // Prologue: allocate stack space for locals
                     // sub sp, sp, #stack_size
@@ -1471,7 +1654,7 @@ pub const Driver = struct {
         return try self.allocator.dupe(u8, path);
     }
 
-    fn generateX86Value(self: *Driver, buf: *be.CodeBuffer, func: *ssa.Func, value: ssa.Value) !void {
+    fn generateX86Value(self: *Driver, buf: *be.CodeBuffer, func: *ssa.Func, value: ssa.Value, value_idx: u32) !void {
         // System V AMD64 ABI argument registers
         const arg_regs = [_]x86_64.Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
 
@@ -1497,9 +1680,15 @@ pub const Driver = struct {
                 if (args.len >= 2) {
                     const left = func.getValue(args[0]);
                     const right = func.getValue(args[1]);
+                    const left_idx = args[0];
+                    const right_idx = args[1];
 
                     // Generate code for left operand -> rax
-                    if (left.op == .arg) {
+                    // Use storage manager to check if value has a saved location
+                    if (self.storage.get(left_idx)) |slot| {
+                        // Value was saved to storage slot - load from there
+                        try x86_64.movRegMem(buf, .rax, .rbp, slot);
+                    } else if (left.op == .arg) {
                         const param_idx: u32 = @intCast(left.aux_int);
                         if (param_idx < arg_regs.len) {
                             try x86_64.movRegReg(buf, .rax, arg_regs[param_idx]);
@@ -1514,7 +1703,12 @@ pub const Driver = struct {
                     }
 
                     // Generate code for right operand, then add
-                    if (right.op == .const_int) {
+                    // Use storage manager to check if value has a saved location
+                    if (self.storage.get(right_idx)) |slot| {
+                        // Value was saved to storage slot - load into r9 and add
+                        try x86_64.movRegMem(buf, .r9, .rbp, slot);
+                        try x86_64.addRegReg(buf, .rax, .r9);
+                    } else if (right.op == .const_int) {
                         // add rax, imm32
                         try x86_64.addRegImm32(buf, .rax, @intCast(right.aux_int));
                     } else if (right.op == .arg) {
@@ -1530,6 +1724,10 @@ pub const Driver = struct {
                         try x86_64.addRegReg(buf, .rax, .r9);
                     }
                 }
+
+                // Save result to storage for use by later operations
+                const result_slot = try self.storage.allocate(value_idx);
+                try x86_64.movMemReg(buf, .rbp, result_slot, .rax);
             },
             .sub => {
                 // Binary subtract: look up both operands
@@ -1652,7 +1850,9 @@ pub const Driver = struct {
                     else
                         value.aux_str;
                     try x86_64.callSymbol(buf, call_func_name);
-                    // Return value is in rax
+                    // Return value is in rax - save to storage slot for later use
+                    const slot = try self.storage.allocate(value_idx);
+                    try x86_64.movMemReg(buf, .rbp, slot, .rax);
                 }
             },
             .ret => {
@@ -1661,8 +1861,13 @@ pub const Driver = struct {
                 const args = value.args();
                 if (args.len > 0) {
                     const ret_val = func.getValue(args[0]);
+                    const ret_idx = args[0];
                     // If the return value isn't already in rax, move it there
-                    if (ret_val.op == .arg) {
+                    // Use storage manager to check if value has a saved location
+                    if (self.storage.get(ret_idx)) |slot| {
+                        // Value was saved to storage slot - load from there
+                        try x86_64.movRegMem(buf, .rax, .rbp, slot);
+                    } else if (ret_val.op == .arg) {
                         const param_idx: u32 = @intCast(ret_val.aux_int);
                         if (param_idx < arg_regs.len) {
                             try x86_64.movRegReg(buf, .rax, arg_regs[param_idx]);
@@ -1675,7 +1880,7 @@ pub const Driver = struct {
                         const local_offset: i32 = func.locals[local_idx].offset;
                         try x86_64.movRegMem(buf, .rax, .rbp, local_offset);
                     }
-                    // .field and call results are already in rax
+                    // Note: sub, mul, div, field results are already in rax
                 }
                 // Emit function epilogue: mov rsp, rbp; pop rbp; ret
                 try x86_64.movRegReg(buf, .rsp, .rbp);
@@ -1964,7 +2169,8 @@ pub const Driver = struct {
                         } else if (val.op == .add or val.op == .sub or val.op == .mul or val.op == .div or
                             val.op == .load or val.op == .call or val.op == .field or val.op == .index or
                             val.op == .slice_index or val.op == .union_payload or
-                            val.op == .map_new or val.op == .map_get or val.op == .map_has or val.op == .map_size)
+                            val.op == .map_new or val.op == .map_get or val.op == .map_has or val.op == .map_size or
+                            val.op == .list_new or val.op == .list_get or val.op == .list_len)
                         {
                             // Operations that leave result in rax - store directly
                             use_rax_directly = true;
@@ -2279,6 +2485,115 @@ pub const Driver = struct {
                 const map_free_name = if (self.options.target.os == .macos) "_cot_native_map_free" else "cot_native_map_free";
                 try x86_64.callSymbol(buf, map_free_name);
             },
+            // ========== List Operations (native layout + FFI) ==========
+            // List layout (24 bytes):
+            //   elements_ptr (8): pointer to heap-allocated element array
+            //   length (8): current number of elements
+            //   capacity (8): allocated capacity
+            .list_new => {
+                // Call calloc(1, 24) to allocate zeroed list header
+                // System V AMD64 ABI: rdi=nmemb, rsi=size
+                try x86_64.movRegImm64(buf, .rdi, 1);
+                try x86_64.movRegImm64(buf, .rsi, 24); // 24-byte header
+                const calloc_name = if (self.options.target.os == .macos) "_calloc" else "calloc";
+                try x86_64.callSymbol(buf, calloc_name);
+                // rax now has pointer to zeroed list header
+                // All fields (elements_ptr=0, length=0, capacity=0) already correct from calloc
+            },
+            .list_push => {
+                // Call cot_native_list_push(list, value) - grows if needed
+                // System V AMD64 ABI: rdi=list, rsi=value
+                const args = value.args();
+                if (args.len > 0) {
+                    const handle_val = func.getValue(args[0]);
+                    if (handle_val.op == .load or handle_val.op == .copy) {
+                        const local_idx: u32 = @intCast(handle_val.aux_int);
+                        const offset = self.getLocalOffset(func, local_idx);
+                        try x86_64.movRegMem(buf, .rdi, .rbp, offset);
+                    } else if (handle_val.op == .const_int) {
+                        try x86_64.movRegImm64(buf, .rdi, handle_val.aux_int);
+                    }
+                }
+                if (args.len > 1) {
+                    const val_val = func.getValue(args[1]);
+                    if (val_val.op == .const_int) {
+                        try x86_64.movRegImm64(buf, .rsi, val_val.aux_int);
+                    } else if (val_val.op == .load or val_val.op == .copy) {
+                        const local_idx: u32 = @intCast(val_val.aux_int);
+                        const offset = self.getLocalOffset(func, local_idx);
+                        try x86_64.movRegMem(buf, .rsi, .rbp, offset);
+                    }
+                }
+                const list_push_name = if (self.options.target.os == .macos) "_cot_native_list_push" else "cot_native_list_push";
+                try x86_64.callSymbol(buf, list_push_name);
+            },
+            .list_get => {
+                // Call cot_native_list_get(list, index) - returns element value
+                // System V AMD64 ABI: rdi=list, rsi=index
+                const args = value.args();
+                if (args.len > 0) {
+                    const handle_val = func.getValue(args[0]);
+                    if (handle_val.op == .load or handle_val.op == .copy) {
+                        const local_idx: u32 = @intCast(handle_val.aux_int);
+                        const offset = self.getLocalOffset(func, local_idx);
+                        try x86_64.movRegMem(buf, .rdi, .rbp, offset);
+                    } else if (handle_val.op == .const_int) {
+                        try x86_64.movRegImm64(buf, .rdi, handle_val.aux_int);
+                    }
+                }
+                if (args.len > 1) {
+                    const idx_val = func.getValue(args[1]);
+                    if (idx_val.op == .const_int) {
+                        try x86_64.movRegImm64(buf, .rsi, idx_val.aux_int);
+                    } else if (idx_val.op == .load or idx_val.op == .copy) {
+                        const local_idx: u32 = @intCast(idx_val.aux_int);
+                        const offset = self.getLocalOffset(func, local_idx);
+                        try x86_64.movRegMem(buf, .rsi, .rbp, offset);
+                    }
+                }
+                const list_get_name = if (self.options.target.os == .macos) "_cot_native_list_get" else "cot_native_list_get";
+                try x86_64.callSymbol(buf, list_get_name);
+                // Result is in rax - save to storage for later use
+                const slot = try self.storage.allocate(value_idx);
+                try x86_64.movMemReg(buf, .rbp, slot, .rax);
+            },
+            .list_len => {
+                // Read length field from list header (offset 8)
+                // Inline implementation - no FFI needed
+                const args = value.args();
+                if (args.len > 0) {
+                    const handle_val = func.getValue(args[0]);
+                    if (handle_val.op == .load or handle_val.op == .copy) {
+                        const local_idx: u32 = @intCast(handle_val.aux_int);
+                        const offset = self.getLocalOffset(func, local_idx);
+                        try x86_64.movRegMem(buf, .rdi, .rbp, offset); // rdi = list ptr
+                    } else if (handle_val.op == .const_int) {
+                        try x86_64.movRegImm64(buf, .rdi, handle_val.aux_int);
+                    }
+                }
+                // Load length from [rdi + 8] into rax
+                // mov rax, [rdi+8] = REX.W + MOV r64,r/m64 + ModRM(disp8) + disp
+                try buf.emit8(0x48); // REX.W
+                try buf.emit8(0x8B); // MOV r64, r/m64
+                try buf.emit8(0x47); // ModRM: [rdi + disp8], dst=rax
+                try buf.emit8(0x08); // disp8 = 8
+            },
+            .list_free => {
+                // Call cot_native_list_free(list) - frees elements array and header
+                const args = value.args();
+                if (args.len > 0) {
+                    const handle_val = func.getValue(args[0]);
+                    if (handle_val.op == .load or handle_val.op == .copy) {
+                        const local_idx: u32 = @intCast(handle_val.aux_int);
+                        const offset = self.getLocalOffset(func, local_idx);
+                        try x86_64.movRegMem(buf, .rdi, .rbp, offset);
+                    } else if (handle_val.op == .const_int) {
+                        try x86_64.movRegImm64(buf, .rdi, handle_val.aux_int);
+                    }
+                }
+                const list_free_name = if (self.options.target.os == .macos) "_cot_native_list_free" else "cot_native_list_free";
+                try x86_64.callSymbol(buf, list_free_name);
+            },
             else => {
                 // Warn about unhandled ops in debug mode
                 if (self.options.debug_codegen) {
@@ -2332,7 +2647,6 @@ pub const Driver = struct {
     fn generateX86ValueWithPatching(self: *Driver, buf: *be.CodeBuffer, func: *ssa.Func, value: ssa.Value, value_idx: u32, patches: *std.ArrayList(BranchPatch)) !void {
         const arg_regs = [_]x86_64.Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
         _ = arg_regs;
-        _ = value_idx;
 
         switch (value.op) {
             .branch => {
@@ -2417,7 +2731,7 @@ pub const Driver = struct {
             },
             else => {
                 // Use the regular code generator for non-branch ops
-                try self.generateX86Value(buf, func, value);
+                try self.generateX86Value(buf, func, value, value_idx);
             },
         }
     }
@@ -2504,7 +2818,7 @@ pub const Driver = struct {
         }
     }
 
-    fn generateAArch64Value(self: *Driver, buf: *be.CodeBuffer, func: *ssa.Func, value: ssa.Value, stack_size: u32, has_calls: bool) !void {
+    fn generateAArch64Value(self: *Driver, buf: *be.CodeBuffer, func: *ssa.Func, value: ssa.Value, value_idx: u32, stack_size: u32, has_calls: bool) !void {
         // AAPCS64 argument registers: x0-x7
         const arg_regs = [_]aarch64.Reg{ .x0, .x1, .x2, .x3, .x4, .x5, .x6, .x7 };
 
@@ -2520,9 +2834,16 @@ pub const Driver = struct {
                 if (args.len >= 2) {
                     const left = func.getValue(args[0]);
                     const right = func.getValue(args[1]);
+                    const left_idx = args[0];
+                    const right_idx = args[1];
 
                     // Generate code for left operand -> x0
-                    if (left.op == .arg) {
+                    // Use storage manager to check if value has a saved location
+                    if (self.storage.get(left_idx)) |slot| {
+                        // Value was saved to storage slot - load from there
+                        const aarch64_offset = self.storage.aarch64Offset(slot, func.frame_size);
+                        try aarch64.ldrRegImm(buf, .x0, .sp, aarch64_offset);
+                    } else if (left.op == .arg) {
                         const param_idx: u32 = @intCast(left.aux_int);
                         if (param_idx < arg_regs.len and param_idx != 0) {
                             try aarch64.movRegReg(buf, .x0, arg_regs[param_idx]);
@@ -2541,7 +2862,13 @@ pub const Driver = struct {
                     }
 
                     // Generate code for right operand, then add
-                    if (right.op == .const_int) {
+                    // Use storage manager to check if value has a saved location
+                    if (self.storage.get(right_idx)) |slot| {
+                        // Value was saved to storage slot - load into x9 and add
+                        const aarch64_offset = self.storage.aarch64Offset(slot, func.frame_size);
+                        try aarch64.ldrRegImm(buf, .x9, .sp, aarch64_offset);
+                        try aarch64.addRegReg(buf, .x0, .x0, .x9);
+                    } else if (right.op == .const_int) {
                         // add x0, x0, #imm12
                         const imm: u12 = @intCast(right.aux_int & 0xFFF);
                         try aarch64.addRegImm12(buf, .x0, .x0, imm);
@@ -2562,6 +2889,11 @@ pub const Driver = struct {
                         }
                     }
                 }
+
+                // Save result to storage for use by later operations
+                const result_slot = try self.storage.allocate(value_idx);
+                const result_aarch64 = self.storage.aarch64Offset(result_slot, func.frame_size);
+                try aarch64.strRegImm(buf, .x0, .sp, result_aarch64);
             },
             .sub => {
                 // Binary sub: look up both operands
@@ -2680,7 +3012,10 @@ pub const Driver = struct {
                     else
                         value.aux_str;
                     try aarch64.callSymbol(buf, call_func_name);
-                    // Return value is in x0
+                    // Return value is in x0 - save to storage for later use
+                    const slot = try self.storage.allocate(value_idx);
+                    const aarch64_offset = self.storage.aarch64Offset(slot, func.frame_size);
+                    try aarch64.strRegImm(buf, .x0, .sp, aarch64_offset);
                 }
             },
             .ret => {
@@ -2688,7 +3023,13 @@ pub const Driver = struct {
                 const args = value.args();
                 if (args.len > 0) {
                     const ret_val = func.getValue(args[0]);
-                    if (ret_val.op == .arg) {
+                    const ret_idx = args[0];
+                    // Use storage manager to check if value has a saved location
+                    if (self.storage.get(ret_idx)) |slot| {
+                        // Value was saved to storage slot - load from there
+                        const aarch64_offset = self.storage.aarch64Offset(slot, func.frame_size);
+                        try aarch64.ldrRegImm(buf, .x0, .sp, aarch64_offset);
+                    } else if (ret_val.op == .arg) {
                         const param_idx: u32 = @intCast(ret_val.aux_int);
                         if (param_idx < arg_regs.len and param_idx != 0) {
                             try aarch64.movRegReg(buf, .x0, arg_regs[param_idx]);
@@ -2706,8 +3047,8 @@ pub const Driver = struct {
                             try aarch64.ldrRegImm(buf, .x0, .sp, offset_scaled);
                         }
                     }
-                    // Operations that already leave result in x0: add, sub, mul, div,
-                    // field, index, call, slice_make - no extra code needed
+                    // Note: sub, mul, div, field, index, slice_make leave result in x0
+                    // and are consumed immediately - no storage needed
                 }
                 // Emit epilogue and ret for each return point
                 // (Functions with multiple returns need each to properly exit)
@@ -2907,7 +3248,8 @@ pub const Driver = struct {
                         } else if (val.op == .add or val.op == .sub or val.op == .mul or val.op == .div or
                             val.op == .load or val.op == .call or val.op == .field or val.op == .index or
                             val.op == .slice_index or val.op == .union_payload or
-                            val.op == .map_new or val.op == .map_get or val.op == .map_has or val.op == .map_size)
+                            val.op == .map_new or val.op == .map_get or val.op == .map_has or val.op == .map_size or
+                            val.op == .list_new or val.op == .list_get or val.op == .list_len)
                         {
                             // Operations that leave result in x0 - store directly
                             use_x0_directly = true;
@@ -3450,6 +3792,137 @@ pub const Driver = struct {
                 const map_free_name = if (self.options.target.os == .macos) "_cot_native_map_free" else "cot_native_map_free";
                 try aarch64.callSymbol(buf, map_free_name);
             },
+            // ========== List Operations (native layout + FFI) ==========
+            // List layout (24 bytes):
+            //   elements_ptr (8): pointer to heap-allocated element array
+            //   length (8): current number of elements
+            //   capacity (8): allocated capacity
+            .list_new => {
+                // Call calloc(1, 24) to allocate zeroed list header
+                // AArch64 ABI: x0=nmemb, x1=size
+                try aarch64.movRegImm64(buf, .x0, 1);
+                try aarch64.movRegImm64(buf, .x1, 24); // 24-byte header
+                const calloc_name = if (self.options.target.os == .macos) "_calloc" else "calloc";
+                try aarch64.callSymbol(buf, calloc_name);
+                // x0 now has pointer to zeroed list header
+                // All fields (elements_ptr=0, length=0, capacity=0) already correct from calloc
+            },
+            .list_push => {
+                // Call cot_native_list_push(list, value) - grows if needed
+                // AArch64 ABI: x0=list, x1=value
+                const args = value.args();
+                if (args.len > 0) {
+                    const handle_val = func.getValue(args[0]);
+                    if (handle_val.op == .load or handle_val.op == .copy) {
+                        const local_idx: u32 = @intCast(handle_val.aux_int);
+                        const x86_offset = self.getLocalOffset(func, local_idx);
+                        const local_offset = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
+                        if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
+                            const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
+                            try aarch64.ldrRegImm(buf, .x0, .sp, offset_scaled);
+                        }
+                    } else if (handle_val.op == .const_int) {
+                        try aarch64.movRegImm64(buf, .x0, handle_val.aux_int);
+                    }
+                }
+                if (args.len > 1) {
+                    const val_val = func.getValue(args[1]);
+                    if (val_val.op == .const_int) {
+                        try aarch64.movRegImm64(buf, .x1, val_val.aux_int);
+                    } else if (val_val.op == .load or val_val.op == .copy) {
+                        const local_idx: u32 = @intCast(val_val.aux_int);
+                        const x86_offset = self.getLocalOffset(func, local_idx);
+                        const local_offset = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
+                        if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
+                            const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
+                            try aarch64.ldrRegImm(buf, .x1, .sp, offset_scaled);
+                        }
+                    }
+                }
+                const list_push_name = if (self.options.target.os == .macos) "_cot_native_list_push" else "cot_native_list_push";
+                try aarch64.callSymbol(buf, list_push_name);
+            },
+            .list_get => {
+                // Call cot_native_list_get(list, index) - returns element value
+                // AArch64 ABI: x0=list, x1=index
+                const args = value.args();
+                if (args.len > 0) {
+                    const handle_val = func.getValue(args[0]);
+                    if (handle_val.op == .load or handle_val.op == .copy) {
+                        const local_idx: u32 = @intCast(handle_val.aux_int);
+                        const x86_offset = self.getLocalOffset(func, local_idx);
+                        const local_offset = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
+                        if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
+                            const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
+                            try aarch64.ldrRegImm(buf, .x0, .sp, offset_scaled);
+                        }
+                    } else if (handle_val.op == .const_int) {
+                        try aarch64.movRegImm64(buf, .x0, handle_val.aux_int);
+                    }
+                }
+                if (args.len > 1) {
+                    const idx_val = func.getValue(args[1]);
+                    if (idx_val.op == .const_int) {
+                        try aarch64.movRegImm64(buf, .x1, idx_val.aux_int);
+                    } else if (idx_val.op == .load or idx_val.op == .copy) {
+                        const local_idx: u32 = @intCast(idx_val.aux_int);
+                        const x86_offset = self.getLocalOffset(func, local_idx);
+                        const local_offset = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
+                        if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
+                            const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
+                            try aarch64.ldrRegImm(buf, .x1, .sp, offset_scaled);
+                        }
+                    }
+                }
+                const list_get_name = if (self.options.target.os == .macos) "_cot_native_list_get" else "cot_native_list_get";
+                try aarch64.callSymbol(buf, list_get_name);
+                // Result is in x0 - save to storage for later use
+                const slot = try self.storage.allocate(value_idx);
+                const aarch64_offset = self.storage.aarch64Offset(slot, func.frame_size);
+                try aarch64.strRegImm(buf, .x0, .sp, aarch64_offset);
+            },
+            .list_len => {
+                // Read length field from list header (offset 8)
+                // Inline implementation - no FFI needed
+                const args = value.args();
+                if (args.len > 0) {
+                    const handle_val = func.getValue(args[0]);
+                    if (handle_val.op == .load or handle_val.op == .copy) {
+                        const local_idx: u32 = @intCast(handle_val.aux_int);
+                        const x86_offset = self.getLocalOffset(func, local_idx);
+                        const local_offset = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
+                        if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
+                            const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
+                            try aarch64.ldrRegImm(buf, .x1, .sp, offset_scaled); // x1 = list ptr
+                        }
+                    } else if (handle_val.op == .const_int) {
+                        try aarch64.movRegImm64(buf, .x1, handle_val.aux_int);
+                    }
+                }
+                // Load length from [x1 + 8] into x0
+                // LDR x0, [x1, #8] - offset is byte offset for LDR with imm
+                try aarch64.ldrRegImm(buf, .x0, .x1, 1); // offset_scaled=1 means 8 bytes
+            },
+            .list_free => {
+                // Call cot_native_list_free(list) - frees elements array and header
+                const args = value.args();
+                if (args.len > 0) {
+                    const handle_val = func.getValue(args[0]);
+                    if (handle_val.op == .load or handle_val.op == .copy) {
+                        const local_idx: u32 = @intCast(handle_val.aux_int);
+                        const x86_offset = self.getLocalOffset(func, local_idx);
+                        const local_offset = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
+                        if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
+                            const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
+                            try aarch64.ldrRegImm(buf, .x0, .sp, offset_scaled);
+                        }
+                    } else if (handle_val.op == .const_int) {
+                        try aarch64.movRegImm64(buf, .x0, handle_val.aux_int);
+                    }
+                }
+                const list_free_name = if (self.options.target.os == .macos) "_cot_native_list_free" else "cot_native_list_free";
+                try aarch64.callSymbol(buf, list_free_name);
+            },
             else => {
                 // Warn about unhandled ops in debug mode
                 if (self.options.debug_codegen) {
@@ -3510,7 +3983,6 @@ pub const Driver = struct {
 
     /// Generate code for a single SSA value and record branch positions for patching
     fn generateAArch64ValueWithPatching(self: *Driver, buf: *be.CodeBuffer, func: *ssa.Func, value: ssa.Value, value_idx: u32, patches: *std.ArrayList(BranchPatch), stack_size: u32, has_calls: bool) !void {
-        _ = value_idx;
 
         // For branch and jump, record position for patching
         switch (value.op) {
@@ -3594,7 +4066,7 @@ pub const Driver = struct {
             },
             else => {
                 // Use the regular code generator for non-branch ops
-                try self.generateAArch64Value(buf, func, value, stack_size, has_calls);
+                try self.generateAArch64Value(buf, func, value, value_idx, stack_size, has_calls);
             },
         }
     }
@@ -3616,7 +4088,7 @@ pub const Driver = struct {
                 try argv.append(self.allocator, obj_path);
                 try argv.append(self.allocator, "-lSystem");
                 // Link with runtime library for map operations (use static lib directly)
-                try argv.append(self.allocator, "./runtime/libmap.a");
+                try argv.append(self.allocator, "./zig-out/lib/libcot_runtime.a");
             },
             .linux => {
                 // Linux: use zig cc for consistent cross-platform linking
@@ -3626,7 +4098,7 @@ pub const Driver = struct {
                 try argv.append(self.allocator, exe_path);
                 try argv.append(self.allocator, obj_path);
                 // Link with runtime library for map operations (use static lib directly)
-                try argv.append(self.allocator, "./runtime/libmap.a");
+                try argv.append(self.allocator, "./zig-out/lib/libcot_runtime.a");
             },
             .windows => {
                 // Windows: use link.exe
@@ -3736,6 +4208,8 @@ test "IR op coverage - exhaustive" {
         .union_init, .union_tag, .union_payload,
         // Map operations
         .map_new, .map_set, .map_get, .map_has, .map_size, .map_free,
+        // List operations
+        .list_new, .list_push, .list_get, .list_len, .list_free,
         // Control Flow
         .call, .ret, .jump, .branch, .phi, .select,
         // Conversions
@@ -3756,6 +4230,7 @@ test "IR op coverage - exhaustive" {
             .field, .index, .slice, .slice_index,
             .union_init, .union_tag, .union_payload,
             .map_new, .map_set, .map_get, .map_has, .map_size, .map_free,
+            .list_new, .list_push, .list_get, .list_len, .list_free,
             .call, .ret, .jump, .branch, .phi, .select,
             .convert, .ptr_cast,
             .nop,
@@ -3791,6 +4266,8 @@ test "SSA op coverage - exhaustive" {
         .union_init, .union_tag, .union_payload,
         // Map operations
         .map_new, .map_set, .map_get, .map_has, .map_size, .map_free,
+        // List operations
+        .list_new, .list_push, .list_get, .list_len, .list_free,
         // Function
         .call, .arg,
         // ARC
@@ -3812,6 +4289,7 @@ test "SSA op coverage - exhaustive" {
             .slice_make, .slice_index,
             .union_init, .union_tag, .union_payload,
             .map_new, .map_set, .map_get, .map_has, .map_size, .map_free,
+            .list_new, .list_push, .list_get, .list_len, .list_free,
             .call, .arg,
             .retain, .release,
             .ret, .jump, .branch, .@"unreachable",

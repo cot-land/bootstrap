@@ -154,14 +154,14 @@ These features are used extensively in all .cot files and must work first.
 
 | Feature | Status | Used In | Notes |
 |---------|--------|---------|-------|
-| `List<T>` | Partial | All | Type parsing + type checking done |
-| `List.push(item)` | **Gap** | All | Append item |
-| `List.get(index)` | **Gap** | ir.cot | Get by index |
+| `List<T>` | Implemented | All | Full runtime support |
+| `List.push(item)` | Implemented | All | Append item via FFI |
+| `List.get(index)` | Implemented | ir.cot | Get by index via FFI |
 | `Map<K, V>` | Implemented | checker.cot, ir.cot | Full runtime support |
 | `Map.set(k, v)` | Implemented | checker.cot | Native layout + FFI |
 | `Map.get(key)` | Implemented | checker.cot | Native layout + FFI |
 | `Map.has(key)` | Implemented | checker.cot | Native layout + FFI |
-| `new List<T>` | Partial | All | Parsing done, codegen TBD |
+| `new List<T>` | Implemented | All | Native calloc + 24-byte header |
 | `new Map<K,V>` | Implemented | checker.cot | Native calloc + init |
 
 ---
@@ -320,11 +320,21 @@ The following features were implemented in recent development sessions:
   - `cot_native_map_free(map)` - Free keys and map memory
 - **Method syntax**: `.set()`, `.get()`, `.has()` all work via IR ops
 
-### List Types - **Partial**
+### List Types - **Implemented**
 - **Type syntax**: `List<T>` parsing works
 - **Type checking**: List types are registered and type-checked
-- **new expression**: `new List<i64>()` parsing works
-- **Remaining**: Runtime library and codegen TBD
+- **new expression**: `new List<i64>()` allocates 24-byte header via calloc
+- **Native layout** (24-byte header):
+  - `ptr` (8 bytes): pointer to element array
+  - `len` (8 bytes): current number of elements
+  - `cap` (8 bytes): allocated capacity
+- **Runtime library**: `runtime/list.zig` with C ABI functions:
+  - `cot_native_list_push(list, value)` - Append with automatic reallocation
+  - `cot_native_list_get(list, index)` - Get element by index
+  - `cot_native_list_len(list)` - Get current length
+  - `cot_native_list_free(list)` - Free elements and header
+- **Method syntax**: `.push()`, `.get()` work via IR ops
+- **Scratch slot codegen**: Intermediate results saved to stack for multi-operation expressions (e.g., `list.get(0) + list.get(1) + list.get(2)`)
 
 ---
 
@@ -346,11 +356,11 @@ The wireframes use `List<T>` and `Map<K,V>` extensively:
 - Checker uses maps for symbol tables
 - IR uses lists for values and blocks
 
-**Map Progress**: Complete. Native layout with heap allocation via `calloc`. FNV-1a hashing with linear probing. Method syntax (`.set()`, `.get()`, `.has()`) works. 43 tests pass on ARM64 and x86_64.
+**Map Progress**: Complete. Native layout with heap allocation via `calloc`. FNV-1a hashing with linear probing. Method syntax (`.set()`, `.get()`, `.has()`) works.
 
-**List Progress**: Type syntax parses and type-checks. Runtime library and codegen TBD.
+**List Progress**: Complete. Native 24-byte header layout with heap allocation via `calloc`. Automatic capacity growth in push. Method syntax (`.push()`, `.get()`) works. Scratch slot mechanism for intermediate results in multi-operation expressions.
 
-**Remaining**: List runtime implementation. User-defined generics are NOT needed for bootstrap (per spec.md).
+**Both Map and List**: 46 tests pass on ARM64 and x86_64. User-defined generics are NOT needed for bootstrap (per spec.md).
 
 ### Switch Expressions are Everywhere
 
@@ -366,8 +376,8 @@ The switch must work as an expression (returns value) with payload capture.
 1. ~~**Tagged unions**~~ - **DONE** (construction + switch with payload capture)
 2. ~~**Map<K,V> types**~~ - **DONE** (native layout + FFI, method syntax works)
 3. ~~**Map methods**~~ - **DONE** (`.set()`, `.get()`, `.has()` all work)
-4. **List<T> runtime** - Runtime library for list operations
-5. **List methods** - `.push()`, `.get()` method call syntax
+4. ~~**List<T> runtime**~~ - **DONE** (runtime library with push/get/len/free)
+5. ~~**List methods**~~ - **DONE** (`.push()`, `.get()` method call syntax works)
 6. **Methods** - `fn method(self: *T)` pattern
 7. **String interpolation** - `"Error: ${msg}"` syntax
 8. **@maxInt/@minInt** - Integer bounds for type checks

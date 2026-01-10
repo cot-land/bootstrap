@@ -1,0 +1,6 @@
+// Test simple list get
+fn main() i64 {
+    var list = new List<i64>();
+    list.push(42);
+    return list.get(0);
+}

@@ -16,9 +16,10 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
-    // Map runtime library (static library for linking with cot programs)
+    // Runtime library (static library for linking with cot programs)
+    // Includes Map and List implementations
     const runtime_module = b.createModule(.{
-        .root_source_file = b.path("runtime/map.zig"),
+        .root_source_file = b.path("runtime/lib.zig"),
         .target = target,
         .optimize = optimize,
     });
