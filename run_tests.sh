@@ -55,6 +55,8 @@ get_expected() {
         test_mul) echo 42 ;;
         test_div) echo 42 ;;
         test_switch) echo 42 ;;
+        test_for_array) echo 60 ;;
+        test_for_slice) echo 90 ;;
         *) echo "" ;;
     esac
 }

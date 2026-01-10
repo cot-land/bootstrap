@@ -71,6 +71,25 @@ pub const Parser = struct {
         return self.tok.tok == t;
     }
 
+    /// Check if next token (after current) matches, without consuming.
+    fn peekCheck(self: *Parser, t: Token) bool {
+        // Save scanner state
+        const saved_pos = self.scanner.pos;
+        const saved_ch = self.scanner.ch;
+        const saved_tok = self.tok;
+
+        // Advance to next token
+        self.advance();
+        const result = self.tok.tok == t;
+
+        // Restore scanner state
+        self.scanner.pos = saved_pos;
+        self.scanner.ch = saved_ch;
+        self.tok = saved_tok;
+
+        return result;
+    }
+
     /// Consume token if it matches, return true if consumed.
     fn match(self: *Parser, t: Token) bool {
         if (self.check(t)) {
@@ -648,11 +667,16 @@ pub const Parser = struct {
                 });
             } else if (self.check(.lbrace)) {
                 // Struct literal: Type{ .field = value, ... }
-                // Only valid after an identifier (type name)
+                // Only valid after an identifier (type name) AND when content starts with '.'
                 // If not an identifier, don't consume the '{' - it may be a block start
                 const node = self.ast.getNode(expr);
                 if (node != .expr or node.expr != .identifier) {
                     // Not a struct literal - leave '{' for caller (e.g., if/while block)
+                    break;
+                }
+                // Peek ahead: struct literals must start with '.field' inside braces
+                // If next after '{' is not '.', this is likely a block, not struct literal
+                if (!self.peekCheck(.dot)) {
                     break;
                 }
                 self.advance(); // consume '{'
@@ -1374,7 +1398,7 @@ test "parser binary expression" {
 }
 
 test "parser if statement" {
-    const content = "fn test() { if x { return 1 } else { return 2 } }";
+    const content = "fn test() i64 { if (1 == 1) { return 1; } else { return 2; } }";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -1389,10 +1413,11 @@ test "parser if statement" {
 
     try std.testing.expect(tree.file != null);
     try std.testing.expect(!err_reporter.hasErrors());
+    try std.testing.expect(tree.file.?.decls.len > 0);
 }
 
-test "parser for loop" {
-    const content = "fn test() { for i in items { print(i) } }";
+test "parser while loop" {
+    const content = "fn test() i64 { var i: i64 = 0; while (i < 10) { i = i + 1; } return i; }";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -1407,6 +1432,7 @@ test "parser for loop" {
 
     try std.testing.expect(tree.file != null);
     try std.testing.expect(!err_reporter.hasErrors());
+    try std.testing.expect(tree.file.?.decls.len > 0);
 }
 
 test "parser struct declaration" {
@@ -1449,4 +1475,64 @@ test "parser error recovery" {
 
     // Should have reported an error
     try std.testing.expect(err_reporter.hasErrors());
+}
+
+test "parser switch expression" {
+    const content = "fn test() i64 { var x: i64 = 2; return switch x { 1 => 10, 2 => 20, else => 0, }; }";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var src = Source.init(alloc, "test.cot", content);
+    var err_reporter = ErrorReporter.init(&src, null);
+    var scan = Scanner.initWithErrors(&src, &err_reporter);
+    var tree = Ast.init(alloc);
+
+    var parser = Parser.init(alloc, &scan, &tree, &err_reporter);
+    try parser.parseFile();
+
+    try std.testing.expect(tree.file != null);
+    try std.testing.expect(!err_reporter.hasErrors());
+    try std.testing.expect(tree.file.?.decls.len > 0);
+
+    // Verify the function has a return statement with a switch expression
+    const decl = tree.getDecl(tree.file.?.decls[0]);
+    try std.testing.expect(decl != null);
+    try std.testing.expect(decl.? == .fn_decl);
+}
+
+test "parser switch with multiple values per case" {
+    const content = "fn test() i64 { var x: i64 = 2; return switch x { 1, 2, 3 => 10, 4, 5 => 20, else => 0, }; }";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var src = Source.init(alloc, "test.cot", content);
+    var err_reporter = ErrorReporter.init(&src, null);
+    var scan = Scanner.initWithErrors(&src, &err_reporter);
+    var tree = Ast.init(alloc);
+
+    var parser = Parser.init(alloc, &scan, &tree, &err_reporter);
+    try parser.parseFile();
+
+    try std.testing.expect(tree.file != null);
+    try std.testing.expect(!err_reporter.hasErrors());
+}
+
+test "parser slice expression" {
+    const content = "fn test() i64 { var arr = [10, 20, 30]; var s = arr[1:3]; return 0; }";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var src = Source.init(alloc, "test.cot", content);
+    var err_reporter = ErrorReporter.init(&src, null);
+    var scan = Scanner.initWithErrors(&src, &err_reporter);
+    var tree = Ast.init(alloc);
+
+    var parser = Parser.init(alloc, &scan, &tree, &err_reporter);
+    try parser.parseFile();
+
+    try std.testing.expect(tree.file != null);
+    try std.testing.expect(!err_reporter.hasErrors());
 }

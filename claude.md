@@ -253,6 +253,46 @@ Cot 0.1 failed because bugs compounded faster than we could fix them. Extensive 
 
 The same test discipline will be required in cot when we self-host.
 
+### Testing Workflow - ALWAYS FOLLOW THIS ORDER
+
+Before any commit or after any code changes, **always run tests in this order**:
+
+```bash
+# 1. FIRST: Run Zig embedded tests (catches compilation and unit test errors)
+zig build test
+
+# 2. THEN: Build the compiler
+zig build
+
+# 3. FINALLY: Run binary tests (ARM64 native or Docker for x86_64)
+./run_tests.sh                    # ARM64 macOS
+# OR
+./docker_test.sh                  # x86_64 via Docker
+```
+
+**Why this order matters:**
+1. `zig build test` catches:
+   - Syntax errors in Zig code
+   - Type errors and API misuse
+   - Unit test failures in parser, checker, lowerer, codegen
+   - Exhaustive switch violations (missing cases for new ops/expressions)
+
+2. Binary tests only work if the Zig code compiles successfully
+
+**Current test counts:**
+- 129 Zig embedded tests (unit tests in source files)
+- 36 binary tests (.cot test files)
+
+### Exhaustive Switches for New Features
+
+When adding a new AST expression type, IR op, or SSA op, the exhaustive switch tests will **fail to compile**, reminding you to handle the new case everywhere:
+
+- `check.zig`: "AST expr coverage - exhaustive" test
+- `driver.zig`: "IR op coverage - exhaustive" test
+- `driver.zig`: "SSA op coverage - exhaustive" test
+
+This ensures new features are implemented across all compilation stages.
+
 ---
 
 ## Cross-Platform Testing (x86_64 on ARM64 Mac)

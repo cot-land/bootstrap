@@ -542,6 +542,9 @@ pub const Checker = struct {
                 if (std.mem.eql(u8, name, "len")) {
                     return self.checkBuiltinLen(c);
                 }
+                if (std.mem.eql(u8, name, "print") or std.mem.eql(u8, name, "println")) {
+                    return self.checkBuiltinPrint(c);
+                }
             }
         }
 
@@ -600,6 +603,34 @@ pub const Checker = struct {
 
         self.err.errorWithCode(c.span.start, .E300, "len() argument must be string, array, or slice");
         return invalid_type;
+    }
+
+    /// Check builtin print()/println() functions.
+    fn checkBuiltinPrint(self: *Checker, c: ast.Call) CheckError!TypeIndex {
+        // print()/println() takes exactly one argument
+        if (c.args.len != 1) {
+            self.err.errorWithCode(c.span.start, .E300, "print() expects exactly one argument");
+            return TypeRegistry.VOID;
+        }
+
+        const arg_type = try self.checkExpr(c.args[0]);
+        const arg = self.types.get(arg_type);
+
+        // print() works on strings and integers
+        switch (arg) {
+            .basic => |k| {
+                if (k == .string_type or k == .i64_type or k == .i32_type or
+                    k == .i16_type or k == .i8_type or k == .u64_type or
+                    k == .u32_type or k == .u16_type or k == .u8_type or k == .bool_type)
+                {
+                    return TypeRegistry.VOID;
+                }
+            },
+            else => {},
+        }
+
+        self.err.errorWithCode(c.span.start, .E300, "print() argument must be string or integer");
+        return TypeRegistry.VOID;
     }
 
     /// Check index expression.
@@ -1475,4 +1506,55 @@ test "scope lookup" {
     // Outer can't see inner
     try std.testing.expect(outer.lookup("x") != null);
     try std.testing.expect(outer.lookup("y") == null);
+}
+
+// Exhaustive test - ensures all AST expression types are handled.
+// If a new expression type is added to ast.Expr, this test will fail to compile.
+test "AST expr coverage - exhaustive" {
+    // This test uses an exhaustive switch on ast.Expr to ensure
+    // all expression types are accounted for in the type checker.
+    // When a new expression type is added, this switch will fail to compile,
+    // reminding us to implement checkExpr handling for the new type.
+    const ExprTag = std.meta.Tag(ast.Expr);
+    const all_tags = [_]ExprTag{
+        .identifier,
+        .literal,
+        .binary,
+        .unary,
+        .call,
+        .index,
+        .slice_expr,
+        .field_access,
+        .array_literal,
+        .paren,
+        .if_expr,
+        .switch_expr,
+        .block,
+        .struct_init,
+        .type_expr,
+        .bad_expr,
+    };
+
+    for (all_tags) |tag| {
+        const is_known = switch (tag) {
+            .identifier,
+            .literal,
+            .binary,
+            .unary,
+            .call,
+            .index,
+            .slice_expr,
+            .field_access,
+            .array_literal,
+            .paren,
+            .if_expr,
+            .switch_expr,
+            .block,
+            .struct_init,
+            .type_expr,
+            .bad_expr,
+            => true,
+        };
+        try std.testing.expect(is_known);
+    }
 }

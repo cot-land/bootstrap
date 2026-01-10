@@ -205,6 +205,10 @@ pub const RelocKind = enum {
     got_rel,
     /// PLT-relative (function calls).
     plt_rel,
+    /// AArch64 ADRP page address.
+    aarch64_adrp,
+    /// AArch64 ADD low 12 bits of address.
+    aarch64_add_lo12,
 };
 
 // ============================================================================

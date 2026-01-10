@@ -1,0 +1,8 @@
+fn main() i64 {
+    var arr = [10, 20, 30];
+    var sum: i64 = 0;
+    for x in arr {
+        sum = sum + x;
+    }
+    return sum;
+}

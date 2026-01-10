@@ -445,6 +445,26 @@ pub fn callSymbol(buf: *CodeBuffer, symbol: []const u8) !void {
     try buf.emit32(0); // Placeholder for linker
 }
 
+/// LEA reg, [rip+symbol] - Load effective address with RIP-relative symbol
+/// Used to load address of data in rodata section
+pub fn leaRipSymbol(buf: *CodeBuffer, dst: Reg, symbol: []const u8) !void {
+    // REX.W prefix for 64-bit operand, REX.R if dst is extended
+    try buf.emit8(0x48 | (if (dst.needsRex()) @as(u8, 0x04) else 0));
+    // LEA opcode
+    try buf.emit8(0x8D);
+    // ModRM: mod=00, reg=dst, rm=101 (RIP-relative)
+    try buf.emit8((dst.low3() << 3) | 0x05);
+    // RIP-relative displacement (placeholder for linker)
+    try buf.addRelocation(.pc_rel_32, symbol, -4);
+    try buf.emit32(0);
+}
+
+/// SYSCALL instruction
+pub fn syscall(buf: *CodeBuffer) !void {
+    try buf.emit8(0x0F);
+    try buf.emit8(0x05);
+}
+
 /// JMP rel32
 pub fn jmpRel32(buf: *CodeBuffer, offset: i32) !void {
     try buf.emit8(0xE9);
@@ -919,4 +939,273 @@ test "x86_64 backend init" {
 
     // Check that registers were initialized
     try std.testing.expect(x86_be.storage.free_general_regs.items.len > 0);
+}
+
+// ============================================================================
+// Instruction Encoding Validation Tests
+// These tests verify byte-exact encodings against known-correct x86_64 values.
+// Reference: Intel 64 and IA-32 Architectures Software Developer's Manual
+// ============================================================================
+
+test "SUB rax, rbx encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try subRegReg(&buf, .rax, .rbx);
+    // SUB rax, rbx: REX.W (48) + 29 /r (SUB r/m64, r64) + ModRM C8 (rbx -> rax)
+    // = 48 29 D8
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x29, 0xD8 }, buf.getBytes());
+}
+
+test "SUB r8, r9 encoding (extended regs)" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try subRegReg(&buf, .r8, .r9);
+    // SUB r8, r9: REX.WRB (4D) + 29 + ModRM C8
+    // = 4D 29 C8
+    try std.testing.expectEqualSlices(u8, &.{ 0x4D, 0x29, 0xC8 }, buf.getBytes());
+}
+
+test "CMP rax, rbx encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try cmpRegReg(&buf, .rax, .rbx);
+    // CMP rax, rbx: REX.W (48) + 39 /r + ModRM D8 (rbx -> rax)
+    // = 48 39 D8
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x39, 0xD8 }, buf.getBytes());
+}
+
+test "CMP r8, r9 encoding (extended regs)" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try cmpRegReg(&buf, .r8, .r9);
+    // CMP r8, r9: REX.WRB (4D) + 39 + ModRM C8
+    // = 4D 39 C8
+    try std.testing.expectEqualSlices(u8, &.{ 0x4D, 0x39, 0xC8 }, buf.getBytes());
+}
+
+test "CMP rax, imm32 encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try cmpRegImm32(&buf, .rax, 42);
+    // CMP rax, 42: REX.W (48) + 81 /7 + ModRM F8 + imm32
+    // = 48 81 F8 2A 00 00 00
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x81, 0xF8, 0x2A, 0x00, 0x00, 0x00 }, buf.getBytes());
+}
+
+test "IMUL rax, rbx encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try imulRegReg(&buf, .rax, .rbx);
+    // IMUL rax, rbx: REX.W (48) + 0F AF /r + ModRM C3
+    // = 48 0F AF C3
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x0F, 0xAF, 0xC3 }, buf.getBytes());
+}
+
+test "IDIV rbx encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try idivReg(&buf, .rbx);
+    // IDIV rbx: REX.W (48) + F7 /7 + ModRM FB
+    // = 48 F7 FB
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0xF7, 0xFB }, buf.getBytes());
+}
+
+test "NEG rax encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try negReg(&buf, .rax);
+    // NEG rax: REX.W (48) + F7 /3 + ModRM D8
+    // = 48 F7 D8
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0xF7, 0xD8 }, buf.getBytes());
+}
+
+test "MOV [rbp-8], rax encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try movMemReg(&buf, .rbp, -8, .rax);
+    // MOV [rbp-8], rax: REX.W (48) + 89 + ModRM 45 (disp8) + F8 (-8)
+    // = 48 89 45 F8
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x89, 0x45, 0xF8 }, buf.getBytes());
+}
+
+test "MOV rax, [rbp-8] encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try movRegMem(&buf, .rax, .rbp, -8);
+    // MOV rax, [rbp-8]: REX.W (48) + 8B + ModRM 45 (disp8) + F8 (-8)
+    // = 48 8B 45 F8
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x8B, 0x45, 0xF8 }, buf.getBytes());
+}
+
+test "MOV [rbp-256], rax encoding (disp32)" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try movMemReg(&buf, .rbp, -256, .rax);
+    // MOV [rbp-256], rax: REX.W (48) + 89 + ModRM 85 (disp32) + imm32 (-256 = 0xFFFFFF00)
+    // = 48 89 85 00 FF FF FF
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x89, 0x85, 0x00, 0xFF, 0xFF, 0xFF }, buf.getBytes());
+}
+
+test "RET encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try ret(&buf);
+    // RET: C3
+    try std.testing.expectEqualSlices(u8, &.{0xC3}, buf.getBytes());
+}
+
+test "JE rel32 encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try jccRel32(&buf, .e, 0);
+    // JE rel32: 0F 84 + rel32
+    // = 0F 84 00 00 00 00
+    try std.testing.expectEqualSlices(u8, &.{ 0x0F, 0x84, 0x00, 0x00, 0x00, 0x00 }, buf.getBytes());
+}
+
+test "JNE rel32 encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try jccRel32(&buf, .ne, 0);
+    // JNE rel32: 0F 85 + rel32
+    // = 0F 85 00 00 00 00
+    try std.testing.expectEqualSlices(u8, &.{ 0x0F, 0x85, 0x00, 0x00, 0x00, 0x00 }, buf.getBytes());
+}
+
+test "JL rel32 encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try jccRel32(&buf, .l, 0);
+    // JL rel32: 0F 8C + rel32
+    // = 0F 8C 00 00 00 00
+    try std.testing.expectEqualSlices(u8, &.{ 0x0F, 0x8C, 0x00, 0x00, 0x00, 0x00 }, buf.getBytes());
+}
+
+test "JGE rel32 encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try jccRel32(&buf, .ge, 0);
+    // JGE rel32: 0F 8D + rel32
+    // = 0F 8D 00 00 00 00
+    try std.testing.expectEqualSlices(u8, &.{ 0x0F, 0x8D, 0x00, 0x00, 0x00, 0x00 }, buf.getBytes());
+}
+
+test "CMOVE rax, rbx encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try cmoveRegReg(&buf, .rax, .rbx);
+    // CMOVE rax, rbx: REX.W (48) + 0F 44 /r + ModRM C3
+    // = 48 0F 44 C3
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x0F, 0x44, 0xC3 }, buf.getBytes());
+}
+
+test "AND rax, rbx encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try andRegReg(&buf, .rax, .rbx);
+    // AND rax, rbx: REX.W (48) + 21 /r + ModRM D8
+    // = 48 21 D8
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x21, 0xD8 }, buf.getBytes());
+}
+
+test "OR rax, rbx encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try orRegReg(&buf, .rax, .rbx);
+    // OR rax, rbx: REX.W (48) + 09 /r + ModRM D8
+    // = 48 09 D8
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x09, 0xD8 }, buf.getBytes());
+}
+
+test "XOR rax, rbx encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try xorRegReg(&buf, .rax, .rbx);
+    // XOR rax, rbx: REX.W (48) + 31 /r + ModRM D8
+    // = 48 31 D8
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x31, 0xD8 }, buf.getBytes());
+}
+
+test "SHL rax, 4 encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try shlRegImm(&buf, .rax, 4);
+    // SHL rax, 4: REX.W (48) + C1 /4 + ModRM E0 + imm8
+    // = 48 C1 E0 04
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0xC1, 0xE0, 0x04 }, buf.getBytes());
+}
+
+test "SHR rax, 4 encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try shrRegImm(&buf, .rax, 4);
+    // SHR rax, 4: REX.W (48) + C1 /5 + ModRM E8 + imm8
+    // = 48 C1 E8 04
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0xC1, 0xE8, 0x04 }, buf.getBytes());
+}
+
+test "LEA rax, [rbp-16] encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try leaRegMem(&buf, .rax, .rbp, -16);
+    // LEA rax, [rbp-16]: REX.W (48) + 8D + ModRM 45 (disp8) + F0 (-16)
+    // = 48 8D 45 F0
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x8D, 0x45, 0xF0 }, buf.getBytes());
+}
+
+test "CQO encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try cqo(&buf);
+    // CQO: REX.W (48) + 99
+    // = 48 99
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x99 }, buf.getBytes());
 }

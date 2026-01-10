@@ -41,6 +41,9 @@ pub const Lowerer = struct {
     // Current function context (like Go's Curfn)
     current_func: ?*ir.FuncBuilder = null,
 
+    // Counter for generating unique names in for-loop desugaring
+    for_counter: u32 = 0,
+
     pub fn init(
         allocator: Allocator,
         tree: *const Ast,
@@ -520,11 +523,199 @@ pub const Lowerer = struct {
     }
 
     fn lowerFor(self: *Lowerer, for_stmt: ast.ForStmt) Allocator.Error!void {
-        // Desugar for-in to while loop
-        // TODO: Implement proper for-in lowering
-        _ = self;
-        _ = for_stmt;
-        log.debug("  for loop (TODO)", .{});
+        // Desugar for-in to while loop:
+        //   for item in arr { body }
+        // becomes:
+        //   var __for_idx_N = 0
+        //   while __for_idx_N < len(arr) {
+        //     var item = arr[__for_idx_N]
+        //     body
+        //     __for_idx_N = __for_idx_N + 1
+        //   }
+
+        const fb = self.current_func orelse return;
+
+        // Get iterable type to determine element type
+        const iter_type_idx = self.inferTypeFromExpr(for_stmt.iterable);
+        const iter_type = self.type_reg.get(iter_type_idx);
+
+        // Determine element type and length
+        var elem_type: TypeIndex = TypeRegistry.INT;
+        var arr_len: ?i64 = null; // null means runtime length (slice)
+        var is_slice = false;
+
+        switch (iter_type) {
+            .array => |a| {
+                elem_type = a.elem;
+                arr_len = @intCast(a.length);
+            },
+            .slice => |s| {
+                elem_type = s.elem;
+                is_slice = true;
+            },
+            .basic => |k| {
+                if (k == .string_type) {
+                    elem_type = TypeRegistry.U8;
+                    // String length would need runtime len call
+                }
+            },
+            else => {
+                log.debug("  for loop: unsupported iterable type", .{});
+                return;
+            },
+        }
+
+        // Generate unique name for hidden index variable
+        var idx_name_buf: [32]u8 = undefined;
+        const idx_name = std.fmt.bufPrint(&idx_name_buf, "__for_idx_{d}", .{self.for_counter}) catch "__for_idx";
+        self.for_counter += 1;
+
+        // Create hidden index variable: var __for_idx_N: i64 = 0
+        const idx_local = try fb.addLocalWithSize(idx_name, TypeRegistry.INT, true, 8);
+        const zero = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
+            .withAux(0);
+        const zero_idx = try fb.emit(zero);
+        const store_init = ir.Node.init(.store, TypeRegistry.INT, Span.fromPos(Pos.zero))
+            .withArgs(&.{ @as(ir.NodeIndex, @intCast(idx_local)), zero_idx });
+        _ = try fb.emit(store_init);
+
+        // Create loop variable: var item: elem_type
+        const elem_size = self.type_reg.sizeOf(elem_type);
+        const item_local = try fb.addLocalWithSize(for_stmt.binding, elem_type, true, elem_size);
+
+        // Create blocks for condition, body, and exit
+        const cond_block = try fb.newBlock("for.cond");
+        const body_block = try fb.newBlock("for.body");
+        const exit_block = try fb.newBlock("for.exit");
+
+        // Jump to condition block
+        const jump_cond = ir.Node.init(.jump, TypeRegistry.VOID, Span.fromPos(Pos.zero))
+            .withAux(@intCast(cond_block));
+        _ = try fb.emit(jump_cond);
+
+        // === Condition block ===
+        fb.setBlock(cond_block);
+
+        // Load current index
+        const load_idx = ir.Node.init(.load, TypeRegistry.INT, Span.fromPos(Pos.zero))
+            .withAux(@intCast(idx_local));
+        const idx_val = try fb.emit(load_idx);
+
+        // Get length of iterable
+        var len_val: ir.NodeIndex = undefined;
+        if (arr_len) |len| {
+            // Array: constant length
+            const len_node = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
+                .withAux(@intCast(len));
+            len_val = try fb.emit(len_node);
+        } else if (is_slice) {
+            // Slice: load length at runtime
+            // Need to get the iterable as a local to access .len field
+            const iter_node = self.tree.getNode(for_stmt.iterable);
+            if (iter_node == .expr and iter_node.expr == .identifier) {
+                const ident = iter_node.expr.identifier;
+                if (fb.lookupLocal(ident.name)) |iter_local| {
+                    // Slice len is at offset 8 (ptr at 0, len at 8)
+                    const len_field = ir.Node.init(.field, TypeRegistry.INT, Span.fromPos(Pos.zero))
+                        .withArgs(&.{@as(ir.NodeIndex, @intCast(iter_local))})
+                        .withAux(8);
+                    len_val = try fb.emit(len_field);
+                } else {
+                    // Fallback: zero length
+                    const zero_len = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
+                        .withAux(0);
+                    len_val = try fb.emit(zero_len);
+                }
+            } else {
+                // Fallback: zero length
+                const zero_len = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
+                    .withAux(0);
+                len_val = try fb.emit(zero_len);
+            }
+        } else {
+            // Fallback: zero length
+            const zero_len = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
+                .withAux(0);
+            len_val = try fb.emit(zero_len);
+        }
+
+        // Compare: idx < len
+        const cmp = ir.Node.init(.lt, TypeRegistry.BOOL, Span.fromPos(Pos.zero))
+            .withArgs(&.{ idx_val, len_val });
+        const cmp_idx = try fb.emit(cmp);
+
+        // Branch: if idx < len goto body else goto exit
+        const branch = ir.Node.init(.branch, TypeRegistry.VOID, Span.fromPos(Pos.zero))
+            .withArgs(&.{ cmp_idx, body_block, exit_block });
+        _ = try fb.emit(branch);
+
+        // === Body block ===
+        fb.setBlock(body_block);
+
+        // Load current index again for array access
+        const load_idx2 = ir.Node.init(.load, TypeRegistry.INT, Span.fromPos(Pos.zero))
+            .withAux(@intCast(idx_local));
+        const idx_val2 = try fb.emit(load_idx2);
+
+        // Get element at index: arr[__for_idx_N]
+        const iter_node = self.tree.getNode(for_stmt.iterable);
+        if (iter_node == .expr and iter_node.expr == .identifier) {
+            const ident = iter_node.expr.identifier;
+            if (fb.lookupLocal(ident.name)) |iter_local| {
+                if (is_slice) {
+                    // Slice indexing
+                    const slice_idx_node = ir.Node.init(.slice_index, elem_type, Span.fromPos(Pos.zero))
+                        .withArgs(&.{ @as(ir.NodeIndex, @intCast(iter_local)), idx_val2 })
+                        .withAux(@intCast(elem_size));
+                    const elem_val = try fb.emit(slice_idx_node);
+
+                    // Store to loop variable
+                    const store_item = ir.Node.init(.store, elem_type, Span.fromPos(Pos.zero))
+                        .withArgs(&.{ @as(ir.NodeIndex, @intCast(item_local)), elem_val });
+                    _ = try fb.emit(store_item);
+                } else {
+                    // Array indexing
+                    const addr_idx = ir.Node.init(.addr_index, elem_type, Span.fromPos(Pos.zero))
+                        .withArgs(&.{ @as(ir.NodeIndex, @intCast(iter_local)), idx_val2 })
+                        .withAux(@intCast(elem_size));
+                    const elem_val = try fb.emit(addr_idx);
+
+                    // Store to loop variable
+                    const store_item = ir.Node.init(.store, elem_type, Span.fromPos(Pos.zero))
+                        .withArgs(&.{ @as(ir.NodeIndex, @intCast(item_local)), elem_val });
+                    _ = try fb.emit(store_item);
+                }
+            }
+        }
+
+        // Execute body
+        _ = try self.lowerBlock(for_stmt.body);
+
+        // Increment index: __for_idx_N = __for_idx_N + 1
+        const load_idx3 = ir.Node.init(.load, TypeRegistry.INT, Span.fromPos(Pos.zero))
+            .withAux(@intCast(idx_local));
+        const idx_val3 = try fb.emit(load_idx3);
+
+        const one = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
+            .withAux(1);
+        const one_idx = try fb.emit(one);
+
+        const add_node = ir.Node.init(.add, TypeRegistry.INT, Span.fromPos(Pos.zero))
+            .withArgs(&.{ idx_val3, one_idx });
+        const new_idx = try fb.emit(add_node);
+
+        const store_inc = ir.Node.init(.store, TypeRegistry.INT, Span.fromPos(Pos.zero))
+            .withArgs(&.{ @as(ir.NodeIndex, @intCast(idx_local)), new_idx });
+        _ = try fb.emit(store_inc);
+
+        // Jump back to condition
+        const jump_back = ir.Node.init(.jump, TypeRegistry.VOID, Span.fromPos(Pos.zero))
+            .withAux(@intCast(cond_block));
+        _ = try fb.emit(jump_back);
+
+        // === Exit block ===
+        fb.setBlock(exit_block);
+        log.debug("  for loop: binding={s}, elem_type={d}", .{ for_stmt.binding, elem_type });
     }
 
     fn lowerBreak(self: *Lowerer) Allocator.Error!void {
@@ -763,6 +954,11 @@ pub const Lowerer = struct {
             return self.lowerBuiltinLen(call);
         }
 
+        // Handle builtin print()/println()
+        if (std.mem.eql(u8, func_name, "print") or std.mem.eql(u8, func_name, "println")) {
+            return self.lowerBuiltinPrint(call, func_name);
+        }
+
         // Lower arguments for regular call
         var args = std.ArrayList(ir.NodeIndex){ .items = &.{}, .capacity = 0 };
         defer args.deinit(self.allocator);
@@ -884,6 +1080,23 @@ pub const Lowerer = struct {
             else => {},
         }
         return null;
+    }
+
+    fn lowerBuiltinPrint(self: *Lowerer, call: ast.Call, func_name: []const u8) Allocator.Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+
+        if (call.args.len != 1) return ir.null_node;
+
+        // Lower the argument
+        const arg_node = try self.lowerExpr(call.args[0]);
+
+        // Emit as a call node - codegen will recognize "print"/"println" and emit syscall
+        const node = ir.Node.init(.call, TypeRegistry.VOID, Span.fromPos(Pos.zero))
+            .withArgs(&.{arg_node})
+            .withAuxStr(func_name);
+
+        log.debug("  {s}: builtin", .{func_name});
+        return try fb.emit(node);
     }
 
     fn lowerIndex(self: *Lowerer, index: ast.Index) Allocator.Error!ir.NodeIndex {

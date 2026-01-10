@@ -146,13 +146,18 @@ fn emit32(buf: *CodeBuffer, inst: u32) !void {
 }
 
 /// Build data processing (shifted register) instruction.
-/// Format: sf|opc|S|11010|shift|0|Rm|imm6|Rn|Rd
+/// Format: sf|op|S|01011|shift|0|Rm|imm6|Rn|Rd
+/// - sf: 1 for 64-bit, 0 for 32-bit
+/// - op: 0 for ADD, 1 for SUB (bit 30)
+/// - S: 1 to set flags (bit 29)
+/// - Fixed pattern 01011 at bits 28-24
 fn dataProcessingShifted(sf: bool, opc: u2, s: bool, rm: Reg, shift: Shift, imm6: u6, rn: Reg, rd: Reg) u32 {
     var inst: u32 = 0;
     if (sf) inst |= 1 << 31; // 64-bit
-    inst |= @as(u32, opc) << 29;
-    if (s) inst |= 1 << 28; // Set flags
-    inst |= 0b01011 << 24;
+    // opc bit 1 is the op field (ADD=0, SUB=1) at bit 30
+    inst |= @as(u32, (opc >> 1) & 1) << 30;
+    if (s) inst |= 1 << 29; // S: set flags at bit 29
+    inst |= 0b01011 << 24; // Fixed pattern at bits 28-24
     inst |= @as(u32, @intFromEnum(shift)) << 22;
     inst |= @as(u32, rm.id()) << 16;
     inst |= @as(u32, imm6) << 10;
@@ -580,6 +585,30 @@ pub fn callSymbol(buf: *CodeBuffer, symbol: []const u8) !void {
     try emit32(buf, branchImm(true, 0)); // Placeholder
 }
 
+/// ADRP + ADD to load symbol address into register
+/// ADRP loads page address, ADD adds page offset
+pub fn loadSymbolAddr(buf: *CodeBuffer, dst: Reg, symbol: []const u8) !void {
+    // ADRP Xd, symbol@PAGE
+    // Encoding: 1|immlo|10000|immhi|Rd
+    // We use relocation, so just emit with zeros
+    try buf.addRelocation(.aarch64_adrp, symbol, 0);
+    const adrp_inst: u32 = (1 << 31) | (0b10000 << 24) | @as(u32, dst.id());
+    try emit32(buf, adrp_inst);
+
+    // ADD Xd, Xd, symbol@PAGEOFF
+    // Encoding: 1|0|0|10001|00|imm12|Rn|Rd
+    try buf.addRelocation(.aarch64_add_lo12, symbol, 0);
+    const add_inst: u32 = (1 << 31) | (0b0010001 << 24) | (@as(u32, dst.id()) << 5) | @as(u32, dst.id());
+    try emit32(buf, add_inst);
+}
+
+/// SVC #imm16 - Supervisor call (syscall)
+pub fn svc(buf: *CodeBuffer, imm: u16) !void {
+    // SVC encoding: 11010100|000|imm16|00001
+    const inst: u32 = (0b11010100 << 24) | (0b000 << 21) | (@as(u32, imm) << 5) | 0b00001;
+    try emit32(buf, inst);
+}
+
 // ============================================================================
 // Miscellaneous
 // ============================================================================
@@ -884,4 +913,166 @@ test "aarch64 backend init" {
 
     // Check that registers were initialized
     try std.testing.expect(arm64_be.storage.free_general_regs.items.len > 0);
+}
+
+// ============================================================================
+// Instruction Encoding Validation Tests
+// These tests verify byte-exact encodings against known-correct ARM64 values.
+// Reference: ARM Architecture Reference Manual for A-profile architecture
+// ============================================================================
+
+test "SUB X0, X1, X2 encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try subRegReg(&buf, .x0, .x1, .x2);
+    // SUB X0, X1, X2: sf=1, op=1, S=0, 01011, shift=00, 0, Rm=x2, imm6=0, Rn=x1, Rd=x0
+    // 1 1 0 01011 00 0 00010 000000 00001 00000
+    // = 0xCB020020
+    const expected: u32 = 0xCB020020;
+    const actual: u32 = @bitCast(buf.getBytes()[0..4].*);
+    try std.testing.expectEqual(expected, actual);
+}
+
+test "SUBS X0, X1, X2 encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try subsRegReg(&buf, .x0, .x1, .x2);
+    // SUBS X0, X1, X2: sf=1, op=1, S=1, 01011, shift=00, 0, Rm=x2, imm6=0, Rn=x1, Rd=x0
+    // 1 1 1 01011 00 0 00010 000000 00001 00000
+    // = 0xEB020020
+    const expected: u32 = 0xEB020020;
+    const actual: u32 = @bitCast(buf.getBytes()[0..4].*);
+    try std.testing.expectEqual(expected, actual);
+}
+
+test "CMP X8, X9 encoding (SUBS XZR, X8, X9)" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try cmpRegReg(&buf, .x8, .x9);
+    // CMP X8, X9 = SUBS XZR, X8, X9: sf=1, op=1, S=1, 01011, shift=00, 0, Rm=x9, imm6=0, Rn=x8, Rd=xzr
+    // 1 1 1 01011 00 0 01001 000000 01000 11111
+    // = 0xEB09011F
+    const expected: u32 = 0xEB09011F;
+    const actual: u32 = @bitCast(buf.getBytes()[0..4].*);
+    try std.testing.expectEqual(expected, actual);
+}
+
+test "ADDS X0, X1, X2 encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try addsRegReg(&buf, .x0, .x1, .x2);
+    // ADDS X0, X1, X2: sf=1, op=0, S=1, 01011, shift=00, 0, Rm=x2, imm6=0, Rn=x1, Rd=x0
+    // 1 0 1 01011 00 0 00010 000000 00001 00000
+    // = 0xAB020020
+    const expected: u32 = 0xAB020020;
+    const actual: u32 = @bitCast(buf.getBytes()[0..4].*);
+    try std.testing.expectEqual(expected, actual);
+}
+
+test "CMP X8, #imm12 encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try cmpRegImm12(&buf, .x8, 42);
+    // CMP X8, #42 = SUBS XZR, X8, #42: sf=1, op=1, S=1, 100010, sh=0, imm12=42, Rn=x8, Rd=xzr
+    // 1 1 1 100010 0 000000101010 01000 11111
+    // = 0xF100A91F
+    const expected: u32 = 0xF100A91F;
+    const actual: u32 = @bitCast(buf.getBytes()[0..4].*);
+    try std.testing.expectEqual(expected, actual);
+}
+
+test "LDR X0, [SP, #offset] encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    // Load from [SP + 16] (offset is scaled by 8, so imm12=2)
+    try ldrRegImm(&buf, .x0, .sp, 2);
+    // LDR X0, [SP, #16]: size=11, V=0, opc=01, imm12=2, Rn=sp(31), Rt=x0(0)
+    // 0xF9400000 (base) + 0x800 (imm12=2 << 10) + 0x3E0 (rn=31 << 5) + 0 (rt)
+    // = 0xF9400BE0
+    const expected: u32 = 0xF9400BE0;
+    const actual: u32 = @bitCast(buf.getBytes()[0..4].*);
+    try std.testing.expectEqual(expected, actual);
+}
+
+test "STR X0, [SP, #offset] encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    // Store to [SP + 16] (offset is scaled by 8, so imm12=2)
+    try strRegImm(&buf, .x0, .sp, 2);
+    // STR X0, [SP, #16]: size=11, V=0, opc=00, imm12=2, Rn=sp(31), Rt=x0(0)
+    // 0xF9000000 (base) + 0x800 (imm12=2 << 10) + 0x3E0 (rn=31 << 5) + 0 (rt)
+    // = 0xF9000BE0
+    const expected: u32 = 0xF9000BE0;
+    const actual: u32 = @bitCast(buf.getBytes()[0..4].*);
+    try std.testing.expectEqual(expected, actual);
+}
+
+test "B.cond encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    // B.EQ with offset 0 (placeholder)
+    try bCond(&buf, .eq, 0);
+    // B.EQ #+0: 0101010 0 imm19=0 0 cond=0000
+    // = 0x54000000
+    const expected: u32 = 0x54000000;
+    const actual: u32 = @bitCast(buf.getBytes()[0..4].*);
+    try std.testing.expectEqual(expected, actual);
+}
+
+test "B.GE encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    // B.GE with offset 0 (placeholder)
+    try bCond(&buf, .ge, 0);
+    // B.GE #+0: 0101010 0 imm19=0 0 cond=1010
+    // = 0x5400000A
+    const expected: u32 = 0x5400000A;
+    const actual: u32 = @bitCast(buf.getBytes()[0..4].*);
+    try std.testing.expectEqual(expected, actual);
+}
+
+test "MUL X0, X1, X2 encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try mulRegReg(&buf, .x0, .x1, .x2);
+    // MUL X0, X1, X2 = MADD X0, X1, X2, XZR: sf=1, 00 11011 000 Rm=x2, 0 Ra=xzr, Rn=x1, Rd=x0
+    // 1 00 11011 000 00010 0 11111 00001 00000
+    // = 0x9B027C20
+    const expected: u32 = 0x9B027C20;
+    const actual: u32 = @bitCast(buf.getBytes()[0..4].*);
+    try std.testing.expectEqual(expected, actual);
+}
+
+test "SDIV X0, X1, X2 encoding" {
+    const allocator = std.testing.allocator;
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+
+    try sdivRegReg(&buf, .x0, .x1, .x2);
+    // SDIV X0, X1, X2: sf=1, 0 0 11010110 Rm=x2, 00001 1 Rn=x1, Rd=x0
+    // 1 0 0 11010110 00010 000011 00001 00000
+    // = 0x9AC20C20
+    const expected: u32 = 0x9AC20C20;
+    const actual: u32 = @bitCast(buf.getBytes()[0..4].*);
+    try std.testing.expectEqual(expected, actual);
 }

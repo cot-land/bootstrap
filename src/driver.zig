@@ -906,26 +906,76 @@ pub const Driver = struct {
         const rodata_idx = try obj.addSection("__cstring", .rodata);
         var rodata_section = obj.getSection(rodata_idx);
 
-        // Collect and store string literals
-        // Map from string content to offset in rodata
+        // Map from symbol name to offset in rodata
         var string_offsets = std.StringHashMap(u32).init(self.allocator);
         defer string_offsets.deinit();
 
+        // Track if we need a newline symbol for println
+        var needs_newline = false;
+
+        // Collect print/println calls and add their strings to rodata
         for (ssa_funcs.items) |*func| {
             for (func.blocks.items) |block| {
                 for (block.values.items) |value_id| {
                     const value = func.getValue(value_id);
-                    if (value.op == .const_string and value.aux_str.len > 0) {
-                        // Add string to rodata if not already there
-                        if (!string_offsets.contains(value.aux_str)) {
-                            const offset: u32 = @intCast(rodata_section.size());
-                            try rodata_section.append(self.allocator, value.aux_str);
-                            try rodata_section.append(self.allocator, &[_]u8{0}); // null terminator
-                            try string_offsets.put(value.aux_str, offset);
+
+                    // Check if we need a newline for println
+                    if (value.op == .call and std.mem.eql(u8, value.aux_str, "println")) {
+                        needs_newline = true;
+                    }
+
+                    // Add strings used by print/println calls
+                    if (value.op == .call and (std.mem.eql(u8, value.aux_str, "print") or std.mem.eql(u8, value.aux_str, "println"))) {
+                        const call_args = value.args();
+                        if (call_args.len > 0) {
+                            const arg_val = func.getValue(call_args[0]);
+                            if (arg_val.op == .const_string) {
+                                const str_content = arg_val.aux_str;
+                                // Strip quotes
+                                const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
+                                    str_content[1 .. str_content.len - 1]
+                                else
+                                    str_content;
+
+                                // Create symbol name
+                                const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
+
+                                // Add to rodata with symbol if not present
+                                if (!string_offsets.contains(sym_name)) {
+                                    const offset: u32 = @intCast(rodata_section.size());
+                                    try rodata_section.append(self.allocator, stripped);
+                                    try rodata_section.append(self.allocator, &[_]u8{0});
+                                    try string_offsets.put(sym_name, offset);
+
+                                    // Add symbol for the string
+                                    _ = try obj.addSymbol(.{
+                                        .name = sym_name,
+                                        .kind = .data,
+                                        .section = rodata_idx,
+                                        .offset = offset,
+                                        .size = @intCast(stripped.len + 1),
+                                        .global = false,
+                                    });
+                                }
+                            }
                         }
                     }
                 }
             }
+        }
+
+        // Add newline symbol if needed
+        if (needs_newline) {
+            const nl_offset: u32 = @intCast(rodata_section.size());
+            try rodata_section.append(self.allocator, "\n");
+            _ = try obj.addSymbol(.{
+                .name = "__str_newline",
+                .kind = .data,
+                .section = rodata_idx,
+                .offset = nl_offset,
+                .size = 1,
+                .global = false,
+            });
         }
 
         // Create backend based on architecture
@@ -1334,31 +1384,36 @@ pub const Driver = struct {
                 }
             },
             .call => {
-                // Set up arguments in registers, then call
-                const args = value.args();
-                for (args, 0..) |arg_id, i| {
-                    if (i >= arg_regs.len) break;
-                    const arg_val = func.getValue(arg_id);
+                // Check for builtin print/println
+                if (std.mem.eql(u8, value.aux_str, "print") or std.mem.eql(u8, value.aux_str, "println")) {
+                    try self.emitX86PrintSyscall(buf, func, value);
+                } else {
+                    // Set up arguments in registers, then call
+                    const args = value.args();
+                    for (args, 0..) |arg_id, i| {
+                        if (i >= arg_regs.len) break;
+                        const arg_val = func.getValue(arg_id);
 
-                    // Move argument value to appropriate register
-                    if (arg_val.op == .const_int) {
-                        try x86_64.movRegImm64(buf, arg_regs[i], arg_val.aux_int);
-                    } else if (arg_val.op == .arg) {
-                        // Already in an arg register, may need to shuffle
-                        const param_idx: u32 = @intCast(arg_val.aux_int);
-                        if (param_idx < arg_regs.len and param_idx != i) {
-                            try x86_64.movRegReg(buf, arg_regs[i], arg_regs[param_idx]);
+                        // Move argument value to appropriate register
+                        if (arg_val.op == .const_int) {
+                            try x86_64.movRegImm64(buf, arg_regs[i], arg_val.aux_int);
+                        } else if (arg_val.op == .arg) {
+                            // Already in an arg register, may need to shuffle
+                            const param_idx: u32 = @intCast(arg_val.aux_int);
+                            if (param_idx < arg_regs.len and param_idx != i) {
+                                try x86_64.movRegReg(buf, arg_regs[i], arg_regs[param_idx]);
+                            }
                         }
                     }
-                }
 
-                // Emit call to function
-                const func_name = if (self.options.target.os == .macos)
-                    try std.fmt.allocPrint(self.allocator, "_{s}", .{value.aux_str})
-                else
-                    value.aux_str;
-                try x86_64.callSymbol(buf, func_name);
-                // Return value is in rax
+                    // Emit call to function
+                    const call_func_name = if (self.options.target.os == .macos)
+                        try std.fmt.allocPrint(self.allocator, "_{s}", .{value.aux_str})
+                    else
+                        value.aux_str;
+                    try x86_64.callSymbol(buf, call_func_name);
+                    // Return value is in rax
+                }
             },
             .ret => {
                 // Return value should be in rax
@@ -1750,6 +1805,88 @@ pub const Driver = struct {
         }
     }
 
+    /// Emit x86_64 write call for print/println builtin
+    /// Uses libc write function instead of raw syscall to avoid relocation issues
+    fn emitX86PrintSyscall(self: *Driver, buf: *be.CodeBuffer, func: *ssa.Func, value: ssa.Value) !void {
+        const args = value.args();
+        if (args.len == 0) return;
+
+        const arg_val = func.getValue(args[0]);
+        const is_println = std.mem.eql(u8, value.aux_str, "println");
+
+        // Get string data
+        if (arg_val.op == .const_string) {
+            const str_content = arg_val.aux_str;
+            // Strip quotes from string literal
+            const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
+                str_content[1 .. str_content.len - 1]
+            else
+                str_content;
+
+            // Create unique symbol name for this string
+            const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
+
+            // Call write(fd=1, buf, len) via libc
+            // System V AMD64 ABI: rdi, rsi, rdx for first 3 args
+            try x86_64.movRegImm64(buf, .rdi, 1); // fd = stdout
+            try x86_64.leaRipSymbol(buf, .rsi, sym_name); // buf = string address
+            try x86_64.movRegImm64(buf, .rdx, @intCast(stripped.len)); // len
+            // Call write function (libc)
+            const write_name = if (self.options.target.os == .macos) "_write" else "write";
+            try x86_64.callSymbol(buf, write_name);
+
+            // For println, also write a newline
+            if (is_println) {
+                const nl_sym = "__str_newline";
+                try x86_64.movRegImm64(buf, .rdi, 1);
+                try x86_64.leaRipSymbol(buf, .rsi, nl_sym);
+                try x86_64.movRegImm64(buf, .rdx, 1);
+                try x86_64.callSymbol(buf, write_name);
+            }
+        }
+    }
+
+    /// Emit AArch64 write call for print/println builtin
+    /// Uses libc write function instead of raw syscall to avoid relocation issues
+    fn emitAArch64PrintSyscall(self: *Driver, buf: *be.CodeBuffer, func: *ssa.Func, value: ssa.Value) !void {
+        const args = value.args();
+        if (args.len == 0) return;
+
+        const arg_val = func.getValue(args[0]);
+        const is_println = std.mem.eql(u8, value.aux_str, "println");
+
+        // Get string data
+        if (arg_val.op == .const_string) {
+            const str_content = arg_val.aux_str;
+            // Strip quotes from string literal
+            const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
+                str_content[1 .. str_content.len - 1]
+            else
+                str_content;
+
+            // Create unique symbol name for this string
+            const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
+
+            // Call write(fd=1, buf, len) via libc
+            // AAPCS64: x0, x1, x2 for first 3 args
+            try aarch64.movRegImm64(buf, .x0, 1); // fd = stdout
+            try aarch64.loadSymbolAddr(buf, .x1, sym_name); // buf = string address
+            try aarch64.movRegImm64(buf, .x2, @intCast(stripped.len)); // len
+            // Call write function (libc)
+            const write_name = if (self.options.target.os == .macos) "_write" else "write";
+            try aarch64.callSymbol(buf, write_name);
+
+            // For println, also write a newline
+            if (is_println) {
+                const nl_sym = "__str_newline";
+                try aarch64.movRegImm64(buf, .x0, 1);
+                try aarch64.loadSymbolAddr(buf, .x1, nl_sym);
+                try aarch64.movRegImm64(buf, .x2, 1);
+                try aarch64.callSymbol(buf, write_name);
+            }
+        }
+    }
+
     fn generateAArch64Value(self: *Driver, buf: *be.CodeBuffer, func: *ssa.Func, value: ssa.Value, stack_size: u32, has_calls: bool) !void {
         // AAPCS64 argument registers: x0-x7
         const arg_regs = [_]aarch64.Reg{ .x0, .x1, .x2, .x3, .x4, .x5, .x6, .x7 };
@@ -1898,30 +2035,35 @@ pub const Driver = struct {
                 }
             },
             .call => {
-                // Set up arguments in registers, then call
-                const args = value.args();
-                for (args, 0..) |arg_id, i| {
-                    if (i >= arg_regs.len) break;
-                    const arg_val = func.getValue(arg_id);
+                // Check for builtin print/println
+                if (std.mem.eql(u8, value.aux_str, "print") or std.mem.eql(u8, value.aux_str, "println")) {
+                    try self.emitAArch64PrintSyscall(buf, func, value);
+                } else {
+                    // Set up arguments in registers, then call
+                    const args = value.args();
+                    for (args, 0..) |arg_id, i| {
+                        if (i >= arg_regs.len) break;
+                        const arg_val = func.getValue(arg_id);
 
-                    // Move argument value to appropriate register
-                    if (arg_val.op == .const_int) {
-                        try aarch64.movRegImm64(buf, arg_regs[i], arg_val.aux_int);
-                    } else if (arg_val.op == .arg) {
-                        const param_idx: u32 = @intCast(arg_val.aux_int);
-                        if (param_idx < arg_regs.len and param_idx != i) {
-                            try aarch64.movRegReg(buf, arg_regs[i], arg_regs[param_idx]);
+                        // Move argument value to appropriate register
+                        if (arg_val.op == .const_int) {
+                            try aarch64.movRegImm64(buf, arg_regs[i], arg_val.aux_int);
+                        } else if (arg_val.op == .arg) {
+                            const param_idx: u32 = @intCast(arg_val.aux_int);
+                            if (param_idx < arg_regs.len and param_idx != i) {
+                                try aarch64.movRegReg(buf, arg_regs[i], arg_regs[param_idx]);
+                            }
                         }
                     }
-                }
 
-                // Emit call to function
-                const func_name = if (self.options.target.os == .macos)
-                    try std.fmt.allocPrint(self.allocator, "_{s}", .{value.aux_str})
-                else
-                    value.aux_str;
-                try aarch64.callSymbol(buf, func_name);
-                // Return value is in x0
+                    // Emit call to function
+                    const call_func_name = if (self.options.target.os == .macos)
+                        try std.fmt.allocPrint(self.allocator, "_{s}", .{value.aux_str})
+                    else
+                        value.aux_str;
+                    try aarch64.callSymbol(buf, call_func_name);
+                    // Return value is in x0
+                }
             },
             .ret => {
                 // Return value should be in x0
@@ -2005,6 +2147,10 @@ pub const Driver = struct {
                             try aarch64.ldrRegImm(buf, .x9, .sp, offset_scaled);
                             try aarch64.cmpRegReg(buf, .x8, .x9);
                         }
+                    } else if (right.op == .field) {
+                        // Field result is in x0, move to x9 and compare
+                        try aarch64.movRegReg(buf, .x9, .x0);
+                        try aarch64.cmpRegReg(buf, .x8, .x9);
                     }
                     // Comparison result is in flags, will be used by branch
                 }
@@ -2519,4 +2665,101 @@ test "output path derivation" {
     };
     const out = opts.getOutputPath();
     try std.testing.expectEqualStrings("test", out);
+}
+
+// Exhaustive switch test - ensures all IR ops are accounted for.
+// If a new IR op is added, this test will fail to compile.
+test "IR op coverage - exhaustive" {
+    const ir_ops = [_]ir.Op{
+        // Constants
+        .const_int, .const_float, .const_string, .const_bool, .const_null,
+        // Variables
+        .local, .global, .param,
+        // Arithmetic
+        .add, .sub, .mul, .div, .mod, .neg,
+        // Comparison
+        .eq, .ne, .lt, .le, .gt, .ge,
+        // Logical
+        .@"and", .@"or", .not,
+        // Bitwise
+        .bit_and, .bit_or, .bit_xor, .bit_not, .shl, .shr,
+        // Memory
+        .load, .store, .addr_local, .addr_field, .addr_index,
+        // Struct/Array
+        .field, .index, .slice, .slice_index,
+        // Control Flow
+        .call, .ret, .jump, .branch, .phi, .select,
+        // Conversions
+        .convert, .ptr_cast,
+        // Misc
+        .nop,
+    };
+    // This switch must be exhaustive - will fail to compile if IR.Op has new values
+    for (ir_ops) |op| {
+        const is_valid = switch (op) {
+            .const_int, .const_float, .const_string, .const_bool, .const_null,
+            .local, .global, .param,
+            .add, .sub, .mul, .div, .mod, .neg,
+            .eq, .ne, .lt, .le, .gt, .ge,
+            .@"and", .@"or", .not,
+            .bit_and, .bit_or, .bit_xor, .bit_not, .shl, .shr,
+            .load, .store, .addr_local, .addr_field, .addr_index,
+            .field, .index, .slice, .slice_index,
+            .call, .ret, .jump, .branch, .phi, .select,
+            .convert, .ptr_cast,
+            .nop,
+            => true,
+        };
+        try std.testing.expect(is_valid);
+    }
+}
+
+// Exhaustive switch test - ensures all SSA ops are accounted for.
+// If a new SSA op is added, this test will fail to compile.
+test "SSA op coverage - exhaustive" {
+    const ssa_ops = [_]ssa.Op{
+        // Constants
+        .const_int, .const_float, .const_string, .const_bool, .const_nil,
+        // SSA specific
+        .phi, .copy,
+        // Arithmetic
+        .add, .sub, .mul, .div, .mod, .neg,
+        // Comparison
+        .eq, .ne, .lt, .le, .gt, .ge,
+        // Logical
+        .@"and", .@"or", .not,
+        // Select
+        .select,
+        // Memory
+        .load, .store, .addr, .alloc,
+        // Struct/array
+        .field, .index,
+        // Slice
+        .slice_make, .slice_index,
+        // Function
+        .call, .arg,
+        // ARC
+        .retain, .release,
+        // Control
+        .ret, .jump, .branch, .@"unreachable",
+    };
+    // This switch must be exhaustive - will fail to compile if SSA.Op has new values
+    for (ssa_ops) |op| {
+        const is_valid = switch (op) {
+            .const_int, .const_float, .const_string, .const_bool, .const_nil,
+            .phi, .copy,
+            .add, .sub, .mul, .div, .mod, .neg,
+            .eq, .ne, .lt, .le, .gt, .ge,
+            .@"and", .@"or", .not,
+            .select,
+            .load, .store, .addr, .alloc,
+            .field, .index,
+            .slice_make, .slice_index,
+            .call, .arg,
+            .retain, .release,
+            .ret, .jump, .branch, .@"unreachable",
+            => true,
+        };
+        try std.testing.expect(is_valid);
+    }
 }

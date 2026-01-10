@@ -38,6 +38,8 @@ Build a complete compiler in Zig that can compile simple cot programs.
 - [x] Slice support (compile-time) - arr[i:j] syntax, len() constant folding
 - [x] Slice support (runtime) - ptr+len storage (16 bytes), len() on slice variables
 - [x] Slice indexing (runtime) - s[i] access
+- [x] Switch expressions - switch x { 1 => a, 2 => b, else => c }
+- [x] For-in loops - `for x in arr { ... }` (arrays and slices)
 - [ ] Standard library basics (print, memory)
 
 **Automated Test Runner**
@@ -57,7 +59,11 @@ Running with `--debug-codegen` will show warnings for any unhandled SSA operatio
 
 ### Verified Test Results (January 2026)
 
-**Both ARM64 and x86_64** - 33/33 tests pass
+**Test Counts:**
+- 129 Zig embedded tests (unit tests in source files)
+- 36 binary tests (.cot test files)
+
+**Both ARM64 and x86_64** - 36/36 tests pass
 
 | Test File | Expected | ARM64 | x86_64 |
 |-----------|----------|-------|--------|
@@ -83,8 +89,12 @@ Running with `--debug-codegen` will show warnings for any unhandled SSA operatio
 | test_sub.cot (50 - 8) | 42 | PASS | PASS |
 | test_mul.cot (6 * 7) | 42 | PASS | PASS |
 | test_div.cot (84 / 2) | 42 | PASS | PASS |
+| test_switch.cot (switch expression) | 42 | PASS | PASS |
+| test_slice_index.cot (s[i] access) | 30 | PASS | PASS |
+| test_for_array.cot (for x in arr) | 60 | PASS | PASS |
+| test_for_slice.cot (for x in slice) | 90 | PASS | PASS |
 
-**All tests pass** - conditionals, while loops, and string comparisons now working.
+**All tests pass** - conditionals, while loops, string comparisons, switch expressions, slice indexing, and for-in loops now working.
 
 ### Testing Commands
 
