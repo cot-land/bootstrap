@@ -103,6 +103,8 @@ pub const Op = enum(u8) {
 
     // Struct/array
     field,
+    // Load field through pointer: args[0] = local index holding ptr, aux_int = field offset
+    ptr_field,
     index,
 
     // Slice construction

@@ -3,7 +3,7 @@
 This document tracks language features required for self-hosting the cot compiler.
 Features are extracted from the .cot wireframe files in `src/`.
 
-**Last Updated:** 2026-01-10
+**Last Updated:** 2026-01-11
 
 ## Legend
 
@@ -134,8 +134,8 @@ These features are used extensively in all .cot files and must work first.
 
 | Feature | Status | Used In | Notes |
 |---------|--------|---------|-------|
-| Methods with self | Partial | ir.cot, checker.cot | `fn method(self: *T) { }` - definition works |
-| Method call syntax (UFCS) | **Gap** | All | `obj.method()` - not yet implemented |
+| Methods with self | Implemented | ir.cot, checker.cot | `fn method(self: *T) { }` |
+| Method call syntax (UFCS) | Implemented | All | `obj.method()` transforms to `method(&obj)` |
 
 ---
 
@@ -378,6 +378,6 @@ The switch must work as an expression (returns value) with payload capture.
 3. ~~**Map methods**~~ - **DONE** (`.set()`, `.get()`, `.has()` all work)
 4. ~~**List<T> runtime**~~ - **DONE** (runtime library with push/get/len/free)
 5. ~~**List methods**~~ - **DONE** (`.push()`, `.get()` method call syntax works)
-6. **Methods** - `fn method(self: *T)` pattern
+6. ~~**Methods**~~ - **DONE** (`fn method(self: *T)` + UFCS `obj.method()`)
 7. **String interpolation** - `"Error: ${msg}"` syntax
 8. **@maxInt/@minInt** - Integer bounds for type checks

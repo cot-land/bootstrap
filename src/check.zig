@@ -124,6 +124,18 @@ pub const Scope = struct {
 };
 
 // ============================================================================
+// Method Info
+// ============================================================================
+
+/// Information about a method attached to a type.
+pub const MethodInfo = struct {
+    name: []const u8, // method name
+    func_name: []const u8, // function name (for IR lookup)
+    func_type: TypeIndex, // full function type (with self)
+    receiver_is_ptr: bool, // true if self: *T, false if self: T
+};
+
+// ============================================================================
 // Checker
 // ============================================================================
 
@@ -145,6 +157,8 @@ pub const Checker = struct {
     current_return_type: TypeIndex,
     /// Are we inside a loop? (for break/continue)
     in_loop: bool,
+    /// Method registry: maps type name -> list of methods
+    method_registry: std.StringHashMap(std.ArrayList(MethodInfo)),
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -162,11 +176,18 @@ pub const Checker = struct {
             .expr_types = std.AutoHashMap(NodeIndex, TypeIndex).init(allocator),
             .current_return_type = TypeRegistry.VOID,
             .in_loop = false,
+            .method_registry = std.StringHashMap(std.ArrayList(MethodInfo)).init(allocator),
         };
     }
 
     pub fn deinit(self: *Checker) void {
         self.expr_types.deinit();
+        // Deinit all method lists in the registry
+        var it = self.method_registry.valueIterator();
+        while (it.next()) |methods| {
+            methods.deinit(self.allocator);
+        }
+        self.method_registry.deinit();
     }
 
     // ========================================================================
@@ -207,6 +228,11 @@ pub const Checker = struct {
                     idx,
                     false,
                 ));
+
+                // Check if this is a method (first param named "self")
+                if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "self")) {
+                    try self.registerMethod(f.name, f.params[0].type_expr, func_type);
+                }
             },
             .var_decl => |v| {
                 if (self.scope.isDefined(v.name)) {
@@ -282,6 +308,68 @@ pub const Checker = struct {
             },
             .bad_decl => {},
         }
+    }
+
+    /// Register a method for a type.
+    /// self_type_expr is the AST node for the self parameter type (e.g., *Counter or Counter).
+    fn registerMethod(self: *Checker, func_name: []const u8, self_type_expr: NodeIndex, func_type: TypeIndex) CheckError!void {
+        // Resolve the self type to get the receiver type name
+        const type_node = self.tree.getNode(self_type_expr);
+        if (type_node != .expr) return;
+        const expr = type_node.expr;
+        if (expr != .type_expr) return;
+
+        const te = expr.type_expr;
+        var receiver_name: []const u8 = undefined;
+        var is_ptr = false;
+
+        switch (te.kind) {
+            .named => |name| {
+                receiver_name = name;
+                is_ptr = false;
+            },
+            .pointer => |ptr_elem| {
+                // It's a pointer type, get the element type name
+                const elem_node = self.tree.getNode(ptr_elem);
+                if (elem_node == .expr and elem_node.expr == .type_expr) {
+                    const elem_te = elem_node.expr.type_expr;
+                    if (elem_te.kind == .named) {
+                        receiver_name = elem_te.kind.named;
+                        is_ptr = true;
+                    } else {
+                        return; // Can't handle non-named pointer types
+                    }
+                } else {
+                    return;
+                }
+            },
+            else => return, // Can't handle other self types for now
+        }
+
+        // Add to method registry
+        const gop = try self.method_registry.getOrPut(receiver_name);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = std.ArrayList(MethodInfo){ .items = &.{}, .capacity = 0 };
+        }
+
+        try gop.value_ptr.append(self.allocator, MethodInfo{
+            .name = func_name,
+            .func_name = func_name,
+            .func_type = func_type,
+            .receiver_is_ptr = is_ptr,
+        });
+    }
+
+    /// Look up a method for a type by name.
+    pub fn lookupMethod(self: *const Checker, type_name: []const u8, method_name: []const u8) ?MethodInfo {
+        if (self.method_registry.get(type_name)) |methods| {
+            for (methods.items) |method| {
+                if (std.mem.eql(u8, method.name, method_name)) {
+                    return method;
+                }
+            }
+        }
+        return null;
     }
 
     // ========================================================================
@@ -581,18 +669,28 @@ pub const Checker = struct {
         const callee_type = try self.checkExpr(c.callee);
         const callee = self.types.get(callee_type);
 
+        // Check if this is a method call (callee is field_access on struct/pointer)
+        const is_method_call = self.isMethodCall(c.callee);
+
         switch (callee) {
             .func => |ft| {
+                // For method calls, the function has self as first param, but caller doesn't pass it
+                const expected_args = if (is_method_call and ft.params.len > 0)
+                    ft.params.len - 1
+                else
+                    ft.params.len;
+
                 // Check argument count
-                if (c.args.len != ft.params.len) {
+                if (c.args.len != expected_args) {
                     self.err.errorWithCode(c.span.start, .E300, "wrong number of arguments");
                     return invalid_type;
                 }
 
-                // Check argument types
+                // Check argument types (skip self param for method calls)
+                const param_offset: usize = if (is_method_call) 1 else 0;
                 for (c.args, 0..) |arg_idx, i| {
                     const arg_type = try self.checkExpr(arg_idx);
-                    const param_type = ft.params[i].type_idx;
+                    const param_type = ft.params[i + param_offset].type_idx;
                     if (!self.isAssignable(arg_type, param_type)) {
                         self.errTypeMismatch(c.span.start, param_type, arg_type);
                     }
@@ -605,6 +703,30 @@ pub const Checker = struct {
                 return invalid_type;
             },
         }
+    }
+
+    /// Check if a callee expression is a method call (field_access on struct type with matching method).
+    fn isMethodCall(self: *Checker, callee_idx: NodeIndex) bool {
+        const callee_expr = self.tree.getExpr(callee_idx) orelse return false;
+        if (callee_expr != .field_access) return false;
+
+        const fa = callee_expr.field_access;
+        const base_type_idx = self.expr_types.get(fa.base) orelse return false;
+        const base_type = self.types.get(base_type_idx);
+
+        const struct_name = switch (base_type) {
+            .struct_type => |st| st.name,
+            .pointer => |ptr| blk: {
+                const elem = self.types.get(ptr.elem);
+                if (elem == .struct_type) {
+                    break :blk elem.struct_type.name;
+                }
+                return false;
+            },
+            else => return false,
+        };
+
+        return self.lookupMethod(struct_name, fa.field) != null;
     }
 
     /// Check builtin len() function.
@@ -800,10 +922,17 @@ pub const Checker = struct {
         // Handle struct field access
         switch (base) {
             .struct_type => |st| {
+                // First check for struct fields
                 for (st.fields) |field| {
                     if (std.mem.eql(u8, field.name, f.field)) {
                         return field.type_idx;
                     }
+                }
+                // Then check for methods on this struct type
+                if (self.lookupMethod(st.name, f.field)) |method| {
+                    // Return the function type - caller will see this as callable
+                    // The method has self as first param, but caller doesn't pass it explicitly
+                    return method.func_type;
                 }
                 self.errUndefined(f.span.start, f.field);
                 return invalid_type;
@@ -849,10 +978,15 @@ pub const Checker = struct {
                 const elem = self.types.get(ptr.elem);
                 switch (elem) {
                     .struct_type => |st| {
+                        // First check for struct fields
                         for (st.fields) |field| {
                             if (std.mem.eql(u8, field.name, f.field)) {
                                 return field.type_idx;
                             }
+                        }
+                        // Then check for methods on this struct type
+                        if (self.lookupMethod(st.name, f.field)) |method| {
+                            return method.func_type;
                         }
                         self.errUndefined(f.span.start, f.field);
                         return invalid_type;

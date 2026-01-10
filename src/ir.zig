@@ -120,6 +120,8 @@ pub const Op = enum(u8) {
     addr_field,
     /// Get array element address. args[0] = array addr, args[1] = index
     addr_index,
+    /// Load field through pointer. args[0] = local holding ptr, aux = field offset
+    ptr_field,
 
     // ========== Struct/Array/Union ==========
     /// Get struct field. aux = field index, args[0] = struct value

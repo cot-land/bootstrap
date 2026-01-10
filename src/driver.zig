@@ -320,6 +320,8 @@ pub const Driver = struct {
     tree: ?*ast.Ast = null,
     type_reg: ?*types.TypeRegistry = null,
     ir_data: ?*ir.IR = null,
+    type_checker: ?*check.Checker = null,
+    global_scope: ?*check.Scope = null,
 
     // Diagnostics
     err_reporter: ?*errors.ErrorReporter = null,
@@ -355,6 +357,14 @@ pub const Driver = struct {
         if (self.ir_data) |i| {
             // TODO: IR.deinit() when implemented
             self.allocator.destroy(i);
+        }
+        if (self.type_checker) |tc| {
+            tc.deinit();
+            self.allocator.destroy(tc);
+        }
+        if (self.global_scope) |gs| {
+            gs.deinit();
+            self.allocator.destroy(gs);
         }
         if (self.err_reporter) |er| {
             // ErrorReporter has no deinit (stack-based)
@@ -529,17 +539,22 @@ pub const Driver = struct {
         const reg = try self.allocator.create(types.TypeRegistry);
         reg.* = try types.TypeRegistry.init(self.allocator);
 
-        // Create global scope for type checking
-        var global_scope = check.Scope.init(self.allocator, null);
-        defer global_scope.deinit();
+        // Create global scope for type checking (heap-allocated for persistence)
+        const global_scope = try self.allocator.create(check.Scope);
+        global_scope.* = check.Scope.init(self.allocator, null);
+        self.global_scope = global_scope;
 
-        var checker = check.Checker.init(
+        // Create type checker (heap-allocated for persistence)
+        const checker = try self.allocator.create(check.Checker);
+        checker.* = check.Checker.init(
             self.allocator,
             self.tree.?,
             reg,
             self.err_reporter.?,
-            &global_scope,
+            global_scope,
         );
+        self.type_checker = checker;
+
         checker.checkFile() catch {
             return error.TypeError;
         };
@@ -561,6 +576,7 @@ pub const Driver = struct {
             self.tree.?,
             self.type_reg.?,
             self.err_reporter.?,
+            self.type_checker.?,
         );
 
         if (self.options.verbose) {
@@ -907,6 +923,21 @@ pub const Driver = struct {
             return value_id;
         }
 
+        // Handle ptr_field - load field through pointer
+        // args[0] = local index holding pointer, aux = field offset
+        if (node.op == .ptr_field) {
+            const value_id = try func.newValue(.ptr_field, node.type_idx, block);
+            var value = func.getValue(value_id);
+            // Store local_idx in args_storage[0] as a raw value (not SSA ref)
+            // and field_offset in aux_int
+            if (node.args_len > 0) {
+                value.args_storage[0] = node.args()[0]; // local index holding ptr
+                value.args_len = 1;
+            }
+            value.aux_int = node.aux; // field offset
+            return value_id;
+        }
+
         // Handle slice - slice construction from array
         // IR args: [0] = local index (raw), [1] = start (IR node), [2] = end (IR node)
         // aux = element size
@@ -1211,6 +1242,7 @@ pub const Driver = struct {
             .not => .not,
             .load => .load,
             .local => .load, // Local variable load becomes SSA load
+            .addr_local => .addr, // Address of local variable
             .store => .store,
             .jump => .jump,
             .branch => .branch,
@@ -1427,6 +1459,17 @@ pub const Driver = struct {
                     const stack_size: i32 = @intCast(@max(512, func.frame_size));
                     try x86_64.subRegImm32(&code_buf, .rsp, stack_size);
 
+                    // Spill function parameters from argument registers to local slots
+                    // Parameters are the first param_count locals
+                    // System V AMD64 ABI: arguments in rdi, rsi, rdx, rcx, r8, r9
+                    const x86_arg_regs = [_]x86_64.Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
+                    const num_params = @min(func.param_count, @as(u32, @intCast(x86_arg_regs.len)));
+                    for (0..num_params) |param_idx| {
+                        const local_offset: i32 = func.locals[param_idx].offset;
+                        // mov [rbp + offset], reg
+                        try x86_64.movMemReg(&code_buf, .rbp, local_offset, x86_arg_regs[param_idx]);
+                    }
+
                     // Track branch positions for patching
                     var branch_patches: std.ArrayList(BranchPatch) = .{ .items = &.{}, .capacity = 0 };
                     defer branch_patches.deinit(self.allocator);
@@ -1548,6 +1591,20 @@ pub const Driver = struct {
                     if (has_calls) {
                         // stp fp, lr, [sp, #-16]!
                         try aarch64.stpPreIndex(&code_buf, .fp, .lr, .sp, -2);
+                    }
+
+                    // Spill function parameters from argument registers to local slots
+                    // Parameters are the first param_count locals
+                    // AArch64 ABI: arguments in x0-x7
+                    const arm_arg_regs = [_]aarch64.Reg{ .x0, .x1, .x2, .x3, .x4, .x5, .x6, .x7 };
+                    const num_params = @min(func.param_count, @as(u32, @intCast(arm_arg_regs.len)));
+                    for (0..num_params) |param_idx| {
+                        const x86_offset: i32 = func.locals[param_idx].offset;
+                        const local_offset: i32 = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
+                        if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
+                            const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
+                            try aarch64.strRegImm(&code_buf, arm_arg_regs[param_idx], .sp, offset_scaled);
+                        }
                     }
 
                     // Track branch positions for patching
@@ -1841,6 +1898,17 @@ pub const Driver = struct {
                             if (param_idx < arg_regs.len and param_idx != i) {
                                 try x86_64.movRegReg(buf, arg_regs[i], arg_regs[param_idx]);
                             }
+                        } else if (arg_val.op == .addr) {
+                            // Address of local variable - compute stack address
+                            const local_idx: usize = @intCast(arg_val.aux_int);
+                            const local_offset: i32 = func.locals[local_idx].offset;
+                            // lea reg, [rbp + offset]
+                            try x86_64.leaRegMem(buf, arg_regs[i], .rbp, local_offset);
+                        } else if (arg_val.op == .load) {
+                            // Load from local variable
+                            const local_idx: usize = @intCast(arg_val.aux_int);
+                            const local_offset: i32 = func.locals[local_idx].offset;
+                            try x86_64.movRegMem(buf, arg_regs[i], .rbp, local_offset);
                         }
                     }
 
@@ -2002,6 +2070,24 @@ pub const Driver = struct {
                     // Load from [rbp + local_offset + field_offset]
                     const total_offset: i32 = local_offset + field_offset;
                     try x86_64.movRegMem(buf, .rax, .rbp, total_offset);
+                }
+            },
+            .ptr_field => {
+                // Load field through pointer: local holds pointer, load from ptr + offset
+                // args[0] = local index holding pointer, aux_int = field offset
+                const args = value.args();
+                if (args.len > 0) {
+                    const local_idx = args[0];
+                    const field_offset: i32 = @intCast(value.aux_int);
+
+                    // Get stack offset of local holding the pointer
+                    const local_offset: i32 = func.locals[@intCast(local_idx)].offset;
+
+                    // Load the pointer into rax: mov rax, [rbp + local_offset]
+                    try x86_64.movRegMem(buf, .rax, .rbp, local_offset);
+
+                    // Load field from pointer: mov rax, [rax + field_offset]
+                    try x86_64.movRegMem(buf, .rax, .rax, field_offset);
                 }
             },
             .index => {
@@ -3003,6 +3089,24 @@ pub const Driver = struct {
                             if (param_idx < arg_regs.len and param_idx != i) {
                                 try aarch64.movRegReg(buf, arg_regs[i], arg_regs[param_idx]);
                             }
+                        } else if (arg_val.op == .addr) {
+                            // Address of local variable - compute stack address
+                            const local_idx: usize = @intCast(arg_val.aux_int);
+                            const x86_offset: i32 = func.locals[local_idx].offset;
+                            const local_offset: i32 = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
+                            // add reg, sp, #offset
+                            if (local_offset >= 0 and local_offset <= 4095) {
+                                try aarch64.addRegImm12(buf, arg_regs[i], .sp, @intCast(local_offset));
+                            }
+                        } else if (arg_val.op == .load) {
+                            // Load from local variable
+                            const local_idx: usize = @intCast(arg_val.aux_int);
+                            const x86_offset: i32 = func.locals[local_idx].offset;
+                            const local_offset: i32 = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
+                            if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
+                                const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
+                                try aarch64.ldrRegImm(buf, arg_regs[i], .sp, offset_scaled);
+                            }
                         }
                     }
 
@@ -3288,6 +3392,35 @@ pub const Driver = struct {
                     if (total_offset >= 0 and @mod(total_offset, 8) == 0) {
                         const offset_scaled: u12 = @intCast(@divExact(total_offset, 8));
                         try aarch64.ldrRegImm(buf, .x0, .sp, offset_scaled);
+                    }
+                }
+            },
+            .ptr_field => {
+                // Load field through pointer: local holds pointer, load from ptr + offset
+                // args[0] = local index holding pointer, aux_int = field offset
+                const args = value.args();
+                if (args.len > 0) {
+                    const local_idx = args[0];
+                    const field_offset: i32 = @intCast(value.aux_int);
+
+                    // Convert x86-style negative offset to ARM64 positive sp-relative offset
+                    const x86_offset: i32 = func.locals[@intCast(local_idx)].offset;
+                    const local_offset: i32 = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
+
+                    // Load the pointer into x8: ldr x8, [sp, #local_offset]
+                    if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
+                        const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
+                        try aarch64.ldrRegImm(buf, .x8, .sp, offset_scaled);
+                    }
+
+                    // Load field from pointer: ldr x0, [x8, #field_offset]
+                    if (field_offset >= 0 and @mod(field_offset, 8) == 0) {
+                        const field_offset_scaled: u12 = @intCast(@divExact(field_offset, 8));
+                        try aarch64.ldrRegImm(buf, .x0, .x8, field_offset_scaled);
+                    } else {
+                        // Unaligned field offset: add offset to pointer and load
+                        try aarch64.addRegImm12(buf, .x8, .x8, @intCast(field_offset));
+                        try aarch64.ldrRegImm(buf, .x0, .x8, 0);
                     }
                 }
             },
@@ -4204,7 +4337,7 @@ test "IR op coverage - exhaustive" {
         // Memory
         .load, .store, .addr_local, .addr_field, .addr_index,
         // Struct/Array/Union
-        .field, .index, .slice, .slice_index,
+        .field, .ptr_field, .index, .slice, .slice_index,
         .union_init, .union_tag, .union_payload,
         // Map operations
         .map_new, .map_set, .map_get, .map_has, .map_size, .map_free,
@@ -4227,7 +4360,7 @@ test "IR op coverage - exhaustive" {
             .@"and", .@"or", .not,
             .bit_and, .bit_or, .bit_xor, .bit_not, .shl, .shr,
             .load, .store, .addr_local, .addr_field, .addr_index,
-            .field, .index, .slice, .slice_index,
+            .field, .ptr_field, .index, .slice, .slice_index,
             .union_init, .union_tag, .union_payload,
             .map_new, .map_set, .map_get, .map_has, .map_size, .map_free,
             .list_new, .list_push, .list_get, .list_len, .list_free,
@@ -4259,7 +4392,7 @@ test "SSA op coverage - exhaustive" {
         // Memory
         .load, .store, .addr, .alloc,
         // Struct/array
-        .field, .index,
+        .field, .ptr_field, .index,
         // Slice
         .slice_make, .slice_index,
         // Union
@@ -4285,7 +4418,7 @@ test "SSA op coverage - exhaustive" {
             .@"and", .@"or", .not,
             .select,
             .load, .store, .addr, .alloc,
-            .field, .index,
+            .field, .ptr_field, .index,
             .slice_make, .slice_index,
             .union_init, .union_tag, .union_payload,
             .map_new, .map_set, .map_get, .map_has, .map_size, .map_free,

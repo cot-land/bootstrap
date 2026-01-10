@@ -67,9 +67,9 @@ Running with `--debug-codegen` will show warnings for any unhandled SSA operatio
 
 **Test Counts:**
 - 135+ Zig embedded tests (unit tests in source files)
-- 47 binary tests (.cot test files)
+- 48 binary tests (.cot test files)
 
-**Both ARM64 and x86_64** - 47/47 tests pass
+**Both ARM64 and x86_64** - 48/48 tests pass
 
 | Test File | Expected | ARM64 | x86_64 |
 |-----------|----------|-------|--------|
@@ -108,6 +108,7 @@ Running with `--debug-codegen` will show warnings for any unhandled SSA operatio
 | test_list_simple.cot (list push/get) | 42 | PASS | PASS |
 | test_list_methods.cot (list operations) | 42 | PASS | PASS |
 | test_value_lifetime.cot (intermediate value preservation) | 42 | PASS | PASS |
+| test_method.cot (method call with self: *T) | 42 | PASS | PASS |
 
 **All tests pass** - conditionals, while loops, string comparisons, switch expressions, slice indexing, for-in loops, tagged unions with payload capture, Map<K,V>, List<T>, and value lifetime preservation all working.
 

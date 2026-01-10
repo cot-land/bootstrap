@@ -68,6 +68,7 @@ get_expected() {
         test_list_simple) echo 42 ;;
         test_list_methods) echo 42 ;;
         test_value_lifetime) echo 42 ;;
+        test_method) echo 42 ;;
         *) echo "" ;;
     esac
 }

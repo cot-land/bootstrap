@@ -14,6 +14,7 @@ const types = @import("types.zig");
 const source = @import("source.zig");
 const errors = @import("errors.zig");
 const debug = @import("debug.zig");
+const check = @import("check.zig");
 
 const Allocator = std.mem.Allocator;
 const Ast = ast.Ast;
@@ -37,6 +38,7 @@ pub const Lowerer = struct {
     type_reg: *TypeRegistry,
     err: *ErrorReporter,
     builder: ir.Builder,
+    checker: *const check.Checker,
 
     // Current function context (like Go's Curfn)
     current_func: ?*ir.FuncBuilder = null,
@@ -49,6 +51,7 @@ pub const Lowerer = struct {
         tree: *const Ast,
         type_reg: *TypeRegistry,
         err: *ErrorReporter,
+        chk: *const check.Checker,
     ) Lowerer {
         return .{
             .allocator = allocator,
@@ -56,6 +59,7 @@ pub const Lowerer = struct {
             .type_reg = type_reg,
             .err = err,
             .builder = ir.Builder.init(allocator, type_reg),
+            .checker = chk,
         };
     }
 
@@ -98,7 +102,11 @@ pub const Lowerer = struct {
 
     fn lowerFnDecl(self: *Lowerer, fn_decl: ast.FnDecl, _: NodeIndex) !void {
         const name = fn_decl.name;
-        const return_type = fn_decl.return_type orelse TypeRegistry.VOID;
+        // Resolve return type from AST node to TypeIndex
+        const return_type = if (fn_decl.return_type) |rt_node|
+            self.resolveTypeExprNode(rt_node)
+        else
+            TypeRegistry.VOID;
         const span = fn_decl.span;
 
         log.debug("lowering function: {s}", .{name});
@@ -110,11 +118,11 @@ pub const Lowerer = struct {
         if (self.builder.current_func) |*fb| {
             self.current_func = fb;
 
-            // Add parameters
+            // Add parameters - resolve type expressions to TypeIndex
             for (fn_decl.params) |param| {
-                const param_type = param.type_expr;
+                const param_type = self.resolveTypeExprNode(param.type_expr);
                 _ = try fb.addParam(param.name, param_type);
-                log.debug("  param: {s}", .{param.name});
+                log.debug("  param: {s} type_idx={d}", .{ param.name, param_type });
             }
 
             // Lower function body
@@ -1019,6 +1027,23 @@ pub const Lowerer = struct {
                             } else if (local_type == .list_type) {
                                 log.debug("  list method call: {s}.{s}", .{ var_name, fa.field });
                                 return self.lowerListMethodCall(call, fa.field, @intCast(local_idx));
+                            } else if (local_type == .struct_type) {
+                                // Check if this is a method call on a struct
+                                const struct_name = local_type.struct_type.name;
+                                if (self.checker.lookupMethod(struct_name, fa.field)) |method| {
+                                    log.debug("  struct method call: {s}.{s}", .{ var_name, fa.field });
+                                    return self.lowerStructMethodCall(call, method, @intCast(local_idx), false);
+                                }
+                            } else if (local_type == .pointer) {
+                                // Check if this is a method call on a pointer to struct
+                                const elem_type = self.type_reg.get(local_type.pointer.elem);
+                                if (elem_type == .struct_type) {
+                                    const struct_name = elem_type.struct_type.name;
+                                    if (self.checker.lookupMethod(struct_name, fa.field)) |method| {
+                                        log.debug("  struct ptr method call: {s}.{s}", .{ var_name, fa.field });
+                                        return self.lowerStructMethodCall(call, method, @intCast(local_idx), true);
+                                    }
+                                }
                             }
                         }
                     }
@@ -1450,6 +1475,53 @@ pub const Lowerer = struct {
         }
     }
 
+    /// Lower a struct method call: obj.method(args) -> method(&obj, args) or method(obj, args)
+    fn lowerStructMethodCall(self: *Lowerer, call: ast.Call, method: check.MethodInfo, local_idx: u32, is_ptr: bool) Allocator.Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+
+        var args = std.ArrayList(ir.NodeIndex){ .items = &.{}, .capacity = 0 };
+        defer args.deinit(self.allocator);
+
+        // First argument is the receiver (self)
+        if (method.receiver_is_ptr and !is_ptr) {
+            // Method wants *T but we have T - emit addr_local
+            const addr_node = ir.Node.init(.addr_local, TypeRegistry.VOID, Span.fromPos(Pos.zero))
+                .withAux(@intCast(local_idx));
+            const receiver = try fb.emit(addr_node);
+            try args.append(self.allocator, receiver);
+            log.debug("  method receiver: &local[{d}]", .{local_idx});
+        } else if (!method.receiver_is_ptr and is_ptr) {
+            // Method wants T but we have *T - emit load from local (dereference)
+            const local = fb.locals.items[local_idx];
+            const load_node = ir.Node.init(.local, local.type_idx, Span.fromPos(Pos.zero))
+                .withAux(@intCast(local_idx));
+            const receiver = try fb.emit(load_node);
+            try args.append(self.allocator, receiver);
+            log.debug("  method receiver: *local[{d}]", .{local_idx});
+        } else {
+            // Types match - pass address for both cases (pointer for ptr method, address for value method)
+            const addr_node = ir.Node.init(.addr_local, TypeRegistry.VOID, Span.fromPos(Pos.zero))
+                .withAux(@intCast(local_idx));
+            const receiver = try fb.emit(addr_node);
+            try args.append(self.allocator, receiver);
+            log.debug("  method receiver: &local[{d}]", .{local_idx});
+        }
+
+        // Lower the remaining arguments
+        for (call.args) |arg_idx| {
+            const arg_node = try self.lowerExpr(arg_idx);
+            try args.append(self.allocator, arg_node);
+        }
+
+        // Emit the call to the method function
+        const node = ir.Node.init(.call, TypeRegistry.VOID, Span.fromPos(Pos.zero))
+            .withArgs(try self.allocator.dupe(ir.NodeIndex, args.items))
+            .withAuxStr(method.func_name);
+
+        log.debug("  method call: {s}({d} args)", .{ method.func_name, args.items.len });
+        return try fb.emit(node);
+    }
+
     fn lowerIndex(self: *Lowerer, index: ast.Index) Allocator.Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
 
@@ -1616,6 +1688,7 @@ pub const Lowerer = struct {
         const base_type = self.type_reg.get(base_type_idx);
         var field_offset: u32 = 0;
         var field_type_idx: TypeIndex = TypeRegistry.VOID;
+        var is_ptr_deref = false;
 
         switch (base_type) {
             .struct_type => |st| {
@@ -1627,21 +1700,45 @@ pub const Lowerer = struct {
                     }
                 }
             },
+            .pointer => |ptr| {
+                // Pointer to struct - need to dereference
+                const elem_type = self.type_reg.get(ptr.elem);
+                if (elem_type == .struct_type) {
+                    const st = elem_type.struct_type;
+                    for (st.fields) |f| {
+                        if (std.mem.eql(u8, f.name, field.field)) {
+                            field_offset = f.offset;
+                            field_type_idx = f.type_idx;
+                            is_ptr_deref = true;
+                            break;
+                        }
+                    }
+                }
+            },
             else => {},
         }
 
-        log.debug("  field_access: .{s} at offset {d}", .{ field.field, field_offset });
+        log.debug("  field_access: .{s} at offset {d}, ptr_deref={}", .{ field.field, field_offset, is_ptr_deref });
 
         // Emit: addr_local for base, then load at offset
         const base_node_idx = self.tree.getNode(field.base);
         if (base_node_idx == .expr and base_node_idx.expr == .identifier) {
             const ident = base_node_idx.expr.identifier;
             if (fb.lookupLocal(ident.name)) |local_idx| {
-                // Emit addr_field: get address of field within struct
-                const addr_node = ir.Node.init(.addr_field, field_type_idx, Span.fromPos(Pos.zero))
-                    .withArgs(&.{@intCast(local_idx)})
-                    .withAux(@intCast(field_offset));
-                return try fb.emit(addr_node);
+                if (is_ptr_deref) {
+                    // For pointer to struct: load pointer value, then access field at offset
+                    // args[0] = local_idx (which holds the pointer), aux = field_offset
+                    const node = ir.Node.init(.ptr_field, field_type_idx, Span.fromPos(Pos.zero))
+                        .withArgs(&.{@intCast(local_idx)})
+                        .withAux(@intCast(field_offset));
+                    return try fb.emit(node);
+                } else {
+                    // For direct struct: emit addr_field: get address of field within struct
+                    const addr_node = ir.Node.init(.addr_field, field_type_idx, Span.fromPos(Pos.zero))
+                        .withArgs(&.{@intCast(local_idx)})
+                        .withAux(@intCast(field_offset));
+                    return try fb.emit(addr_node);
+                }
             }
         }
 
@@ -1874,6 +1971,12 @@ pub const Lowerer = struct {
                         // Look up in registry
                         return self.type_reg.lookupByName(name) orelse TypeRegistry.VOID;
                     },
+                    .pointer => |ptr_elem| {
+                        // Pointer type: *T
+                        const elem_type = self.resolveTypeExprNode(ptr_elem);
+                        // Create pointer type in registry
+                        return self.type_reg.makePointer(elem_type) catch TypeRegistry.VOID;
+                    },
                     else => return TypeRegistry.VOID,
                 }
             }
@@ -2034,8 +2137,9 @@ pub fn lowerAst(
     tree: *const Ast,
     type_reg: *TypeRegistry,
     err: *ErrorReporter,
+    chk: *const check.Checker,
 ) !ir.IR {
-    var lowerer = Lowerer.init(allocator, tree, type_reg, err);
+    var lowerer = Lowerer.init(allocator, tree, type_reg, err, chk);
     defer lowerer.deinit();
     return try lowerer.lower();
 }
@@ -2053,8 +2157,12 @@ test "lowerer init" {
     var src = source.Source.init(allocator, "test", "");
     defer src.deinit();
     var err = errors.ErrorReporter.init(&src, null);
+    var global_scope = check.Scope.init(allocator, null);
+    defer global_scope.deinit();
+    var checker = check.Checker.init(allocator, &tree, &type_reg, &err, &global_scope);
+    defer checker.deinit();
 
-    var lowerer = Lowerer.init(allocator, &tree, &type_reg, &err);
+    var lowerer = Lowerer.init(allocator, &tree, &type_reg, &err, &checker);
     defer lowerer.deinit();
 
     try std.testing.expect(lowerer.current_func == null);
@@ -2075,6 +2183,10 @@ test "inferTypeFromExpr returns non-VOID for union constructor" {
     var src = source.Source.init(allocator, "test", "");
     defer src.deinit();
     var err = errors.ErrorReporter.init(&src, null);
+    var global_scope = check.Scope.init(allocator, null);
+    defer global_scope.deinit();
+    var checker = check.Checker.init(allocator, &tree, &type_reg, &err, &global_scope);
+    defer checker.deinit();
 
     // Register a union type
     const variants = try allocator.alloc(types.UnionVariant, 1);
@@ -2089,7 +2201,7 @@ test "inferTypeFromExpr returns non-VOID for union constructor" {
     const size = type_reg.sizeOf(union_type_idx);
     try std.testing.expect(size > 0);
 
-    var lowerer = Lowerer.init(allocator, &tree, &type_reg, &err);
+    var lowerer = Lowerer.init(allocator, &tree, &type_reg, &err, &checker);
     defer lowerer.deinit();
 
     // The lowerer is initialized - real integration testing would require

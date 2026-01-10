@@ -1,0 +1,12 @@
+struct Counter {
+    value: i64,
+}
+
+fn get_value(self: *Counter) i64 {
+    return self.value;
+}
+
+fn main() i64 {
+    var c = Counter{ .value = 42 };
+    return c.get_value();
+}
