@@ -1131,7 +1131,7 @@ pub const CodeGen = struct {
         try self.setResult(value.id, .{ .register = .rax });
     }
 
-    /// Generate code for list_get: runtime call cot_native_list_get(handle, index)
+    /// Generate code for list_get: runtime call cot_list_get(handle, index)
     /// Uses inline op type lookup (archive pattern) for reliable operand loading
     pub fn genListGet(self: *CodeGen, value: *ssa.Value) !void {
         const args = value.args();
@@ -1147,7 +1147,7 @@ pub const CodeGen = struct {
         const idx_mcv = self.getValue(args[1]);
         try self.loadToReg(.rsi, idx_mcv);
 
-        try self.emitRuntimeCall("cot_native_list_get");
+        try self.emitRuntimeCall("cot_list_get");
 
         // Result in rax
         self.reg_manager.markUsed(.rax, value.id);
@@ -1283,15 +1283,11 @@ pub const CodeGen = struct {
         try self.emitRuntimeCall("cot_map_free");
     }
 
-    /// Generate code for list_new: call calloc(1, 24) directly (archive pattern)
+    /// Generate code for list_new: call cot_list_new() runtime function
     pub fn genListNew(self: *CodeGen, value: *ssa.Value) !void {
         try self.spillCallerSaved();
-        // calloc(1, 24) for 24-byte header (elements_ptr, length, capacity)
-        try x86.movRegImm64(self.buf, .rdi, 1);
-        try x86.movRegImm64(self.buf, .rsi, 24);
-        const calloc_name = if (self.os == .macos) "_calloc" else "calloc";
-        try x86.callSymbol(self.buf, calloc_name);
-        // rax now has pointer to zeroed list header
+        try self.emitRuntimeCall("cot_list_new");
+        // rax now has list handle
         self.reg_manager.markUsed(.rax, value.id);
         try self.setResult(value.id, .{ .register = .rax });
     }
@@ -1312,21 +1308,21 @@ pub const CodeGen = struct {
         const val_mcv = self.getValue(args[1]);
         try self.loadToReg(.rsi, val_mcv);
 
-        try self.emitRuntimeCall("cot_native_list_push");
+        try self.emitRuntimeCall("cot_list_push");
     }
 
     /// Generate code for list_len: args[0]=handle
-    /// Inline implementation: read length from [list_ptr + 8]
     pub fn genListLen(self: *CodeGen, value: *ssa.Value) !void {
         const args = value.args();
         if (args.len == 0) return;
+
+        try self.spillCallerSaved();
 
         // Load handle into rdi via MCValue
         const handle_mcv = self.getValue(args[0]);
         try self.loadToReg(.rdi, handle_mcv);
 
-        // Load length from [rdi + 8] into rax (inline, no call needed)
-        try x86.movRegMem(self.buf, .rax, .rdi, 8);
+        try self.emitRuntimeCall("cot_list_len");
 
         self.reg_manager.markUsed(.rax, value.id);
         try self.setResult(value.id, .{ .register = .rax });
@@ -1343,7 +1339,7 @@ pub const CodeGen = struct {
         const handle_mcv = self.getValue(args[0]);
         try self.loadToReg(.rdi, handle_mcv);
 
-        try self.emitRuntimeCall("cot_native_list_free");
+        try self.emitRuntimeCall("cot_list_free");
     }
 
     /// Generate code for str_concat: concatenate two strings via runtime

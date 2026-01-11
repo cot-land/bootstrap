@@ -45,7 +45,7 @@ fn genMyOp(self: *CodeGen, value: *ssa.Value) !void {
 **Common bugs:**
 - Loading left operand clobbers right (if both target same register)
 - Forgetting to call `setResult()` after an operation
-- Using wrong function names for runtime calls (`cot_map_*` not `cot_native_map_*`)
+- Using wrong function names for runtime calls (check runtime/*.zig for correct names)
 
 ---
 

@@ -1021,7 +1021,7 @@ pub const CodeGen = struct {
         try self.setResult(value.id, .{ .register = .x0 });
     }
 
-    /// Generate code for list_get: call runtime cot_native_list_get(handle, index)
+    /// Generate code for list_get: call runtime cot_list_get(handle, index)
     /// Uses MCValue for all operands
     pub fn genListGet(self: *CodeGen, value: *ssa.Value) !void {
         const args = value.args();
@@ -1038,7 +1038,7 @@ pub const CodeGen = struct {
         const idx_mcv = self.getValue(args[1]);
         try self.loadToReg(.x1, idx_mcv);
 
-        try aarch64.callSymbol(self.buf, "_cot_native_list_get");
+        try aarch64.callSymbol(self.buf, "_cot_list_get");
 
         // Result in x0
         self.reg_manager.markUsed(.x0, value.id);
@@ -1199,13 +1199,10 @@ pub const CodeGen = struct {
         try aarch64.callSymbol(self.buf, "_cot_map_free");
     }
 
-    /// Generate code for list_new: call calloc(1, 24) directly (archive pattern)
+    /// Generate code for list_new: call cot_list_new() runtime function
     pub fn genListNew(self: *CodeGen, value: *ssa.Value) !void {
-        // calloc(1, 24) for 24-byte header (elements_ptr, length, capacity)
-        try aarch64.movRegImm64(self.buf, .x0, 1);
-        try aarch64.movRegImm64(self.buf, .x1, 24);
-        try aarch64.callSymbol(self.buf, "_calloc");
-        // x0 now has pointer to zeroed list header
+        try aarch64.callSymbol(self.buf, "_cot_list_new");
+        // x0 now has list handle
         self.reg_manager.markUsed(.x0, value.id);
         try self.setResult(value.id, .{ .register = .x0 });
     }
@@ -1224,11 +1221,10 @@ pub const CodeGen = struct {
         const val_mcv = self.getValue(args[1]);
         try self.loadToReg(.x1, val_mcv);
 
-        try aarch64.callSymbol(self.buf, "_cot_native_list_push");
+        try aarch64.callSymbol(self.buf, "_cot_list_push");
     }
 
     /// Generate code for list_len: args[0]=handle
-    /// Inline implementation: read length from [list_ptr + 8]
     pub fn genListLen(self: *CodeGen, value: *ssa.Value) !void {
         const args = value.args();
         if (args.len == 0) return;
@@ -1237,8 +1233,7 @@ pub const CodeGen = struct {
         const handle_mcv = self.getValue(args[0]);
         try self.loadToReg(.x0, handle_mcv);
 
-        // Load length from [x0 + 8] into x0 (inline, no call needed)
-        try aarch64.ldrRegImm(self.buf, .x0, .x0, 1); // offset 1 = 8 bytes (scaled)
+        try aarch64.callSymbol(self.buf, "_cot_list_len");
 
         self.reg_manager.markUsed(.x0, value.id);
         try self.setResult(value.id, .{ .register = .x0 });
@@ -1253,7 +1248,7 @@ pub const CodeGen = struct {
         const handle_mcv = self.getValue(args[0]);
         try self.loadToReg(.x0, handle_mcv);
 
-        try aarch64.callSymbol(self.buf, "_cot_native_list_free");
+        try aarch64.callSymbol(self.buf, "_cot_list_free");
     }
 
     /// Generate code for str_concat: concatenate two strings via runtime
