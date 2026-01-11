@@ -4,6 +4,13 @@ zig-out/
 
 # Object files
 *.o
+*.obj
+
+# Windows executables
+*.exe
+*.dll
+*.lib
+*.pdb
 
 # Compiled binaries
 test

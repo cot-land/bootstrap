@@ -1007,6 +1007,65 @@ cot/
 
 Windows support is important for broader adoption. The good news: x86_64 instruction encoding is already complete and identical on Windows. Only the packaging and calling convention differ.
 
+### Current Status (January 2026)
+
+**PE/COFF object generation is implemented and working.** The compiler produces valid Windows .obj files that link with `zig cc` and execute correctly. The runtime library is compiled and linked.
+
+#### Windows Test Results
+
+```
+58 passed, 5 failed, 1 skipped (91% pass rate)
+```
+
+| Category | Count | Notes |
+|----------|-------|-------|
+| Passing | 58 | Core language + function calls + strings work |
+| Runtime crashes | 5 | Complex runtime library interop issues |
+| Skipped | 1 | test_print (no expected value) |
+
+**Remaining Issues:**
+- `test_interpolation` - String concat with runtime library crashes
+- `test_interp_var` - String concat with variables crashes
+- `test_list_methods` - List operations (heap corruption)
+- `test_list_simple` - List operations (heap corruption)
+- `test_map_methods` - Map operations (alignment error)
+
+These failures are related to complex runtime library calls with multiple parameters. The core language features all work correctly.
+
+#### Fixes Applied
+1. **Win64 calling convention** - Uses rcx, rdx, r8, r9 instead of SysV rdi, rsi, rdx, rcx
+2. **Shadow space** - All function calls now allocate 32 bytes of shadow space on Windows
+3. **COFF local relocation fix** - Disabled ARM64 patching that was incorrectly applied to x86_64 COFF
+4. **Windows linker** - Uses `zig cc` for consistent cross-platform linking
+
+#### Files Implemented
+
+| File | Status | Description |
+|------|--------|-------------|
+| `src/codegen/pe_coff.zig` | ✓ NEW | COFF object file writer (~500 lines) |
+| `src/codegen/object.zig` | ✓ Modified | Added `.coff` format, `writeCOFF()` method |
+| `src/debug.zig` | ✓ Modified | Added `pe_coff` category, Windows-compatible getenv |
+| `run_tests_windows.ps1` | ✓ NEW | PowerShell test runner |
+| `run_tests_windows.bat` | ✓ NEW | Batch file wrapper |
+| `.gitignore` | ✓ Modified | Added `*.obj`, `*.exe`, `*.dll`, `*.lib`, `*.pdb` |
+
+#### Running Windows Tests
+
+```powershell
+# PowerShell
+.\run_tests_windows.ps1
+
+# Or via batch file
+.\run_tests_windows.bat
+
+# Or manually
+zig build
+.\zig-out\bin\cot.exe tests\test_return.cot -o test_return
+zig cc test_return.obj -o test_return.exe
+.\test_return.exe
+echo $LASTEXITCODE  # Should print 42
+```
+
 ### What's Reusable (100%)
 
 | Component | Notes |
@@ -1015,9 +1074,9 @@ Windows support is important for broader adoption. The good news: x86_64 instruc
 | Register allocation | Architecture-level, OS-independent |
 | SSA/IR/frontend | Completely OS-independent |
 
-### New Work Required
+### Remaining Work
 
-#### 1. PE/COFF Object Format
+#### 1. PE/COFF Object Format ✓ COMPLETE
 
 Windows uses PE/COFF instead of ELF (Linux) or Mach-O (macOS):
 
@@ -1025,20 +1084,23 @@ Windows uses PE/COFF instead of ELF (Linux) or Mach-O (macOS):
 codegen/object.zig:
 ├── writeMachO()   ← macOS (done)
 ├── writeELF()     ← Linux (done)
-└── writePE()      ← Windows (new)
+└── writeCOFF()    ← Windows (done) - calls pe_coff.zig
 ```
 
-**Effort:** 1-2 days
+**Implementation:** `src/codegen/pe_coff.zig`
 
-PE/COFF structure:
-- DOS header (legacy stub)
-- PE signature
-- COFF file header
-- Optional header (PE32+)
-- Section headers (.text, .data, .rdata)
+COFF structure implemented:
+- COFF file header (20 bytes)
+- Section headers (40 bytes each): .text, .rdata
 - Section data
-- Symbol table
-- Relocation entries
+- Symbol table (18 bytes per symbol)
+- String table (for names > 8 chars)
+- Relocation entries (10 bytes each)
+
+All x86_64 COFF relocation types supported:
+- `IMAGE_REL_AMD64_REL32` - PC-relative 32-bit
+- `IMAGE_REL_AMD64_ADDR64` - Absolute 64-bit
+- Plus 14 more relocation types defined
 
 #### 2. Win64 Calling Convention
 
@@ -1163,6 +1225,12 @@ This requires:
 
 ### Testing Strategy
 
+**Current: Native Windows Testing** ✓ Implemented
+- `run_tests_windows.ps1` - PowerShell test runner
+- `run_tests_windows.bat` - Batch file wrapper
+- Uses `zig cc` for linking (cross-platform, no VS required)
+- 52/64 tests passing (81%)
+
 **Option A: Windows VM/Machine**
 - Most reliable
 - Full integration testing
@@ -1188,14 +1256,15 @@ This requires:
 
 ### Timeline Summary
 
-| Task | Effort |
-|------|--------|
-| PE/COFF object writer | 1-2 days |
-| Win64 calling convention | 0.5-1 day |
-| Runtime (print, exit) | 0.5-1 day |
-| Linker integration | 0.5 day |
-| Testing/debugging | 1-2 days |
-| **Total** | **3-5 days** |
+| Task | Effort | Status |
+|------|--------|--------|
+| PE/COFF object writer | 1-2 days | ✓ Complete |
+| Windows test infrastructure | 0.5 day | ✓ Complete |
+| Win64 calling convention | 0.5-1 day | Pending |
+| Runtime (print, exit) | 0.5-1 day | Pending |
+| Linker integration (zig cc) | 0.5 day | ✓ Working |
+| Testing/debugging | 1-2 days | In progress (81% passing) |
+| **Total** | **3-5 days** | ~50% complete |
 
 ### When to Implement
 

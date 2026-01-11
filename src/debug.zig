@@ -31,11 +31,24 @@ pub const Category = enum {
     regalloc, // Register allocation debugging
     codegen, // Code generation debugging
     object, // Object file debugging
+    pe_coff, // PE/COFF (Windows) object file debugging
 
     pub fn enabled(self: Category) bool {
         return isEnabled(self);
     }
 };
+
+/// Cross-platform getenv helper (returns null on Windows for now)
+fn getEnvCrossPlat(comptime name: []const u8) ?[]const u8 {
+    // Windows uses WTF-16 for environment strings, std.posix.getenv is not available
+    // For now, return null on Windows (debug features disabled)
+    // TODO: Use std.process.getEnvVarOwned with an allocator for Windows
+    if (comptime builtin.os.tag == .windows) {
+        return null;
+    } else {
+        return std.posix.getenv(name);
+    }
+}
 
 /// Check if a debug category is enabled.
 /// In release builds, this always returns false (zero overhead).
@@ -51,7 +64,7 @@ pub fn isEnabled(category: Category) bool {
             if (initialized) return;
             initialized = true;
 
-            const env = std.posix.getenv("COT_DEBUG") orelse return;
+            const env = getEnvCrossPlat("COT_DEBUG") orelse return;
 
             // Parse comma-separated categories: "ssa,regalloc,codegen"
             var iter = std.mem.splitScalar(u8, env, ',');
@@ -127,11 +140,11 @@ pub const DumpConfig = struct {
         if (builtin.mode != .Debug) return .{};
 
         return .{
-            .dump_ir = std.posix.getenv("COT_DUMP_IR") != null,
-            .dump_func = std.posix.getenv("COT_DUMP_FUNC"),
-            .dump_dir = std.posix.getenv("COT_DUMP_DIR"),
-            .validate_ir = std.posix.getenv("COT_VALIDATE_IR") != null,
-            .trace_regalloc = std.posix.getenv("COT_TRACE_REGALLOC") != null,
+            .dump_ir = getEnvCrossPlat("COT_DUMP_IR") != null,
+            .dump_func = getEnvCrossPlat("COT_DUMP_FUNC"),
+            .dump_dir = getEnvCrossPlat("COT_DUMP_DIR"),
+            .validate_ir = getEnvCrossPlat("COT_VALIDATE_IR") != null,
+            .trace_regalloc = getEnvCrossPlat("COT_TRACE_REGALLOC") != null,
         };
     }
 };
@@ -219,7 +232,7 @@ pub fn regAllocTraceLevel() RegAllocTraceLevel {
     if (builtin.mode != .Debug) return .none;
     if (!config.trace_regalloc) return .none;
 
-    const level_str = std.posix.getenv("COT_TRACE_REGALLOC") orelse return .spills;
+    const level_str = getEnvCrossPlat("COT_TRACE_REGALLOC") orelse return .spills;
 
     return std.fmt.parseInt(u8, level_str, 10) catch return .spills;
 }

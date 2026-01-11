@@ -382,6 +382,43 @@ pub const Driver = struct {
         }
     }
 
+    // ========================================================================
+    // Calling Convention Helpers
+    // ========================================================================
+
+    /// Get the x86_64 argument registers for the current target OS.
+    /// Win64: rcx, rdx, r8, r9
+    /// SysV (Linux/macOS): rdi, rsi, rdx, rcx, r8, r9
+    fn getX86ArgRegs(self: *const Driver) []const x86_64.Reg {
+        return switch (self.options.target.os) {
+            .windows => &[_]x86_64.Reg{ .rcx, .rdx, .r8, .r9 },
+            .linux, .macos => &[_]x86_64.Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 },
+        };
+    }
+
+    /// Get the shadow space size required before function calls.
+    /// Win64: 32 bytes (4 x 8-byte slots for register parameters)
+    /// SysV: 0 bytes
+    fn getX86ShadowSpace(self: *const Driver) i32 {
+        return switch (self.options.target.os) {
+            .windows => 32,
+            .linux, .macos => 0,
+        };
+    }
+
+    /// Emit a function call with proper Win64 shadow space handling
+    fn emitX86Call(self: *const Driver, buf: *be.CodeBuffer, symbol: []const u8) !void {
+        // Win64 requires 32 bytes of shadow space before every call
+        const shadow = self.getX86ShadowSpace();
+        if (shadow > 0) {
+            try x86_64.subRegImm32(buf, .rsp, shadow);
+        }
+        try x86_64.callSymbol(buf, symbol);
+        if (shadow > 0) {
+            try x86_64.addRegImm32(buf, .rsp, shadow);
+        }
+    }
+
     /// Run full compilation pipeline
     pub fn compile(self: *Driver) CompileResult {
         if (self.options.verbose) {
@@ -1451,7 +1488,7 @@ pub const Driver = struct {
             self.options.target.arch,
             self.options.target.os,
         );
-        var obj = object.ObjectFile.init(self.allocator, format);
+        var obj = object.ObjectFile.initWithArch(self.allocator, format, self.options.target.arch);
         defer obj.deinit();
 
         // Add text section
@@ -1639,8 +1676,8 @@ pub const Driver = struct {
 
                     // Spill function parameters from argument registers to local slots
                     // Parameters are the first param_count locals
-                    // System V AMD64 ABI: arguments in rdi, rsi, rdx, rcx, r8, r9
-                    const x86_arg_regs = [_]x86_64.Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
+                    // Win64: rcx, rdx, r8, r9 | SysV: rdi, rsi, rdx, rcx, r8, r9
+                    const x86_arg_regs = self.getX86ArgRegs();
                     const num_params = @min(func.param_count, @as(u32, @intCast(x86_arg_regs.len)));
                     for (0..num_params) |param_idx| {
                         const local_offset: i32 = func.locals[param_idx].offset;
@@ -1901,7 +1938,7 @@ pub const Driver = struct {
     /// Returns the x86_64 register containing the value
     fn loadX86ValueToReg(self: *Driver, buf: *be.CodeBuffer, func: *ssa.Func, value_id: ssa.ValueID, hint_reg: ?x86_64.Reg) !x86_64.Reg {
         const value = &func.values.items[value_id];
-        const arg_regs = [_]x86_64.Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
+        const arg_regs = self.getX86ArgRegs();
         const target_reg: x86_64.Reg = hint_reg orelse .rax;
         const target_reg_num: u5 = @truncate(@intFromEnum(target_reg));
 
@@ -1991,8 +2028,8 @@ pub const Driver = struct {
     }
 
     fn generateX86Value(self: *Driver, buf: *be.CodeBuffer, func: *ssa.Func, value: ssa.Value, value_idx: u32) !void {
-        // System V AMD64 ABI argument registers
-        const arg_regs = [_]x86_64.Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
+        // Argument registers: Win64 (rcx, rdx, r8, r9) or SysV (rdi, rsi, rdx, rcx, r8, r9)
+        const arg_regs = self.getX86ArgRegs();
 
         switch (value.op) {
             .const_int, .const_bool, .const_string, .load => {
@@ -2154,7 +2191,7 @@ pub const Driver = struct {
                         try std.fmt.allocPrint(self.allocator, "_{s}", .{value.aux_str})
                     else
                         value.aux_str;
-                    try x86_64.callSymbol(buf, call_func_name);
+                    try self.emitX86Call(buf, call_func_name);
                     // Invalidate caller-saved registers since call may have clobbered them
                     self.invalidateX86CallerSaved();
                     // Return value is in rax - save to storage slot for later use
@@ -2784,11 +2821,11 @@ pub const Driver = struct {
             // Slot meta: 0 = empty, 1 = occupied, 2 = deleted
             .map_new => {
                 // Call calloc(1, 2080) to allocate zeroed map
-                // System V AMD64 ABI: rdi=nmemb, rsi=size
-                try x86_64.movRegImm64(buf, .rdi, 1);
-                try x86_64.movRegImm64(buf, .rsi, 2080); // 32 header + 64*32 slots
+                // arg_regs already available from outer scope
+                try x86_64.movRegImm64(buf, arg_regs[0], 1);
+                try x86_64.movRegImm64(buf, arg_regs[1], 2080); // 32 header + 64*32 slots
                 const calloc_name = if (self.options.target.os == .macos) "_calloc" else "calloc";
-                try x86_64.callSymbol(buf, calloc_name);
+                try self.emitX86Call(buf, calloc_name);
                 self.invalidateX86CallerSaved();
                 // rax now has pointer to zeroed map
 
@@ -2851,7 +2888,7 @@ pub const Driver = struct {
                 }
 
                 const map_set_name = if (self.options.target.os == .macos) "_cot_native_map_set" else "cot_native_map_set";
-                try x86_64.callSymbol(buf, map_set_name);
+                try self.emitX86Call(buf, map_set_name);
                 self.invalidateX86CallerSaved();
                 // Result is in rax
             },
@@ -2891,7 +2928,7 @@ pub const Driver = struct {
                 }
 
                 const map_get_name = if (self.options.target.os == .macos) "_cot_native_map_get" else "cot_native_map_get";
-                try x86_64.callSymbol(buf, map_get_name);
+                try self.emitX86Call(buf, map_get_name);
                 self.invalidateX86CallerSaved();
                 // Result is in rax
             },
@@ -2931,7 +2968,7 @@ pub const Driver = struct {
                 }
 
                 const map_has_name = if (self.options.target.os == .macos) "_cot_native_map_has" else "cot_native_map_has";
-                try x86_64.callSymbol(buf, map_has_name);
+                try self.emitX86Call(buf, map_has_name);
                 self.invalidateX86CallerSaved();
                 // Result is in rax
             },
@@ -2950,7 +2987,7 @@ pub const Driver = struct {
                     }
                 }
                 const map_size_name = if (self.options.target.os == .macos) "_cot_native_map_size" else "cot_native_map_size";
-                try x86_64.callSymbol(buf, map_size_name);
+                try self.emitX86Call(buf, map_size_name);
                 self.invalidateX86CallerSaved();
                 // Result is in rax
             },
@@ -2969,7 +3006,7 @@ pub const Driver = struct {
                     }
                 }
                 const map_free_name = if (self.options.target.os == .macos) "_cot_native_map_free" else "cot_native_map_free";
-                try x86_64.callSymbol(buf, map_free_name);
+                try self.emitX86Call(buf, map_free_name);
                 self.invalidateX86CallerSaved();
             },
             // ========== List Operations (native layout + FFI) ==========
@@ -2983,7 +3020,7 @@ pub const Driver = struct {
                 try x86_64.movRegImm64(buf, .rdi, 1);
                 try x86_64.movRegImm64(buf, .rsi, 24); // 24-byte header
                 const calloc_name = if (self.options.target.os == .macos) "_calloc" else "calloc";
-                try x86_64.callSymbol(buf, calloc_name);
+                try self.emitX86Call(buf, calloc_name);
                 self.invalidateX86CallerSaved();
                 // rax now has pointer to zeroed list header
                 // All fields (elements_ptr=0, length=0, capacity=0) already correct from calloc
@@ -3013,7 +3050,7 @@ pub const Driver = struct {
                     }
                 }
                 const list_push_name = if (self.options.target.os == .macos) "_cot_native_list_push" else "cot_native_list_push";
-                try x86_64.callSymbol(buf, list_push_name);
+                try self.emitX86Call(buf, list_push_name);
                 self.invalidateX86CallerSaved();
             },
             .list_get => {
@@ -3041,7 +3078,7 @@ pub const Driver = struct {
                     }
                 }
                 const list_get_name = if (self.options.target.os == .macos) "_cot_native_list_get" else "cot_native_list_get";
-                try x86_64.callSymbol(buf, list_get_name);
+                try self.emitX86Call(buf, list_get_name);
                 self.invalidateX86CallerSaved();
                 // Result is in rax - save to storage for later use
                 const slot = try self.storage.allocate(value_idx);
@@ -3082,7 +3119,7 @@ pub const Driver = struct {
                     }
                 }
                 const list_free_name = if (self.options.target.os == .macos) "_cot_native_list_free" else "cot_native_list_free";
-                try x86_64.callSymbol(buf, list_free_name);
+                try self.emitX86Call(buf, list_free_name);
                 self.invalidateX86CallerSaved();
             },
             .str_concat => {
@@ -3139,7 +3176,7 @@ pub const Driver = struct {
                 }
 
                 const str_concat_name = if (self.options.target.os == .macos) "_cot_str_concat" else "cot_str_concat";
-                try x86_64.callSymbol(buf, str_concat_name);
+                try self.emitX86Call(buf, str_concat_name);
                 self.invalidateX86CallerSaved();
                 // Result: rax = new ptr, rdx = new len
             },
@@ -3154,8 +3191,7 @@ pub const Driver = struct {
 
     /// Generate x86_64 code for a comparison operation (helper for or/and)
     fn generateX86Comparison(self: *Driver, buf: *be.CodeBuffer, func: *ssa.Func, cmp_value: ssa.Value) !void {
-        _ = self;
-        const arg_regs = [_]x86_64.Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
+        const arg_regs = self.getX86ArgRegs();
         const cmp_args = cmp_value.args();
         if (cmp_args.len >= 2) {
             const left = func.getValue(cmp_args[0]);
@@ -3194,9 +3230,6 @@ pub const Driver = struct {
 
     /// Generate x86_64 code for a value and record branch positions for patching
     fn generateX86ValueWithPatching(self: *Driver, buf: *be.CodeBuffer, func: *ssa.Func, value: ssa.Value, value_idx: u32, patches: *std.ArrayList(BranchPatch)) !void {
-        const arg_regs = [_]x86_64.Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
-        _ = arg_regs;
-
         switch (value.op) {
             .branch => {
                 // Branch: conditional jump based on comparison result
@@ -3319,7 +3352,7 @@ pub const Driver = struct {
             try x86_64.movRegImm64(buf, .rdx, @intCast(stripped.len)); // len
             // Call write function (libc)
             const write_name = if (self.options.target.os == .macos) "_write" else "write";
-            try x86_64.callSymbol(buf, write_name);
+            try self.emitX86Call(buf, write_name);
 
             // For println, also write a newline
             if (is_println) {
@@ -3327,7 +3360,7 @@ pub const Driver = struct {
                 try x86_64.movRegImm64(buf, .rdi, 1);
                 try x86_64.leaRipSymbol(buf, .rsi, nl_sym);
                 try x86_64.movRegImm64(buf, .rdx, 1);
-                try x86_64.callSymbol(buf, write_name);
+                try self.emitX86Call(buf, write_name);
             }
         }
     }
@@ -4977,11 +5010,14 @@ pub const Driver = struct {
                 try argv.append(self.allocator, "./zig-out/lib/libcot_runtime.a");
             },
             .windows => {
-                // Windows: use link.exe
-                try argv.append(self.allocator, "link.exe");
-                try argv.append(self.allocator, "/OUT:");
-                try argv.append(self.allocator, exe_path);
+                // Windows: use zig cc for consistent cross-platform linking
+                try argv.append(self.allocator, "zig");
+                try argv.append(self.allocator, "cc");
                 try argv.append(self.allocator, obj_path);
+                try argv.append(self.allocator, "-o");
+                try argv.append(self.allocator, exe_path);
+                // Link with runtime library for map/list/string operations
+                try argv.append(self.allocator, "./zig-out/lib/cot_runtime.lib");
             },
         }
 

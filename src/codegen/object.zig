@@ -13,6 +13,7 @@
 const std = @import("std");
 const be = @import("backend.zig");
 const debug = @import("../debug.zig");
+const pe_coff = @import("pe_coff.zig");
 
 const Allocator = std.mem.Allocator;
 const CodeBuffer = be.CodeBuffer;
@@ -189,12 +190,13 @@ fn getElfAddend(kind: RelocKind, stored_addend: i64) i64 {
 pub const ObjectFormat = enum {
     elf64,
     macho64,
+    coff,
 
     pub fn fromTarget(_: be.Arch, os: be.OS) ObjectFormat {
         return switch (os) {
             .linux => .elf64,
             .macos => .macho64,
-            .windows => .elf64, // TODO: COFF support
+            .windows => .coff,
         };
     }
 };
@@ -412,7 +414,12 @@ pub const ObjectFile = struct {
     }
 
     /// Apply local relocations (resolve symbols within the same object file).
+    /// For ELF64 and MachO, we patch local function calls directly.
+    /// For COFF, we leave all relocations for the Windows linker to handle.
     pub fn applyLocalRelocations(self: *ObjectFile) void {
+        // Skip local patching for COFF - Windows linker handles all relocations
+        if (self.format == .coff) return;
+
         for (self.sections.items) |*sec| {
             for (sec.relocations.items) |reloc| {
                 // Look up the target symbol
@@ -485,6 +492,7 @@ pub const ObjectFile = struct {
         switch (self.format) {
             .elf64 => try self.writeELF64(writer),
             .macho64 => try self.writeMachO64(writer),
+            .coff => try self.writeCOFF(writer),
         }
     }
 
@@ -1180,6 +1188,53 @@ pub const ObjectFile = struct {
 
         log.debug("section {s}: reloff={d}, nreloc={d}", .{ sec.name, reloff, nreloc });
     }
+
+    // ========================================================================
+    // COFF Writer (Windows)
+    // ========================================================================
+
+    fn writeCOFF(self: *ObjectFile, writer: anytype) !void {
+        // Use the pe_coff module to write COFF format
+        var coff = pe_coff.CoffWriter.init(self.allocator, self.arch);
+        defer coff.deinit();
+
+        // Add sections
+        for (self.sections.items) |sec| {
+            const name = pe_coff.getCoffSectionName(sec.kind);
+            const is_code = (sec.kind == .text);
+            _ = try coff.addSection(name, sec.data.items, sec.relocations.items, is_code);
+        }
+
+        // Add symbols
+        for (self.symbols.items) |sym| {
+            const section: i16 = switch (sym.kind) {
+                .external => pe_coff.SectionNumber.IMAGE_SYM_UNDEFINED,
+                else => @as(i16, @intCast(sym.section)) + 1, // COFF uses 1-based section indices
+            };
+            _ = try coff.addSymbol(
+                sym.name,
+                @intCast(sym.offset),
+                section,
+                sym.global or sym.kind == .external,
+                sym.kind == .func,
+            );
+        }
+
+        // Ensure symbols exist for all relocations
+        for (self.sections.items) |sec| {
+            for (sec.relocations.items) |reloc| {
+                _ = try coff.getOrCreateSymbol(reloc.symbol);
+            }
+        }
+
+        // Write the COFF file
+        try coff.write(writer);
+
+        log.debug("writeCOFF: {d} sections, {d} symbols", .{
+            self.sections.items.len,
+            self.symbols.items.len,
+        });
+    }
 };
 
 // ============================================================================
@@ -1286,4 +1341,41 @@ test "write macho64 object file" {
     // Check Mach-O magic (little-endian)
     const magic: u32 = @bitCast(output.items[0..4].*);
     try std.testing.expectEqual(@as(u32, 0xFEEDFACF), magic);
+}
+
+test "write coff object file" {
+    const allocator = std.testing.allocator;
+    var obj = ObjectFile.initWithArch(allocator, .coff, .x86_64);
+    defer obj.deinit();
+
+    const text_idx = try obj.addSection(".text", .text);
+
+    var buf = CodeBuffer.init(allocator);
+    defer buf.deinit();
+    // x86_64: mov eax, 42; ret
+    try buf.emit8(0xB8); // mov eax, imm32
+    try buf.emit32(42);
+    try buf.emit8(0xC3); // ret
+
+    try obj.addCode(text_idx, &buf);
+
+    // Add main symbol
+    _ = try obj.addSymbol(.{
+        .name = "main",
+        .kind = .func,
+        .section = text_idx,
+        .offset = 0,
+        .size = 6,
+        .global = true,
+    });
+
+    // Write to buffer
+    var output: std.ArrayList(u8) = .{ .items = &.{}, .capacity = 0 };
+    defer output.deinit(allocator);
+
+    try obj.write(output.writer(allocator));
+
+    // Check COFF machine type (0x8664 = AMD64, little-endian)
+    try std.testing.expectEqual(@as(u8, 0x64), output.items[0]);
+    try std.testing.expectEqual(@as(u8, 0x86), output.items[1]);
 }
