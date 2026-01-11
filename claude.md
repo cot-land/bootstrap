@@ -1,5 +1,54 @@
 # Cot 0.2 Development Guidelines
 
+## CODEGEN ARCHITECTURE - MANDATORY READING
+
+**Before implementing new SSA operations or debugging codegen bugs, you MUST read `CODEGEN.md`.**
+
+The codegen uses an **MCValue-based architecture** where every value's location is tracked explicitly. This is different from naive approaches that guess register contents.
+
+### Quick Reference (read CODEGEN.md for details)
+
+**To add a new operation:**
+```zig
+fn genMyOp(self: *CodeGen, value: *ssa.Value) !void {
+    const args = value.args();
+
+    // 1. Get operand locations (NEVER assume registers)
+    const left_mcv = self.getValue(args[0]);
+    const right_mcv = self.getValue(args[1]);
+
+    // 2. Handle register clobbering (if right is in x0/rax, save it first!)
+    if (right_mcv == .register and right_mcv.register == .x0) {
+        try movRegReg(.x9, .x0);  // Save right to scratch
+        try self.loadToReg(.x0, left_mcv);
+        // ... use x9 for right
+    } else {
+        try self.loadToReg(.x0, left_mcv);
+        try self.loadToReg(.x9, right_mcv);
+    }
+
+    // 3. Emit instruction
+    try someInstruction(self.buf, .x0, .x9);
+
+    // 4. Record result location
+    self.reg_manager.markUsed(.x0, value.id);
+    try self.setResult(value.id, .{ .register = .x0 });
+}
+```
+
+**Key functions:**
+- `getValue(id)` - Returns MCValue showing where a value currently lives
+- `loadToReg(dest, mcv)` - Loads any MCValue into a register
+- `setResult(id, mcv)` - Records where an operation's result is stored
+- `spillReg(reg)` - Saves register to stack when we need it for something else
+
+**Common bugs:**
+- Loading left operand clobbers right (if both target same register)
+- Forgetting to call `setResult()` after an operation
+- Using wrong function names for runtime calls (`cot_map_*` not `cot_native_map_*`)
+
+---
+
 ## TROUBLESHOOTING - READ THIS FIRST
 
 When debugging compiler issues, **DO NOT read through source code to trace execution**. Instead, use these debug flags to observe what's actually happening:
