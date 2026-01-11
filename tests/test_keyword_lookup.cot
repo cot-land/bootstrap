@@ -1,0 +1,20 @@
+// Test simple keyword lookup
+enum Token: u8 {
+    invalid,
+    kw_fn,
+    kw_var,
+}
+
+fn lookupKeyword(name: string) Token {
+    if name == "fn" { return Token.kw_fn }
+    if name == "var" { return Token.kw_var }
+    return Token.invalid
+}
+
+fn main() int {
+    var tok: Token = lookupKeyword("fn")
+    if tok == Token.kw_fn {
+        return 42
+    }
+    return 1
+}

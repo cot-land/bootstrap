@@ -1,0 +1,77 @@
+// Simplified scanner test - just test the core functionality
+enum Token: u8 {
+    invalid,
+    identifier,
+    kw_fn,
+}
+
+fn isAlpha(c: u8) bool {
+    return (c >= 97 and c <= 122) or (c >= 65 and c <= 90)
+}
+
+fn lookupKeyword(name: string) Token {
+    if name == "fn" { return Token.kw_fn }
+    return Token.invalid
+}
+
+struct ScannerState {
+    content: string,
+    pos: int,
+    len: int,
+}
+
+struct TokenResult {
+    tok: Token,
+    start: int,
+    end: int,
+}
+
+fn scanIdentifier(state: ScannerState) int {
+    var pos: int = state.pos
+    while pos < state.len {
+        var c: u8 = state.content[pos]
+        if isAlpha(c) or c == 95 {
+            pos = pos + 1
+        } else {
+            break
+        }
+    }
+    return pos
+}
+
+fn scanNext(state: ScannerState) TokenResult {
+    var start: int = state.pos
+
+    if state.pos >= state.len {
+        return TokenResult{ .tok = Token.invalid, .start = start, .end = start }
+    }
+
+    var c: u8 = state.content[state.pos]
+
+    if isAlpha(c) or c == 95 {
+        var end_pos: int = scanIdentifier(state)
+        var text: string = state.content[start:end_pos]
+        var tok: Token = lookupKeyword(text)
+        if tok == Token.invalid {
+            tok = Token.identifier
+        }
+        return TokenResult{ .tok = tok, .start = start, .end = end_pos }
+    }
+
+    return TokenResult{ .tok = Token.invalid, .start = start, .end = state.pos + 1 }
+}
+
+fn main() int {
+    var content: string = "fn"
+    var state: ScannerState = ScannerState{
+        .content = content,
+        .pos = 0,
+        .len = 2,
+    }
+
+    var result: TokenResult = scanNext(state)
+    if result.tok == Token.kw_fn {
+        return 42
+    }
+    return 1
+}

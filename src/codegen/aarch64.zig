@@ -323,6 +323,25 @@ pub fn cmpRegImm12(buf: *CodeBuffer, rn: Reg, imm12: u12) !void {
     try emit32(buf, dataProcessingImm(true, 1, true, false, imm12, rn, zr));
 }
 
+/// CSET Xd, cond - Set register to 1 if condition true, 0 otherwise
+/// Alias for CSINC Xd, XZR, XZR, invert(cond)
+pub fn cset(buf: *CodeBuffer, rd: Reg, cond: Cond) !void {
+    // CSINC: sf=1 (64-bit), op=0, S=0, 11010100, Rm=XZR, cond, o2=0, Rn=XZR, Rd
+    // We use inverted condition because CSINC picks Rm+1 when cond is FALSE
+    const inv_cond: u4 = @intFromEnum(cond) ^ 1; // Invert condition
+    const inst: u32 = (0b1 << 31) | // sf=1 (64-bit)
+        (0b0 << 30) | // op=0
+        (0b0 << 29) | // S=0
+        (0b11010100 << 21) | // opcode
+        (0b11111 << 16) | // Rm=XZR
+        (@as(u32, inv_cond) << 12) | // inverted cond
+        (0b0 << 11) | // o2=0
+        (0b1 << 10) | // o2=1 for CSINC
+        (0b11111 << 5) | // Rn=XZR
+        @as(u32, @intFromEnum(rd)); // Rd
+    try emit32(buf, inst);
+}
+
 /// NEG Xd, Xm (SUB Xd, XZR, Xm)
 pub fn negReg(buf: *CodeBuffer, rd: Reg, rm: Reg) !void {
     try emit32(buf, dataProcessingShifted(true, 0b10, false, rm, .lsl, 0, zr, rd));
@@ -476,8 +495,10 @@ pub fn movRegImm64(buf: *CodeBuffer, rd: Reg, imm: i64) !void {
 
 /// LDR Xd, [Xn, #imm] (unsigned offset, scaled by 8)
 pub fn ldrRegImm(buf: *CodeBuffer, rt: Reg, rn: Reg, offset: u12) !void {
-    // Offset must be multiple of 8 for 64-bit load
-    try emit32(buf, loadStoreUnsignedOffset(0b11, false, 0b01, offset, rn, rt));
+    // ARM64 LDR (immediate, unsigned offset): imm12 is scaled by 8 for 64-bit
+    // Caller passes byte offset, we divide by 8 for encoding
+    const scaled: u12 = offset >> 3;
+    try emit32(buf, loadStoreUnsignedOffset(0b11, false, 0b01, scaled, rn, rt));
 }
 
 /// LDR Xd, [Xn, Xm] (register offset)
@@ -501,7 +522,10 @@ pub fn ldrRegReg(buf: *CodeBuffer, rt: Reg, rn: Reg, rm: Reg) !void {
 
 /// STR Xd, [Xn, #imm] (unsigned offset, scaled by 8)
 pub fn strRegImm(buf: *CodeBuffer, rt: Reg, rn: Reg, offset: u12) !void {
-    try emit32(buf, loadStoreUnsignedOffset(0b11, false, 0b00, offset, rn, rt));
+    // ARM64 STR (immediate, unsigned offset): imm12 is scaled by 8 for 64-bit
+    // Caller passes byte offset, we divide by 8 for encoding
+    const scaled: u12 = offset >> 3;
+    try emit32(buf, loadStoreUnsignedOffset(0b11, false, 0b00, scaled, rn, rt));
 }
 
 /// LDP Xt1, Xt2, [Xn, #imm]! (pre-index)
@@ -538,6 +562,24 @@ pub fn ldrbRegImm(buf: *CodeBuffer, rt: Reg, rn: Reg, offset: u12) !void {
 pub fn strbRegImm(buf: *CodeBuffer, rt: Reg, rn: Reg, offset: u12) !void {
     // size=00 (byte), V=0, opc=00 (store)
     try emit32(buf, loadStoreUnsignedOffset(0b00, false, 0b00, offset, rn, rt));
+}
+
+/// STR Xd, [Xn, #0] via address computation for unaligned offsets
+/// Computes address into x9, then stores rt there
+pub fn strViaAddressComputation(buf: *CodeBuffer, rt: Reg, base: Reg, offset: u12) !void {
+    // add x9, base, #offset
+    try addRegImm12(buf, .x9, base, offset);
+    // str rt, [x9]
+    try strRegImm(buf, rt, .x9, 0);
+}
+
+/// LDR Xd, [Xn, #0] via address computation for unaligned offsets
+/// Computes address into x9, then loads from there
+pub fn ldrViaAddressComputation(buf: *CodeBuffer, rt: Reg, base: Reg, offset: u12) !void {
+    // add x9, base, #offset
+    try addRegImm12(buf, .x9, base, offset);
+    // ldr rt, [x9]
+    try ldrRegImm(buf, rt, .x9, 0);
 }
 
 /// LDRB Wd, [Xn, Xm] - Load byte with register offset
@@ -596,6 +638,69 @@ pub fn retReg(buf: *CodeBuffer, rn: Reg) !void {
 /// B.cond label (conditional branch)
 pub fn bCond(buf: *CodeBuffer, cond: Cond, offset: i19) !void {
     try emit32(buf, branchCond(cond, offset));
+}
+
+/// B label (unconditional branch, placeholder for patching)
+pub fn bImm(buf: *CodeBuffer, offset: i26) !void {
+    try emit32(buf, branchImm(false, offset));
+}
+
+/// CBZ Xn, label (compare and branch if zero)
+pub fn cbz(buf: *CodeBuffer, rt: Reg, offset: i19) !void {
+    // CBZ: sf=1 (64-bit), op=0 (CBZ), imm19, Rt
+    // 1011010 0 imm19 Rt
+    const sf: u32 = 1; // 64-bit
+    const op: u32 = 0; // CBZ
+    const imm19: u32 = @as(u32, @bitCast(@as(i32, offset))) & 0x7FFFF;
+    const inst = (sf << 31) | (0b011010 << 25) | (op << 24) | (imm19 << 5) | @as(u32, @intFromEnum(rt));
+    try emit32(buf, inst);
+}
+
+/// CBNZ Xn, label (compare and branch if not zero)
+pub fn cbnz(buf: *CodeBuffer, rt: Reg, offset: i19) !void {
+    // CBNZ: sf=1 (64-bit), op=1 (CBNZ), imm19, Rt
+    // 1011010 1 imm19 Rt
+    const sf: u32 = 1; // 64-bit
+    const op: u32 = 1; // CBNZ
+    const imm19: u32 = @as(u32, @bitCast(@as(i32, offset))) & 0x7FFFF;
+    const inst = (sf << 31) | (0b011010 << 25) | (op << 24) | (imm19 << 5) | @as(u32, @intFromEnum(rt));
+    try emit32(buf, inst);
+}
+
+/// Patch a branch instruction at the given offset with a new relative offset
+/// Works for B, B.cond, CBZ, and CBNZ instructions
+/// Note: inst_offset should point to the position AFTER the instruction (buf.pos() after emit)
+pub fn patchBranch(buf: *CodeBuffer, inst_offset: u32, rel_offset: i32) void {
+    // Go back 4 bytes to get the actual instruction position
+    const actual_offset = inst_offset - 4;
+    const old_inst = std.mem.readInt(u32, buf.bytes.items[actual_offset..][0..4], .little);
+
+    // Check instruction type by examining top bits
+    // B/BL: 00010x (bits [31:26])
+    // CBZ/CBNZ: x011010x (bits [30:25] = 011010)
+    // B.cond: 01010100 (bits [31:24])
+    const is_unconditional = (old_inst >> 26) == 0b000101;
+    const is_cbz_cbnz = ((old_inst >> 25) & 0b1111110) == 0b0110100;
+
+    var new_inst: u32 = undefined;
+    if (is_unconditional) {
+        // B/BL: bits [25:0] are the imm26 offset
+        const masked_offset: u32 = @as(u32, @bitCast(rel_offset)) & 0x3FFFFFF;
+        new_inst = (old_inst & 0xFC000000) | masked_offset;
+    } else if (is_cbz_cbnz) {
+        // CBZ/CBNZ: bits [23:5] are the imm19 offset
+        const imm19: u32 = @as(u32, @bitCast(rel_offset)) & 0x7FFFF;
+        new_inst = (old_inst & 0xFF00001F) | (imm19 << 5);
+    } else {
+        // B.cond: bits [23:5] are the imm19 offset
+        const imm19: u32 = @as(u32, @bitCast(rel_offset)) & 0x7FFFF;
+        new_inst = (old_inst & 0xFF00001F) | (imm19 << 5);
+    }
+
+    buf.bytes.items[actual_offset] = @truncate(new_inst);
+    buf.bytes.items[actual_offset + 1] = @truncate(new_inst >> 8);
+    buf.bytes.items[actual_offset + 2] = @truncate(new_inst >> 16);
+    buf.bytes.items[actual_offset + 3] = @truncate(new_inst >> 24);
 }
 
 /// CSEL Xd, Xn, Xm, cond - conditional select
@@ -1027,8 +1132,8 @@ test "LDR X0, [SP, #offset] encoding" {
     var buf = CodeBuffer.init(allocator);
     defer buf.deinit();
 
-    // Load from [SP + 16] (offset is scaled by 8, so imm12=2)
-    try ldrRegImm(&buf, .x0, .sp, 2);
+    // Load from [SP + 16] (byte offset 16, scaled by 8 gives imm12=2)
+    try ldrRegImm(&buf, .x0, .sp, 16);
     // LDR X0, [SP, #16]: size=11, V=0, opc=01, imm12=2, Rn=sp(31), Rt=x0(0)
     // 0xF9400000 (base) + 0x800 (imm12=2 << 10) + 0x3E0 (rn=31 << 5) + 0 (rt)
     // = 0xF9400BE0
@@ -1042,8 +1147,8 @@ test "STR X0, [SP, #offset] encoding" {
     var buf = CodeBuffer.init(allocator);
     defer buf.deinit();
 
-    // Store to [SP + 16] (offset is scaled by 8, so imm12=2)
-    try strRegImm(&buf, .x0, .sp, 2);
+    // Store to [SP + 16] (byte offset 16, scaled by 8 gives imm12=2)
+    try strRegImm(&buf, .x0, .sp, 16);
     // STR X0, [SP, #16]: size=11, V=0, opc=00, imm12=2, Rn=sp(31), Rt=x0(0)
     // 0xF9000000 (base) + 0x800 (imm12=2 << 10) + 0x3E0 (rn=31 << 5) + 0 (rt)
     // = 0xF9000BE0

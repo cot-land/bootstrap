@@ -1,0 +1,9 @@
+// Test character literal as u8
+fn main() int {
+    var s = "A";
+    var c: u8 = s[0];  // Get 'A' from string
+    if c == 65 {       // Compare with int literal works
+        return 42;
+    }
+    return 1;
+}

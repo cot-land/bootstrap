@@ -129,7 +129,8 @@ pub const BasicKind = enum(u8) {
             .i16_type, .u16_type => 2,
             .i32_type, .u32_type, .f32_type => 4,
             .i64_type, .u64_type, .f64_type => 8,
-            else => 0, // string, void, untyped
+            .string_type => 16, // ptr (8) + len (8)
+            else => 0, // void, untyped
         };
     }
 };

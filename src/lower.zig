@@ -174,9 +174,13 @@ pub const Lowerer = struct {
     fn lowerVarStmt(self: *Lowerer, var_stmt: ast.VarStmt) !void {
         const fb = self.current_func orelse return;
 
-        // Infer type from initializer expression
+        // Get type: explicit annotation takes precedence, otherwise infer from initializer
         var type_idx: TypeIndex = TypeRegistry.VOID;
-        if (var_stmt.value) |value_idx| {
+        if (var_stmt.type_expr) |type_node_idx| {
+            // Use explicit type annotation
+            type_idx = self.resolveTypeExprNode(type_node_idx);
+        } else if (var_stmt.value) |value_idx| {
+            // Infer type from initializer expression
             type_idx = self.inferTypeFromExpr(value_idx);
         }
 
@@ -419,11 +423,46 @@ pub const Lowerer = struct {
         const fb = self.current_func orelse return;
 
         if (ret.value) |value_idx| {
-            const value_node = try self.lowerExpr(value_idx);
-            const ret_node = ir.Node.init(.ret, fb.return_type, Span.fromPos(Pos.zero))
-                .withArgs(&.{value_node});
-            _ = try fb.emit(ret_node);
-            log.debug("  return <expr>", .{});
+            // Check if returning a struct_init - needs special handling
+            const value_ast = self.tree.getNode(value_idx);
+            if (value_ast == .expr and value_ast.expr == .struct_init) {
+                // Returning a struct literal: allocate temp local and init fields
+                const si = value_ast.expr.struct_init;
+                const struct_type_idx = self.type_reg.lookupByName(si.type_name) orelse {
+                    // Fallback to regular lowering
+                    const value_node = try self.lowerExpr(value_idx);
+                    const ret_node = ir.Node.init(.ret, fb.return_type, Span.fromPos(Pos.zero))
+                        .withArgs(&.{value_node});
+                    _ = try fb.emit(ret_node);
+                    return;
+                };
+
+                const struct_size = self.type_reg.sizeOf(struct_type_idx);
+
+                // Allocate temp local for return value
+                const temp_local_idx = try fb.addLocalWithSize("__ret_tmp", struct_type_idx, false, struct_size);
+                log.debug("  return struct: allocated temp local {d} size {d}", .{ temp_local_idx, struct_size });
+
+                // Initialize struct fields into temp local
+                try self.lowerStructInitInline(si, temp_local_idx);
+
+                // Load first 8 bytes of struct into return value
+                // (For larger structs, this is simplified - full impl would handle hidden ptr)
+                const load = ir.Node.init(.load, struct_type_idx, Span.fromPos(Pos.zero))
+                    .withArgs(&.{@intCast(temp_local_idx)});
+                const load_node = try fb.emit(load);
+
+                const ret_node = ir.Node.init(.ret, struct_type_idx, Span.fromPos(Pos.zero))
+                    .withArgs(&.{load_node});
+                _ = try fb.emit(ret_node);
+                log.debug("  return struct: emitted load and ret", .{});
+            } else {
+                const value_node = try self.lowerExpr(value_idx);
+                const ret_node = ir.Node.init(.ret, fb.return_type, Span.fromPos(Pos.zero))
+                    .withArgs(&.{value_node});
+                _ = try fb.emit(ret_node);
+                log.debug("  return <expr>", .{});
+            }
         } else {
             const ret_node = ir.Node.init(.ret, TypeRegistry.VOID, Span.fromPos(Pos.zero));
             _ = try fb.emit(ret_node);
@@ -448,7 +487,7 @@ pub const Lowerer = struct {
                             const value_node = if (assign.op) |compound_op| blk: {
                                 // Load current value of target
                                 const load = ir.Node.init(.load, local_type, Span.fromPos(Pos.zero))
-                                    .withAux(@intCast(local_idx));
+                                    .withArgs(&.{@intCast(local_idx)});
                                 const current_value = try fb.emit(load);
 
                                 // Lower the right-hand side
@@ -650,7 +689,7 @@ pub const Lowerer = struct {
 
         // Load current index
         const load_idx = ir.Node.init(.load, TypeRegistry.INT, Span.fromPos(Pos.zero))
-            .withAux(@intCast(idx_local));
+            .withArgs(&.{@intCast(idx_local)});
         const idx_val = try fb.emit(load_idx);
 
         // Get length of iterable
@@ -706,7 +745,7 @@ pub const Lowerer = struct {
 
         // Load current index again for array access
         const load_idx2 = ir.Node.init(.load, TypeRegistry.INT, Span.fromPos(Pos.zero))
-            .withAux(@intCast(idx_local));
+            .withArgs(&.{@intCast(idx_local)});
         const idx_val2 = try fb.emit(load_idx2);
 
         // Get element at index: arr[__for_idx_N]
@@ -745,7 +784,7 @@ pub const Lowerer = struct {
 
         // Increment index: __for_idx_N = __for_idx_N + 1
         const load_idx3 = ir.Node.init(.load, TypeRegistry.INT, Span.fromPos(Pos.zero))
-            .withAux(@intCast(idx_local));
+            .withArgs(&.{@intCast(idx_local)});
         const idx_val3 = try fb.emit(load_idx3);
 
         const one = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
@@ -976,7 +1015,7 @@ pub const Lowerer = struct {
         if (fb.lookupLocal(ident.name)) |local_idx| {
             const local = fb.locals.items[local_idx];
             const load = ir.Node.init(.load, local.type_idx, Span.fromPos(Pos.zero))
-                .withAux(@intCast(local_idx));
+                .withArgs(&.{@intCast(local_idx)});
             return try fb.emit(load);
         }
 
@@ -1743,7 +1782,7 @@ pub const Lowerer = struct {
         if (method.receiver_is_ptr and !is_ptr) {
             // Method wants *T but we have T - emit addr_local
             const addr_node = ir.Node.init(.addr_local, TypeRegistry.VOID, Span.fromPos(Pos.zero))
-                .withAux(@intCast(local_idx));
+                .withArgs(&.{@intCast(local_idx)});
             const receiver = try fb.emit(addr_node);
             try args.append(self.allocator, receiver);
             log.debug("  method receiver: &local[{d}]", .{local_idx});
@@ -1751,14 +1790,14 @@ pub const Lowerer = struct {
             // Method wants T but we have *T - emit load from local (dereference)
             const local = fb.locals.items[local_idx];
             const load_node = ir.Node.init(.local, local.type_idx, Span.fromPos(Pos.zero))
-                .withAux(@intCast(local_idx));
+                .withArgs(&.{@intCast(local_idx)});
             const receiver = try fb.emit(load_node);
             try args.append(self.allocator, receiver);
             log.debug("  method receiver: *local[{d}]", .{local_idx});
         } else {
             // Types match - pass address for both cases (pointer for ptr method, address for value method)
             const addr_node = ir.Node.init(.addr_local, TypeRegistry.VOID, Span.fromPos(Pos.zero))
-                .withAux(@intCast(local_idx));
+                .withArgs(&.{@intCast(local_idx)});
             const receiver = try fb.emit(addr_node);
             try args.append(self.allocator, receiver);
             log.debug("  method receiver: &local[{d}]", .{local_idx});
@@ -1996,19 +2035,26 @@ pub const Lowerer = struct {
         if (base_node_idx == .expr and base_node_idx.expr == .identifier) {
             const ident = base_node_idx.expr.identifier;
             if (fb.lookupLocal(ident.name)) |local_idx| {
-                if (is_ptr_deref) {
-                    // For pointer to struct: load pointer value, then access field at offset
+                // Check if this is a large struct parameter (passed by reference on ARM64)
+                // Large struct params (>16 bytes) are passed as pointers, need ptr_field
+                const local = fb.locals.items[local_idx];
+                const is_large_struct_param = local.is_param and
+                    base_type == .struct_type and
+                    self.type_reg.sizeOf(base_type_idx) > 16;
+
+                if (is_ptr_deref or is_large_struct_param) {
+                    // For pointer to struct OR large struct param: load pointer value, then access field at offset
                     // args[0] = local_idx (which holds the pointer), aux = field_offset
                     const node = ir.Node.init(.ptr_field, field_type_idx, Span.fromPos(Pos.zero))
                         .withArgs(&.{@intCast(local_idx)})
                         .withAux(@intCast(field_offset));
                     return try fb.emit(node);
                 } else {
-                    // For direct struct: emit addr_field: get address of field within struct
-                    const addr_node = ir.Node.init(.addr_field, field_type_idx, Span.fromPos(Pos.zero))
+                    // For direct struct: emit field op to load the field value
+                    const field_node = ir.Node.init(.field, field_type_idx, Span.fromPos(Pos.zero))
                         .withArgs(&.{@intCast(local_idx)})
                         .withAux(@intCast(field_offset));
-                    return try fb.emit(addr_node);
+                    return try fb.emit(field_node);
                 }
             }
         }
@@ -2248,9 +2294,15 @@ pub const Lowerer = struct {
 
             // Build select: if (cond) case_body else result
             if (cond != ir.null_node) {
-                const select = ir.Node.init(.select, TypeRegistry.VOID, Span.fromPos(Pos.zero))
-                    .withArgs(&.{ cond, case_body, result });
-                result = try fb.emit(select);
+                // If this is the first case and there's no else clause, result is null_node.
+                // In that case, just use case_body as the result (no select needed).
+                if (result == ir.null_node) {
+                    result = case_body;
+                } else {
+                    const select = ir.Node.init(.select, TypeRegistry.VOID, Span.fromPos(Pos.zero))
+                        .withArgs(&.{ cond, case_body, result });
+                    result = try fb.emit(select);
+                }
             }
         }
 
@@ -2395,14 +2447,16 @@ pub const Lowerer = struct {
                     // Field access
                     .field_access => return TypeRegistry.VOID, // TODO: look up field type
 
-                    // Index - would need array element type
+                    // Index - get element type from indexable
                     .index => |idx| {
-                        const arr_type_idx = self.inferTypeFromExpr(idx.base);
-                        const arr_type = self.type_reg.get(arr_type_idx);
-                        if (arr_type == .array) {
-                            return arr_type.array.elem;
-                        }
-                        return TypeRegistry.VOID;
+                        const base_type_idx = self.inferTypeFromExpr(idx.base);
+                        const base_type = self.type_reg.get(base_type_idx);
+                        return switch (base_type) {
+                            .array => |a| a.elem,
+                            .slice => |s| s.elem,
+                            .basic => |k| if (k == .string_type) TypeRegistry.U8 else TypeRegistry.VOID,
+                            else => TypeRegistry.VOID,
+                        };
                     },
 
                     // Slice expression - creates a slice of base's element type

@@ -97,7 +97,7 @@ fn cmdBuild(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         if (arg[0] == '-') {
             // Option
             if (std.mem.eql(u8, arg, "-c")) {
-                options.output_kind = .object;
+                // TODO: Add object-only output mode
             } else if (std.mem.eql(u8, arg, "-o")) {
                 i += 1;
                 if (i >= args.len) {
@@ -106,7 +106,7 @@ fn cmdBuild(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 }
                 options.output_path = args[i];
             } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
-                options.verbose = true;
+                // TODO: Add verbose mode
             } else if (std.mem.eql(u8, arg, "--debug-ir")) {
                 options.debug_ir = true;
             } else if (std.mem.eql(u8, arg, "--debug-ssa")) {

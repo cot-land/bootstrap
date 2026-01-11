@@ -14,8 +14,11 @@ const std = @import("std");
 const be = @import("backend.zig");
 const ssa = @import("../ssa.zig");
 const debug = @import("../debug.zig");
+const types = @import("../types.zig");
 
 const Allocator = std.mem.Allocator;
+const TypeRegistry = types.TypeRegistry;
+const Location = ssa.Location;
 
 // Scoped logger for x86-64 codegen
 const log = debug.scoped(.codegen);
@@ -508,6 +511,29 @@ pub fn jccRel8(buf: *CodeBuffer, cc: CondCode, offset: i8) !void {
     try buf.emit8(@bitCast(offset));
 }
 
+/// SETcc r8 - set byte based on condition
+pub fn setcc(buf: *CodeBuffer, cc: CondCode, dst: Reg) !void {
+    // REX prefix needed for:
+    // - r8-r15: to access r8b-r15b (REX.B)
+    // - rsp/rbp/rsi/rdi (4-7): to access spl/bpl/sil/dil instead of ah/ch/dh/bh
+    if (@intFromEnum(dst) >= 8) {
+        try buf.emit8(0x41); // REX.B
+    } else if (@intFromEnum(dst) >= 4) {
+        try buf.emit8(0x40); // REX (no extension bits, just enables new byte regs)
+    }
+    try buf.emit8(0x0F);
+    try buf.emit8(0x90 | @intFromEnum(cc));
+    try buf.emit8(0xC0 | (@intFromEnum(dst) & 0x7));
+}
+
+/// MOVZX r64, r8 - zero extend byte register to 64-bit
+pub fn movzxReg8(buf: *CodeBuffer, dst: Reg, src: Reg) !void {
+    try buf.emit8(rex(true, dst, src));
+    try buf.emit8(0x0F);
+    try buf.emit8(0xB6);
+    try buf.emit8(ModRM.regReg(dst, src));
+}
+
 // ============================================================================
 // CMOVcc Instructions (conditional move)
 // ============================================================================
@@ -528,6 +554,22 @@ pub fn cmoveRegReg(buf: *CodeBuffer, dst: Reg, src: Reg) !void {
 /// CMOVNE r64, r64 - move if not equal (ZF=0)
 pub fn cmovneRegReg(buf: *CodeBuffer, dst: Reg, src: Reg) !void {
     try cmovccRegReg(buf, .ne, dst, src);
+}
+
+pub fn cmovlRegReg(buf: *CodeBuffer, dst: Reg, src: Reg) !void {
+    try cmovccRegReg(buf, .l, dst, src);
+}
+
+pub fn cmovleRegReg(buf: *CodeBuffer, dst: Reg, src: Reg) !void {
+    try cmovccRegReg(buf, .le, dst, src);
+}
+
+pub fn cmovgRegReg(buf: *CodeBuffer, dst: Reg, src: Reg) !void {
+    try cmovccRegReg(buf, .g, dst, src);
+}
+
+pub fn cmovgeRegReg(buf: *CodeBuffer, dst: Reg, src: Reg) !void {
+    try cmovccRegReg(buf, .ge, dst, src);
 }
 
 // ============================================================================
@@ -970,6 +1012,625 @@ pub const X86_64Backend = struct {
         try ret(buf);
     }
 };
+
+// ============================================================================
+// SSA Codegen (Go-style: separate from instruction encoding)
+// ============================================================================
+// This section contains the SSA-to-machine-code translation, following Go's
+// amd64/ssa.go pattern. The instruction encoding functions above are used
+// by this higher-level codegen.
+
+/// Scratch registers for codegen - NEVER allocated by regalloc
+pub const scratch0: Reg = .r10;
+pub const scratch1: Reg = .r11;
+
+/// Jump patch record for fixing up forward jumps
+pub const JumpPatch = struct {
+    patch_offset: u32, // Offset right after the rel32 field
+    target_block: u32, // Target block index
+};
+
+/// Align value up to alignment boundary
+pub fn alignTo(value: u32, alignment: u32) u32 {
+    return (value + alignment - 1) & ~(alignment - 1);
+}
+
+/// Load a value from its location into a register
+pub fn loadToReg(buf: *CodeBuffer, reg: Reg, loc: Location) !void {
+    switch (loc) {
+        .reg => |r| {
+            if (r != @intFromEnum(reg)) {
+                try movRegReg(buf, reg, @enumFromInt(r));
+            }
+        },
+        .stack => |offset| {
+            try movRegMem(buf, reg, .rbp, offset);
+        },
+        .none => {},
+    }
+}
+
+/// Generate code for one SSA value (Go's ssaGenValue pattern)
+pub fn generateValue(
+    buf: *CodeBuffer,
+    func: *ssa.Func,
+    value: *ssa.Value,
+    type_reg: *TypeRegistry,
+    os: be.OS,
+    string_offsets: *std.StringHashMap(u32),
+    allocator: Allocator,
+) !void {
+    // Get destination location (pre-assigned by regalloc)
+    const dest_loc = func.locations.items[value.id];
+
+    switch (value.op) {
+        .const_int => {
+            if (dest_loc.getReg()) |dest_reg| {
+                try movRegImm64(buf, @enumFromInt(dest_reg), value.aux_int);
+            } else if (dest_loc.getStack()) |offset| {
+                try movRegImm64(buf, scratch0, value.aux_int);
+                try movMemReg(buf, .rbp, offset, scratch0);
+            }
+        },
+
+        .add => {
+            const dest_reg = dest_loc.getReg() orelse return;
+            const left_loc = func.locations.items[value.args()[0]];
+            const right_loc = func.locations.items[value.args()[1]];
+
+            try loadToReg(buf, @enumFromInt(dest_reg), left_loc);
+
+            if (right_loc.getReg()) |r| {
+                try addRegReg(buf, @enumFromInt(dest_reg), @enumFromInt(r));
+            } else if (right_loc.getStack()) |offset| {
+                try movRegMem(buf, .r11, .rbp, offset);
+                try addRegReg(buf, @enumFromInt(dest_reg), .r11);
+            }
+        },
+
+        .sub => {
+            const dest_reg: Reg = @enumFromInt(dest_loc.getReg() orelse return);
+            const left_loc = func.locations.items[value.args()[0]];
+            const right_loc = func.locations.items[value.args()[1]];
+
+            try loadToReg(buf, dest_reg, left_loc);
+
+            if (right_loc.getReg()) |r| {
+                try subRegReg(buf, dest_reg, @enumFromInt(r));
+            } else if (right_loc.getStack()) |offset| {
+                try movRegMem(buf, .r11, .rbp, offset);
+                try subRegReg(buf, dest_reg, .r11);
+            }
+        },
+
+        .mul => {
+            const dest_reg: Reg = @enumFromInt(dest_loc.getReg() orelse return);
+            const left_loc = func.locations.items[value.args()[0]];
+            const right_loc = func.locations.items[value.args()[1]];
+
+            try loadToReg(buf, dest_reg, left_loc);
+
+            if (right_loc.getReg()) |r| {
+                try imulRegReg(buf, dest_reg, @enumFromInt(r));
+            } else if (right_loc.getStack()) |offset| {
+                try movRegMem(buf, .r11, .rbp, offset);
+                try imulRegReg(buf, dest_reg, .r11);
+            }
+        },
+
+        .div => {
+            // x86 division: RAX = RDX:RAX / operand, RDX = remainder
+            const left_loc = func.locations.items[value.args()[0]];
+            const right_loc = func.locations.items[value.args()[1]];
+
+            try loadToReg(buf, .rax, left_loc);
+            try cqo(buf); // Sign-extend RAX into RDX:RAX
+
+            if (right_loc.getReg()) |r| {
+                try idivReg(buf, @enumFromInt(r));
+            } else if (right_loc.getStack()) |offset| {
+                try movRegMem(buf, .r11, .rbp, offset);
+                try idivReg(buf, .r11);
+            }
+
+            // Result in RAX, move to dest if different
+            if (dest_loc.getReg()) |dest_reg| {
+                if (dest_reg != @intFromEnum(Reg.rax)) {
+                    try movRegReg(buf, @enumFromInt(dest_reg), .rax);
+                }
+            } else if (dest_loc.getStack()) |offset| {
+                try movMemReg(buf, .rbp, offset, .rax);
+            }
+        },
+
+        .mod => {
+            const left_loc = func.locations.items[value.args()[0]];
+            const right_loc = func.locations.items[value.args()[1]];
+
+            try loadToReg(buf, .rax, left_loc);
+            try cqo(buf);
+
+            if (right_loc.getReg()) |r| {
+                try idivReg(buf, @enumFromInt(r));
+            } else if (right_loc.getStack()) |offset| {
+                try movRegMem(buf, .r11, .rbp, offset);
+                try idivReg(buf, .r11);
+            }
+
+            // Remainder in RDX
+            if (dest_loc.getReg()) |dest_reg| {
+                if (dest_reg != @intFromEnum(Reg.rdx)) {
+                    try movRegReg(buf, @enumFromInt(dest_reg), .rdx);
+                }
+            } else if (dest_loc.getStack()) |offset| {
+                try movMemReg(buf, .rbp, offset, .rdx);
+            }
+        },
+
+        .neg => {
+            const dest_reg: Reg = @enumFromInt(dest_loc.getReg() orelse return);
+            const src_loc = func.locations.items[value.args()[0]];
+            try loadToReg(buf, dest_reg, src_loc);
+            try negReg(buf, dest_reg);
+        },
+
+        // Comparison ops
+        .eq, .ne, .lt, .le, .gt, .ge => {
+            const dest_reg = dest_loc.getReg() orelse return;
+            const left_loc = func.locations.items[value.args()[0]];
+            const right_loc = func.locations.items[value.args()[1]];
+
+            try loadToReg(buf, scratch0, left_loc);
+
+            if (right_loc.getReg()) |r| {
+                try cmpRegReg(buf, scratch0, @enumFromInt(r));
+            } else if (right_loc.getStack()) |offset| {
+                try movRegMem(buf, scratch1, .rbp, offset);
+                try cmpRegReg(buf, scratch0, scratch1);
+            }
+
+            // Clear dest, then set based on condition
+            try xorRegReg(buf, @enumFromInt(dest_reg), @enumFromInt(dest_reg));
+            try movRegImm64(buf, scratch0, 1);
+
+            switch (value.op) {
+                .eq => try cmoveRegReg(buf, @enumFromInt(dest_reg), scratch0),
+                .ne => try cmovneRegReg(buf, @enumFromInt(dest_reg), scratch0),
+                .lt => try cmovlRegReg(buf, @enumFromInt(dest_reg), scratch0),
+                .le => try cmovleRegReg(buf, @enumFromInt(dest_reg), scratch0),
+                .gt => try cmovgRegReg(buf, @enumFromInt(dest_reg), scratch0),
+                .ge => try cmovgeRegReg(buf, @enumFromInt(dest_reg), scratch0),
+                else => {},
+            }
+        },
+
+        // Bitwise ops
+        .bit_and => {
+            const dest_reg: Reg = @enumFromInt(dest_loc.getReg() orelse return);
+            const left_loc = func.locations.items[value.args()[0]];
+            const right_loc = func.locations.items[value.args()[1]];
+            try loadToReg(buf, dest_reg, left_loc);
+            if (right_loc.getReg()) |r| {
+                try andRegReg(buf, dest_reg, @enumFromInt(r));
+            } else if (right_loc.getStack()) |offset| {
+                try movRegMem(buf, scratch1, .rbp, offset);
+                try andRegReg(buf, dest_reg, scratch1);
+            }
+        },
+
+        .bit_or => {
+            const dest_reg: Reg = @enumFromInt(dest_loc.getReg() orelse return);
+            const left_loc = func.locations.items[value.args()[0]];
+            const right_loc = func.locations.items[value.args()[1]];
+            try loadToReg(buf, dest_reg, left_loc);
+            if (right_loc.getReg()) |r| {
+                try orRegReg(buf, dest_reg, @enumFromInt(r));
+            } else if (right_loc.getStack()) |offset| {
+                try movRegMem(buf, scratch1, .rbp, offset);
+                try orRegReg(buf, dest_reg, scratch1);
+            }
+        },
+
+        .bit_xor => {
+            const dest_reg: Reg = @enumFromInt(dest_loc.getReg() orelse return);
+            const left_loc = func.locations.items[value.args()[0]];
+            const right_loc = func.locations.items[value.args()[1]];
+            try loadToReg(buf, dest_reg, left_loc);
+            if (right_loc.getReg()) |r| {
+                try xorRegReg(buf, dest_reg, @enumFromInt(r));
+            } else if (right_loc.getStack()) |offset| {
+                try movRegMem(buf, scratch1, .rbp, offset);
+                try xorRegReg(buf, dest_reg, scratch1);
+            }
+        },
+
+        .shl => {
+            const dest_reg: Reg = @enumFromInt(dest_loc.getReg() orelse return);
+            const left_loc = func.locations.items[value.args()[0]];
+            const shift_val = func.getValue(value.args()[1]);
+            try loadToReg(buf, dest_reg, left_loc);
+            if (shift_val.op == .const_int) {
+                try shlRegImm(buf, dest_reg, @intCast(shift_val.aux_int));
+            }
+        },
+
+        .shr => {
+            const dest_reg: Reg = @enumFromInt(dest_loc.getReg() orelse return);
+            const left_loc = func.locations.items[value.args()[0]];
+            const shift_val = func.getValue(value.args()[1]);
+            try loadToReg(buf, dest_reg, left_loc);
+            if (shift_val.op == .const_int) {
+                try shrRegImm(buf, dest_reg, @intCast(shift_val.aux_int));
+            }
+        },
+
+        // Logical ops
+        .@"and" => {
+            const dest_reg = dest_loc.getReg() orelse return;
+            const left_loc = func.locations.items[value.args()[0]];
+            const right_loc = func.locations.items[value.args()[1]];
+            try loadToReg(buf, @enumFromInt(dest_reg), left_loc);
+            try testRegReg(buf, @enumFromInt(dest_reg), @enumFromInt(dest_reg));
+            try buf.emit8(0x0F);
+            try buf.emit8(0x84); // JZ
+            const jz_patch = buf.pos();
+            try buf.emit32(0);
+            try loadToReg(buf, @enumFromInt(dest_reg), right_loc);
+            const after = buf.pos();
+            const offset: i32 = @intCast(after - jz_patch);
+            buf.patch32(jz_patch - 4, offset);
+        },
+
+        .@"or" => {
+            const dest_reg = dest_loc.getReg() orelse return;
+            const left_loc = func.locations.items[value.args()[0]];
+            const right_loc = func.locations.items[value.args()[1]];
+            try loadToReg(buf, @enumFromInt(dest_reg), left_loc);
+            try testRegReg(buf, @enumFromInt(dest_reg), @enumFromInt(dest_reg));
+            try buf.emit8(0x0F);
+            try buf.emit8(0x85); // JNZ
+            const jnz_patch = buf.pos();
+            try buf.emit32(0);
+            try loadToReg(buf, @enumFromInt(dest_reg), right_loc);
+            const after = buf.pos();
+            const offset: i32 = @intCast(after - jnz_patch);
+            buf.patch32(jnz_patch - 4, offset);
+        },
+
+        .not => {
+            const dest_reg = dest_loc.getReg() orelse return;
+            const src_loc = func.locations.items[value.args()[0]];
+            try loadToReg(buf, @enumFromInt(dest_reg), src_loc);
+            try testRegReg(buf, @enumFromInt(dest_reg), @enumFromInt(dest_reg));
+            try xorRegReg(buf, @enumFromInt(dest_reg), @enumFromInt(dest_reg));
+            try movRegImm64(buf, scratch0, 1);
+            try cmoveRegReg(buf, @enumFromInt(dest_reg), scratch0);
+        },
+
+        // Store operation
+        .store => {
+            const local_idx: usize = @intCast(value.args()[0]);
+            const field_offset: i32 = @intCast(value.aux_int);
+            if (local_idx < func.locals.len) {
+                const local = func.locals[local_idx];
+                const total_offset = local.offset + field_offset;
+                const src_value = &func.values.items[value.args()[1]];
+                const size = type_reg.sizeOf(src_value.type_idx);
+
+                // Special handling for multi-register values (slice, union)
+                if (src_value.op == .slice_make or src_value.op == .union_init) {
+                    try movMemReg(buf, .rbp, total_offset, .rax);
+                    try movMemReg(buf, .rbp, total_offset + 8, .rdx);
+                } else if (src_value.op == .slice_index or src_value.op == .index) {
+                    if (size == 1) {
+                        try movMem8Reg(buf, .rbp, total_offset, .rax);
+                    } else {
+                        try movMemReg(buf, .rbp, total_offset, .rax);
+                    }
+                } else if (src_value.op == .const_string) {
+                    // String literal handling
+                    const str_content = src_value.aux_str;
+                    const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
+                        str_content[1 .. str_content.len - 1]
+                    else
+                        str_content;
+
+                    if (string_offsets.get(stripped)) |str_offset| {
+                        const sym_name = std.fmt.allocPrint(allocator, ".str.{d}", .{str_offset}) catch return;
+                        try leaRipSymbol(buf, .rax, sym_name);
+                        try movMemReg(buf, .rbp, total_offset, .rax);
+                        try movRegImm64(buf, .rax, @intCast(stripped.len));
+                        try movMemReg(buf, .rbp, total_offset + 8, .rax);
+                    } else {
+                        try xorRegReg(buf, .rax, .rax);
+                        try movMemReg(buf, .rbp, total_offset, .rax);
+                        try movMemReg(buf, .rbp, total_offset + 8, .rax);
+                    }
+                } else {
+                    const src_loc = func.locations.items[value.args()[1]];
+                    if (src_loc.getReg()) |r| {
+                        if (size == 1) {
+                            try movMem8Reg(buf, .rbp, total_offset, @enumFromInt(r));
+                        } else {
+                            try movMemReg(buf, .rbp, total_offset, @enumFromInt(r));
+                        }
+                    } else if (src_loc.getStack()) |src_offset| {
+                        try movRegMem(buf, scratch0, .rbp, src_offset);
+                        if (size == 1) {
+                            try movMem8Reg(buf, .rbp, total_offset, scratch0);
+                        } else {
+                            try movMemReg(buf, .rbp, total_offset, scratch0);
+                        }
+                    }
+                }
+            }
+        },
+
+        // Load operation
+        .load => {
+            const local_idx: usize = @intCast(value.args()[0]);
+            const field_offset: i32 = @intCast(value.aux_int);
+            if (local_idx < func.locals.len) {
+                const local = func.locals[local_idx];
+                const total_offset = local.offset + field_offset;
+                const size = type_reg.sizeOf(value.type_idx);
+
+                if (dest_loc.getReg()) |dest_reg| {
+                    if (size == 1) {
+                        try movzxRegMem8(buf, @enumFromInt(dest_reg), .rbp, total_offset);
+                    } else {
+                        try movRegMem(buf, @enumFromInt(dest_reg), .rbp, total_offset);
+                    }
+                }
+            }
+        },
+
+        // Function call
+        .call => {
+            // SysV ABI: args in rdi, rsi, rdx, rcx, r8, r9
+            const arg_regs = [_]Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
+            const args = value.args();
+
+            // Load args into registers (skip first arg which is function ref)
+            for (args[1..], 0..) |arg, i| {
+                if (i >= arg_regs.len) break;
+                const arg_loc = func.locations.items[arg];
+                try loadToReg(buf, arg_regs[i], arg_loc);
+            }
+
+            // Emit call
+            if (value.aux_str.len > 0) {
+                // External call via PLT
+                const sym_name = std.fmt.allocPrint(allocator, "{s}@PLT", .{value.aux_str}) catch return;
+                try callSymbol(buf, sym_name, os);
+            }
+
+            // Result in rax
+            if (dest_loc.getReg()) |dest_reg| {
+                if (dest_reg != @intFromEnum(Reg.rax)) {
+                    try movRegReg(buf, @enumFromInt(dest_reg), .rax);
+                }
+            } else if (dest_loc.getStack()) |offset| {
+                try movMemReg(buf, .rbp, offset, .rax);
+            }
+        },
+
+        // ========== Slice Operations ==========
+        .slice_make => {
+            // Slice construction from array or string
+            // args[0] = source local index (raw), args[1] = start (SSA), args[2] = end (SSA)
+            // aux_int = element size
+            // Result: rax = ptr (base + start*elem_size), rdx = len (end - start)
+            const args = value.args();
+            if (args.len >= 3) {
+                const local_idx = args[0];
+                const start_id = args[1];
+                const end_id = args[2];
+                const elem_size: i64 = value.aux_int;
+
+                const start_val = func.getValue(start_id);
+                const end_val = func.getValue(end_id);
+
+                if (local_idx < func.locals.len) {
+                    const local_offset: i32 = func.locals[@intCast(local_idx)].offset;
+                    const local_size = func.locals[@intCast(local_idx)].size;
+
+                    // IMPORTANT: Load start/end FIRST before we touch rax/rdx
+                    // Get start value into r9
+                    if (start_val.op == .const_int) {
+                        try movRegImm64(buf, .r9, start_val.aux_int);
+                    } else {
+                        try loadToReg(buf, .r9, func.locations.items[start_id]);
+                    }
+
+                    // Get end value into scratch0 (not rdx yet)
+                    if (end_val.op == .const_int) {
+                        try movRegImm64(buf, scratch0, end_val.aux_int);
+                    } else {
+                        try loadToReg(buf, scratch0, func.locations.items[end_id]);
+                    }
+
+                    // Now safe to use rax - load base address
+                    if (local_size == 16) {
+                        try movRegMem(buf, .rax, .rbp, local_offset);
+                    } else {
+                        try leaRegMem(buf, .rax, .rbp, local_offset);
+                    }
+
+                    // ptr = base + start * elem_size
+                    if (elem_size == 1) {
+                        try addRegReg(buf, .rax, .r9);
+                    } else {
+                        try imulRegRegImm(buf, scratch1, .r9, @intCast(elem_size));
+                        try addRegReg(buf, .rax, scratch1);
+                    }
+
+                    // len = end - start
+                    try movRegReg(buf, .rdx, scratch0);
+                    try subRegReg(buf, .rdx, .r9);
+                }
+            }
+        },
+
+        .slice_index => {
+            // Slice indexing: load ptr from slice, compute ptr + index*elem_size, load value
+            const args = value.args();
+            if (args.len >= 2) {
+                const local_idx = args[0];
+                const idx_val_id = args[1];
+                const idx_val = func.getValue(idx_val_id);
+                const elem_size: i64 = value.aux_int;
+
+                if (local_idx < func.locals.len) {
+                    const local_offset: i32 = func.locals[@intCast(local_idx)].offset;
+
+                    // Load slice ptr into rax
+                    try movRegMem(buf, .rax, .rbp, local_offset);
+
+                    // Get index into r9
+                    if (idx_val.op == .const_int) {
+                        try movRegImm64(buf, .r9, idx_val.aux_int);
+                    } else {
+                        try loadToReg(buf, .r9, func.locations.items[idx_val_id]);
+                    }
+
+                    // Compute offset: r9 = index * elem_size
+                    if (elem_size != 1) {
+                        try imulRegRegImm(buf, .r9, .r9, @intCast(elem_size));
+                    }
+
+                    // Add to base: rax = ptr + offset
+                    try addRegReg(buf, .rax, .r9);
+
+                    // Load value from computed address
+                    const size = type_reg.sizeOf(value.type_idx);
+                    if (size == 1) {
+                        try movzxRegMem8(buf, .rax, .rax, 0);
+                    } else {
+                        try movRegMem(buf, .rax, .rax, 0);
+                    }
+                }
+            }
+        },
+
+        // ========== Union Operations ==========
+        .union_init => {
+            // Initialize union: aux_int = variant index (tag)
+            // args[0] = payload (if any)
+            // Result: rax = tag, rdx = payload
+            const tag: i64 = value.aux_int;
+            try movRegImm64(buf, .rax, tag);
+
+            const args = value.args();
+            if (args.len > 0) {
+                const payload_val = func.getValue(args[0]);
+                if (payload_val.op == .const_int) {
+                    try movRegImm64(buf, .rdx, payload_val.aux_int);
+                } else {
+                    try loadToReg(buf, .rdx, func.locations.items[args[0]]);
+                }
+            } else {
+                try xorRegReg(buf, .rdx, .rdx);
+            }
+        },
+
+        .union_tag => {
+            // Get union tag: args[0] = union local
+            const args = value.args();
+            if (args.len > 0) {
+                const local_idx = args[0];
+                if (local_idx < func.locals.len) {
+                    const local_offset: i32 = func.locals[@intCast(local_idx)].offset;
+                    try movRegMem(buf, .rax, .rbp, local_offset);
+                }
+            }
+        },
+
+        .union_payload => {
+            // Get union payload: args[0] = union local
+            const args = value.args();
+            if (args.len > 0) {
+                const local_idx = args[0];
+                if (local_idx < func.locals.len) {
+                    const local_offset: i32 = func.locals[@intCast(local_idx)].offset;
+                    try movRegMem(buf, .rax, .rbp, local_offset + 8);
+                }
+            }
+        },
+
+        // ========== Array Index ==========
+        .index => {
+            // Array indexing: compute base + index*elem_size, load value
+            const args = value.args();
+            if (args.len >= 2) {
+                const local_idx = args[0];
+                const idx_val_id = args[1];
+                const idx_val = func.getValue(idx_val_id);
+                const elem_size: i64 = value.aux_int;
+
+                if (local_idx < func.locals.len) {
+                    const local_offset: i32 = func.locals[@intCast(local_idx)].offset;
+
+                    // Load array base address
+                    try leaRegMem(buf, .rax, .rbp, local_offset);
+
+                    // Get index into r9
+                    if (idx_val.op == .const_int) {
+                        try movRegImm64(buf, .r9, idx_val.aux_int);
+                    } else {
+                        try loadToReg(buf, .r9, func.locations.items[idx_val_id]);
+                    }
+
+                    // Compute offset
+                    if (elem_size != 1) {
+                        try imulRegRegImm(buf, .r9, .r9, @intCast(elem_size));
+                    }
+
+                    try addRegReg(buf, .rax, .r9);
+
+                    // Load value
+                    const size = type_reg.sizeOf(value.type_idx);
+                    if (size == 1) {
+                        try movzxRegMem8(buf, .rax, .rax, 0);
+                    } else {
+                        try movRegMem(buf, .rax, .rax, 0);
+                    }
+                }
+            }
+        },
+
+        // ========== String Operations ==========
+        .str_concat => {
+            // Concatenate two strings via runtime call
+            const sym_name = if (os == .macos) "_cot_str_concat" else "cot_str_concat";
+            try callSymbol(buf, sym_name, os);
+        },
+
+        // ========== Const Values ==========
+        .const_bool => {
+            if (dest_loc.getReg()) |dest_reg| {
+                const val: i64 = if (value.aux_int != 0) 1 else 0;
+                try movRegImm64(buf, @enumFromInt(dest_reg), val);
+            }
+        },
+
+        .const_nil => {
+            if (dest_loc.getReg()) |dest_reg| {
+                try xorRegReg(buf, @enumFromInt(dest_reg), @enumFromInt(dest_reg));
+            }
+        },
+
+        .const_string => {
+            // String constants are handled in .store
+        },
+
+        // NOTE: More ops to be migrated (map, list FFI ops)
+
+        else => {
+            // Ops not yet migrated
+        },
+    }
+}
 
 // ============================================================================
 // Tests

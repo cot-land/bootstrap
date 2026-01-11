@@ -27,6 +27,38 @@ const Allocator = std.mem.Allocator;
 const log = debug.scoped(.ssa);
 
 // ============================================================================
+// Location - Where a value lives after register allocation
+// ============================================================================
+// Mirrors Go's Location from location.go
+
+pub const Location = union(enum) {
+    /// Value is in a register (register number is arch-specific)
+    reg: u8,
+    /// Value is on the stack (offset from frame pointer)
+    stack: i32,
+    /// Value doesn't need a location (void, memory ops, control flow)
+    none: void,
+
+    pub fn isReg(self: Location) bool {
+        return self == .reg;
+    }
+
+    pub fn getReg(self: Location) ?u8 {
+        return switch (self) {
+            .reg => |r| r,
+            else => null,
+        };
+    }
+
+    pub fn getStack(self: Location) ?i32 {
+        return switch (self) {
+            .stack => |s| s,
+            else => null,
+        };
+    }
+};
+
+// ============================================================================
 // IDs (dense allocation like Go)
 // ============================================================================
 
@@ -339,6 +371,22 @@ pub const Block = struct {
     pub fn numSuccs(self: *const Block) u32 {
         return self.succs_len;
     }
+
+    /// Add a successor block. Returns the index of the added successor.
+    pub fn addSucc(self: *Block, target: BlockID) u8 {
+        const idx = self.succs_len;
+        if (idx < 2) {
+            self.succs_storage[idx] = .{ .block = target, .reverse_idx = 0 };
+        }
+        // Note: for >2 succs we'd need to allocate succs_extra, but most blocks have <=2
+        self.succs_len = idx + 1;
+        return idx;
+    }
+
+    /// Set the control value (condition for if blocks).
+    pub fn setControl(self: *Block, ctrl: ValueID) void {
+        self.control = ctrl;
+    }
 };
 
 // ============================================================================
@@ -348,6 +396,7 @@ pub const Block = struct {
 /// Local variable info for codegen (copied from IR).
 pub const LocalInfo = struct {
     name: []const u8,
+    type_idx: TypeIndex,
     size: u32,
     offset: i32,
 };
@@ -375,6 +424,10 @@ pub const Func = struct {
 
     /// Local variable info (propagated from IR for codegen offset calculations).
     locals: []const LocalInfo = &.{},
+
+    /// Register allocation results: locations[value_id] = where that value lives.
+    /// Populated by regalloc pass BEFORE codegen.
+    locations: std.ArrayList(Location) = .{ .items = &.{}, .capacity = 0 },
 
     /// ID allocators.
     vid: IdAlloc = .{},
@@ -406,6 +459,7 @@ pub const Func = struct {
         }
         self.blocks.deinit(self.allocator);
         self.values.deinit(self.allocator);
+        self.locations.deinit(self.allocator);
         if (self.cached_postorder) |po| {
             self.allocator.free(po);
         }

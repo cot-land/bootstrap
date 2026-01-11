@@ -1,0 +1,22 @@
+// Test calling lookupKeyword with string slice
+enum Token: u8 {
+    invalid,
+    kw_fn,
+    kw_var,
+}
+
+fn lookupKeyword(name: string) Token {
+    if name == "fn" { return Token.kw_fn }
+    if name == "var" { return Token.kw_var }
+    return Token.invalid
+}
+
+fn main() int {
+    var content: string = "fn main()"
+    var text: string = content[0:2]
+    var tok: Token = lookupKeyword(text)
+    if tok == Token.kw_fn {
+        return 42
+    }
+    return 1
+}

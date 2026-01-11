@@ -1,0 +1,9 @@
+// Test if slice can be compared to string literal
+fn main() int {
+    var s = "hello";
+    var sub = s[0:5];  // []u8
+    if sub == "hello" {  // compare []u8 with string
+        return 42;
+    }
+    return 1;
+}

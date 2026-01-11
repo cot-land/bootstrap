@@ -1041,7 +1041,8 @@ pub const Checker = struct {
         return switch (base) {
             .array => |a| try self.types.makeSlice(a.elem),
             .slice => base_type, // Slicing a slice returns same slice type
-            .basic => |k| if (k == .string_type) try self.types.makeSlice(TypeRegistry.U8) else blk: {
+            .basic => |k| if (k == .string_type) TypeRegistry.STRING else blk: {
+                // Slicing a string returns string (substring is still a string)
                 self.err.errorWithCode(se.span.start, .E303, "cannot slice this type");
                 break :blk invalid_type;
             },
@@ -1860,7 +1861,8 @@ pub const Checker = struct {
         const t = self.types.get(idx);
         return switch (t) {
             .basic => |k| k.size(),
-            .pointer, .slice, .func => 8, // pointer size
+            .pointer, .func => 8, // pointer size
+            .slice => 16, // ptr (8) + len (8)
             .optional => |o| self.typeSize(o.elem) + 1, // simplified
             .array => |a| @intCast(a.length * self.typeSize(a.elem)),
             .struct_type => |s| s.size,

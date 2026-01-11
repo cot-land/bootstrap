@@ -406,6 +406,67 @@ The current naive codegen assumes values are in specific registers. For more com
 
 ---
 
+## TODO: Go-Inspired Type Safety (High Priority)
+
+The following improvements are needed to match Go's compiler robustness. These should be implemented before self-hosting to prevent cascading bugs.
+
+### 1. Type-Aware Codegen
+
+**Problem**: Current codegen checks alignment (`@mod(offset, 8) == 0`) to decide instruction width, which fails silently for small types at unaligned offsets.
+
+**Go's approach**: Every SSA value has a type, and codegen uses type.Size() to select the appropriate load/store instruction (byte, half-word, word, double-word).
+
+**Fix needed**:
+- Always check `type_reg.sizeOf(value.type_idx)` in load/store codegen
+- Use `ldrb`/`strb` for 1-byte types, `ldrh`/`strh` for 2-byte types, etc.
+- Never silently skip operations due to alignment - either emit the right instruction or error
+
+### 2. Proper Frame Layout Alignment
+
+**Problem**: Our x86-centric frame layout assigns arbitrary negative offsets, causing ARM64 loads/stores to fail when locals aren't 8-byte aligned.
+
+**Go's approach**: Stack slots are allocated with alignment appropriate to their type (1-byte aligned for u8, 8-byte aligned for int, etc.), with padding as needed.
+
+**Fix needed**:
+- Modify `FrameLayout` to align each local appropriately
+- Or: ensure all locals are 8-byte aligned (wastes space but simpler)
+- Track alignment in `Local` struct: `alignment: u32`
+
+### 3. Type Coverage Tests
+
+**Problem**: We lacked tests for small types (u8 enums) stored from function call results. The bug only surfaced when testing scanner_boot.cot.
+
+**Go's approach**: Comprehensive tests for every type size in every context:
+- Parameters (u8, u16, u32, u64, structs by value, structs by pointer)
+- Return values (same variations)
+- Struct fields (at various offsets)
+- Array elements
+- Nested combinations
+
+**Tests to add**:
+```bash
+tests/test_u8_return.cot      # Function returning u8
+tests/test_u8_param.cot       # Function with u8 parameter
+tests/test_u8_struct_field.cot # Struct with u8 field at various offsets
+tests/test_u16_*.cot          # Same for u16
+tests/test_struct_return_*.cot # Struct returns of various sizes (8, 16, 17, 32 bytes)
+```
+
+### 4. Struct Return Calling Convention
+
+**Problem**: Struct returns don't populate x0/rax. The IR emits `ret args=[0xFFFFFFFF]` as a sentinel but codegen ignores it.
+
+**Go's approach**:
+- Structs ≤ 16 bytes (ARM64) or ≤ 16 bytes (x86_64): returned in registers
+- Larger structs: hidden pointer parameter (x8 on ARM64, first param on x86_64)
+
+**Fix needed**:
+- Detect struct return in lowering, allocate temp space
+- For small structs: pack fields into x0/x1 (or rax/rdx)
+- For large structs: implement hidden pointer convention
+
+---
+
 ## Architecture Reference
 
 See `go-inspired-architecture-improvements.md` for the compiler design we're following. The pipeline phases, IR representation, and optimization passes should match Go's approach - implemented in Zig, processing cot syntax.

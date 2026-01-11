@@ -1,0 +1,28 @@
+// Test returning struct with enum field
+enum Token: u8 {
+    invalid,
+    kw_fn,
+    kw_var,
+}
+
+struct TokenResult {
+    tok: Token,
+    start: int,
+    end: int,
+}
+
+fn getResult() TokenResult {
+    return TokenResult{
+        .tok = Token.kw_fn,
+        .start = 0,
+        .end = 2,
+    }
+}
+
+fn main() int {
+    var result: TokenResult = getResult()
+    if result.tok == Token.kw_fn {
+        return 42
+    }
+    return 1
+}

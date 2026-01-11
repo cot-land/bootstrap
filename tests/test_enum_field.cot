@@ -1,0 +1,19 @@
+// Test enum field access in struct
+enum Color: u8 {
+    red,
+    green,
+    blue,
+}
+
+struct Item {
+    name: int,
+    color: Color,
+}
+
+fn main() int {
+    var item: Item = Item{ .name = 1, .color = Color.green }
+    if item.color == Color.green {
+        return 42
+    }
+    return 1
+}

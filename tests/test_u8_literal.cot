@@ -1,0 +1,8 @@
+// Test u8 literals and initialization
+fn main() int {
+    var c: u8 = 65;  // 'A' as int
+    if c == 65 {
+        return 42;
+    }
+    return 1;
+}
