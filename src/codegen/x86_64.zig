@@ -566,44 +566,29 @@ pub fn leaRegMem(buf: *CodeBuffer, dst: Reg, base: Reg, offset: i32) !void {
 
 /// MOVZX r64, byte [base+offset] - Load byte with zero extension
 pub fn movzxRegMem8(buf: *CodeBuffer, dst: Reg, base: Reg, offset: i32) !void {
-    // REX.W + 0F B6 /r
+    // REX.W + 0F B6 /r (same pattern as movRegMem but with 0F B6 opcode)
     try buf.emit8(rex(true, dst, base));
     try buf.emit8(0x0F);
     try buf.emit8(0xB6);
 
-    // Handle RSP/R12 specially (need SIB byte)
-    if (base == .rsp or base == .r12) {
-        if (offset == 0) {
-            try buf.emit8(ModRM.regMem(dst, base, .sib_no_disp));
-            try buf.emit8(0x24); // SIB: base=RSP, index=none
-        } else if (offset >= -128 and offset <= 127) {
-            try buf.emit8(ModRM.regMem(dst, base, .sib_disp8));
-            try buf.emit8(0x24);
-            try buf.emit8(@bitCast(@as(i8, @intCast(offset))));
-        } else {
-            try buf.emit8(ModRM.regMem(dst, base, .sib_disp32));
-            try buf.emit8(0x24);
-            try buf.emit32(@bitCast(offset));
-        }
-    } else if (base == .rbp or base == .r13) {
-        // RBP/R13 require displacement even if 0
-        if (offset >= -128 and offset <= 127) {
-            try buf.emit8(ModRM.regMem(dst, base, .disp8));
-            try buf.emit8(@bitCast(@as(i8, @intCast(offset))));
-        } else {
-            try buf.emit8(ModRM.regMem(dst, base, .disp32));
-            try buf.emit32(@bitCast(offset));
-        }
+    if (offset == 0 and base != .rbp and base != .r13) {
+        try buf.emit8(ModRM.regDisp(ModRM.indirect, dst, base));
+    } else if (offset >= -128 and offset <= 127) {
+        try buf.emit8(ModRM.regDisp(ModRM.disp8, dst, base));
     } else {
-        if (offset == 0) {
-            try buf.emit8(ModRM.regMem(dst, base, .no_disp));
-        } else if (offset >= -128 and offset <= 127) {
-            try buf.emit8(ModRM.regMem(dst, base, .disp8));
-            try buf.emit8(@bitCast(@as(i8, @intCast(offset))));
-        } else {
-            try buf.emit8(ModRM.regMem(dst, base, .disp32));
-            try buf.emit32(@bitCast(offset));
-        }
+        try buf.emit8(ModRM.regDisp(ModRM.disp32, dst, base));
+    }
+
+    if (base == .rsp or base == .r12) {
+        try buf.emit8(0x24);
+    }
+
+    if (offset == 0 and base != .rbp and base != .r13) {
+        // No displacement
+    } else if (offset >= -128 and offset <= 127) {
+        try buf.emit8(@bitCast(@as(i8, @intCast(offset))));
+    } else {
+        try buf.emit32(@bitCast(offset));
     }
 }
 

@@ -1026,6 +1026,26 @@ pub const Driver = struct {
             return value_id;
         }
 
+        // Handle index - generic indexing (e.g., string indexing)
+        // args[0] = base (SSA ref), args[1] = index (SSA ref)
+        if (node.op == .index) {
+            const value_id = try func.newValue(.index, node.type_idx, block);
+            var value = func.getValue(value_id);
+            // Both args are IR node IDs that need SSA conversion
+            if (node.args_len > 0) {
+                if (ir_to_ssa.get(node.args()[0])) |ssa_base| {
+                    value.args_storage[0] = ssa_base;  // base value (SSA ref)
+                }
+            }
+            if (node.args_len > 1) {
+                if (ir_to_ssa.get(node.args()[1])) |ssa_idx| {
+                    value.args_storage[1] = ssa_idx;  // index value (SSA ref)
+                }
+            }
+            value.args_len = 2;
+            return value_id;
+        }
+
         // Handle store - args[0] = local index (raw), args[1] = value (SSA ref)
         if (node.op == .store) {
             const value_id = try func.newValue(.store, node.type_idx, block);
@@ -2203,6 +2223,9 @@ pub const Driver = struct {
                             const local_offset: i32 = func.locals[local_idx].offset;
                             try x86_64.movRegMem(buf, .r8, .rbp, local_offset + field_offset);
                         }
+                    } else if (left.op == .slice_index or left.op == .index) {
+                        // Slice/array index result is in rax, move to r8
+                        try x86_64.movRegReg(buf, .r8, .rax);
                     } else {
                         // Computed value (neg, add, etc) - load from storage
                         if (self.storage.get(args[0])) |slot| {
@@ -2390,8 +2413,8 @@ pub const Driver = struct {
                 }
             },
             .slice_make => {
-                // Slice construction from array
-                // args[0] = array local index (raw), args[1] = start (SSA), args[2] = end (SSA)
+                // Slice construction from array or string
+                // args[0] = source local index (raw), args[1] = start (SSA), args[2] = end (SSA)
                 // aux_int = element size
                 // Result: rax = ptr (base + start*elem_size), rdx = len (end - start)
                 const args = value.args();
@@ -2404,9 +2427,17 @@ pub const Driver = struct {
                     const start_val = func.getValue(start_id);
                     const end_val = func.getValue(end_id);
 
-                    // Get array base address into rax
                     const local_offset: i32 = func.locals[@intCast(local_idx)].offset;
-                    try x86_64.leaRegMem(buf, .rax, .rbp, local_offset);
+                    const local_size = func.locals[@intCast(local_idx)].size;
+
+                    // Check if source is a string/slice (16 bytes = ptr+len) or array (inline data)
+                    if (local_size == 16) {
+                        // String/slice: load the ptr from local into rax
+                        try x86_64.movRegMem(buf, .rax, .rbp, local_offset);
+                    } else {
+                        // Array: base address is the stack location itself
+                        try x86_64.leaRegMem(buf, .rax, .rbp, local_offset);
+                    }
 
                     // Get start value into r9
                     if (start_val.op == .const_int) {
@@ -2470,8 +2501,14 @@ pub const Driver = struct {
                     // Add to ptr: add rax, r9
                     try x86_64.addRegReg(buf, .rax, .r9);
 
-                    // Load value from computed address: mov rax, [rax]
-                    try x86_64.movRegMem(buf, .rax, .rax, 0);
+                    // Load value from computed address based on element size
+                    if (elem_size == 1) {
+                        // Byte load: movzx rax, byte [rax]
+                        try x86_64.movzxRegMem8(buf, .rax, .rax, 0);
+                    } else {
+                        // 64-bit load: mov rax, [rax]
+                        try x86_64.movRegMem(buf, .rax, .rax, 0);
+                    }
                 }
             },
             .store => {
@@ -2619,17 +2656,24 @@ pub const Driver = struct {
                     if (left.op == .eq or left.op == .ne or left.op == .lt or
                         left.op == .le or left.op == .gt or left.op == .ge)
                     {
-                        // Re-generate the comparison
-                        try self.generateX86Comparison(buf, func, left.*);
-                        // r10 = 0, r11 = 1, then cmove/cmovne based on condition
+                        // Set up r10=0, r11=1 BEFORE comparison (xor destroys flags!)
                         try x86_64.xorRegReg(buf, .r10, .r10); // r10 = 0
                         try x86_64.movRegImm64(buf, .r11, 1); // r11 = 1
+                        // Now do the comparison (sets flags)
+                        try self.generateX86Comparison(buf, func, left.*);
                         // Use appropriate cmov for the comparison type
-                        // For eq: cmove (if ZF=1)
-                        // For now, all our comparisons use eq for the condition
-                        try x86_64.cmoveRegReg(buf, .r10, .r11);
-                    } else if (left.op == .@"or") {
-                        // Left is already an OR - its result should be in r10
+                        const left_cc: x86_64.CondCode = switch (left.op) {
+                            .eq => .e,
+                            .ne => .ne,
+                            .lt => .l,
+                            .le => .le,
+                            .gt => .g,
+                            .ge => .ge,
+                            else => .e,
+                        };
+                        try x86_64.cmovccRegReg(buf, left_cc, .r10, .r11);
+                    } else if (left.op == .@"or" or left.op == .@"and") {
+                        // Left is already an OR/AND - its result should be in r10
                         // Just keep it
                     }
 
@@ -2637,13 +2681,22 @@ pub const Driver = struct {
                     if (right.op == .eq or right.op == .ne or right.op == .lt or
                         right.op == .le or right.op == .gt or right.op == .ge)
                     {
-                        // Re-generate the comparison
-                        try self.generateX86Comparison(buf, func, right.*);
-                        // r11 = 0, r12 = 1, then cmove
+                        // Set up r11=0, r12=1 BEFORE comparison (xor destroys flags!)
                         try x86_64.xorRegReg(buf, .r11, .r11); // r11 = 0
                         try x86_64.movRegImm64(buf, .r12, 1); // r12 = 1
-                        try x86_64.cmoveRegReg(buf, .r11, .r12);
-                    } else if (right.op == .@"or") {
+                        // Now do the comparison (sets flags)
+                        try self.generateX86Comparison(buf, func, right.*);
+                        const right_cc: x86_64.CondCode = switch (right.op) {
+                            .eq => .e,
+                            .ne => .ne,
+                            .lt => .l,
+                            .le => .le,
+                            .gt => .g,
+                            .ge => .ge,
+                            else => .e,
+                        };
+                        try x86_64.cmovccRegReg(buf, right_cc, .r11, .r12);
+                    } else if (right.op == .@"or" or right.op == .@"and") {
                         // Right is already an OR - recurse handled its result in r10
                         // Move to r11
                         try x86_64.movRegReg(buf, .r11, .r10);
@@ -2655,6 +2708,71 @@ pub const Driver = struct {
                     // Set flags for subsequent select: cmp r10, 0
                     // If r10 > 0, at least one was true (ZF = 0)
                     // If r10 == 0, both false (ZF = 1)
+                    try x86_64.cmpRegImm32(buf, .r10, 0);
+                }
+            },
+            .@"and" => {
+                // Logical AND: combine two comparison results
+                // Strategy: capture each comparison result as 0/1, then AND them
+                const args = value.args();
+                if (args.len >= 2) {
+                    const left = func.getValue(args[0]);
+                    const right = func.getValue(args[1]);
+
+                    // Get left comparison result into r10
+                    if (left.op == .eq or left.op == .ne or left.op == .lt or
+                        left.op == .le or left.op == .gt or left.op == .ge)
+                    {
+                        // Set up r10=0, r11=1 BEFORE comparison (xor destroys flags!)
+                        try x86_64.xorRegReg(buf, .r10, .r10); // r10 = 0
+                        try x86_64.movRegImm64(buf, .r11, 1); // r11 = 1
+                        // Now do the comparison (sets flags)
+                        try self.generateX86Comparison(buf, func, left.*);
+                        // Use appropriate cmov based on comparison type
+                        const left_cc: x86_64.CondCode = switch (left.op) {
+                            .eq => .e,
+                            .ne => .ne,
+                            .lt => .l,
+                            .le => .le,
+                            .gt => .g,
+                            .ge => .ge,
+                            else => .e,
+                        };
+                        try x86_64.cmovccRegReg(buf, left_cc, .r10, .r11);
+                    } else if (left.op == .@"and" or left.op == .@"or") {
+                        // Left is already and/or - its result should be in r10
+                    }
+
+                    // Get right comparison result into r11
+                    if (right.op == .eq or right.op == .ne or right.op == .lt or
+                        right.op == .le or right.op == .gt or right.op == .ge)
+                    {
+                        // Set up r11=0, r12=1 BEFORE comparison (xor destroys flags!)
+                        try x86_64.xorRegReg(buf, .r11, .r11); // r11 = 0
+                        try x86_64.movRegImm64(buf, .r12, 1); // r12 = 1
+                        // Now do the comparison (sets flags)
+                        try self.generateX86Comparison(buf, func, right.*);
+                        // Use appropriate cmov based on comparison type
+                        const right_cc: x86_64.CondCode = switch (right.op) {
+                            .eq => .e,
+                            .ne => .ne,
+                            .lt => .l,
+                            .le => .le,
+                            .gt => .g,
+                            .ge => .ge,
+                            else => .e,
+                        };
+                        try x86_64.cmovccRegReg(buf, right_cc, .r11, .r12);
+                    } else if (right.op == .@"and" or right.op == .@"or") {
+                        try x86_64.movRegReg(buf, .r11, .r10);
+                    }
+
+                    // Combine: and r10, r11
+                    try x86_64.andRegReg(buf, .r10, .r11);
+
+                    // Set flags for subsequent select: cmp r10, 0
+                    // If r10 > 0, both were true (ZF = 0)
+                    // If r10 == 0, at least one was false (ZF = 1)
                     try x86_64.cmpRegImm32(buf, .r10, 0);
                 }
             },
@@ -3124,6 +3242,12 @@ pub const Driver = struct {
                     } else if (cond_val.op == .ge) {
                         // For "if greater or equal", jump to false block if <
                         try x86_64.jccRel32(buf, .l, 0);
+                    } else if (cond_val.op == .@"or") {
+                        // For "or" result, jump to false block if result is 0
+                        try x86_64.jccRel32(buf, .e, 0);
+                    } else if (cond_val.op == .@"and") {
+                        // For "and" result, jump to false block if result is 0
+                        try x86_64.jccRel32(buf, .e, 0);
                     } else {
                         // Default: unconditional jump to false block
                         try x86_64.jmpRel32(buf, 0);
@@ -3577,6 +3701,9 @@ pub const Driver = struct {
                     } else if (left.op == .field) {
                         // Field result is in x0, move to x8
                         try aarch64.movRegReg(buf, .x8, .x0);
+                    } else if (left.op == .slice_index or left.op == .index) {
+                        // Slice/array index result is in x0, move to x8
+                        try aarch64.movRegReg(buf, .x8, .x0);
                     }
 
                     // Compare with right operand
@@ -3684,6 +3811,22 @@ pub const Driver = struct {
                         try aarch64.bCond(buf, .ne, 0); // Will be patched
                     } else if (cond_val.op == .ne) {
                         try aarch64.bCond(buf, .eq, 0);
+                    } else if (cond_val.op == .@"or") {
+                        // or result: cmp x10, #0 sets ZF=1 if false
+                        // b.eq to false path (skip then block if or result is 0)
+                        try aarch64.bCond(buf, .eq, 0);
+                    } else if (cond_val.op == .@"and") {
+                        // and result: cmp x10, #0 sets ZF=1 if false
+                        // b.eq to false path (skip then block if and result is 0)
+                        try aarch64.bCond(buf, .eq, 0);
+                    } else if (cond_val.op == .lt) {
+                        try aarch64.bCond(buf, .ge, 0);
+                    } else if (cond_val.op == .le) {
+                        try aarch64.bCond(buf, .gt, 0);
+                    } else if (cond_val.op == .gt) {
+                        try aarch64.bCond(buf, .le, 0);
+                    } else if (cond_val.op == .ge) {
+                        try aarch64.bCond(buf, .lt, 0);
                     } else {
                         // Default: unconditional branch placeholder
                         try aarch64.b(buf, 0);
@@ -3926,8 +4069,8 @@ pub const Driver = struct {
                 }
             },
             .slice_make => {
-                // Slice construction from array
-                // args[0] = array local index (raw), args[1] = start (SSA), args[2] = end (SSA)
+                // Slice construction from array or string
+                // args[0] = source local index (raw), args[1] = start (SSA), args[2] = end (SSA)
                 // aux_int = element size
                 // Result: x0 = ptr (base + start*elem_size), x1 = len (end - start)
                 const args = value.args();
@@ -3940,12 +4083,22 @@ pub const Driver = struct {
                     const start_val = func.getValue(start_id);
                     const end_val = func.getValue(end_id);
 
-                    // Get array base address into x8
                     const x86_offset: i32 = func.locals[@intCast(local_idx)].offset;
                     const local_offset: i32 = FrameLayout.aarch64LocalOffset(x86_offset, func.frame_size);
+                    const local_size = func.locals[@intCast(local_idx)].size;
 
-                    if (local_offset >= 0 and local_offset <= 4095) {
-                        try aarch64.addRegImm12(buf, .x8, .sp, @intCast(local_offset));
+                    // Check if source is a string/slice (16 bytes = ptr+len) or array (inline data)
+                    if (local_size == 16) {
+                        // String/slice: load the ptr from local, then add offset
+                        if (local_offset >= 0 and @mod(local_offset, 8) == 0) {
+                            const offset_scaled: u12 = @intCast(@divExact(local_offset, 8));
+                            try aarch64.ldrRegImm(buf, .x8, .sp, offset_scaled);
+                        }
+                    } else {
+                        // Array: base address is the stack location itself
+                        if (local_offset >= 0 and local_offset <= 4095) {
+                            try aarch64.addRegImm12(buf, .x8, .sp, @intCast(local_offset));
+                        }
                     }
 
                     // Get start value into x9
@@ -4019,8 +4172,14 @@ pub const Driver = struct {
                     // Add to ptr: x8 = x8 + x9
                     try aarch64.addRegReg(buf, .x8, .x8, .x9);
 
-                    // Load value from [x8]: ldr x0, [x8, #0]
-                    try aarch64.ldrRegImm(buf, .x0, .x8, 0);
+                    // Load value from [x8] based on element size
+                    if (elem_size == 1) {
+                        // Byte load: ldrb x0, [x8]
+                        try aarch64.ldrbRegImm(buf, .x0, .x8, 0);
+                    } else {
+                        // 64-bit load: ldr x0, [x8, #0]
+                        try aarch64.ldrRegImm(buf, .x0, .x8, 0);
+                    }
                 }
             },
             .union_init => {
@@ -4155,6 +4314,64 @@ pub const Driver = struct {
                     // Set flags for subsequent select: cmp x10, #0
                     // If x10 > 0, at least one was true (ZF = 0)
                     // If x10 == 0, both false (ZF = 1)
+                    try aarch64.cmpRegImm12(buf, .x10, 0);
+                }
+            },
+            .@"and" => {
+                // Logical AND: combine two comparison results
+                // Strategy: capture each comparison result as 0/1, then AND them
+                const args = value.args();
+                if (args.len >= 2) {
+                    const left = func.getValue(args[0]);
+                    const right = func.getValue(args[1]);
+
+                    // Load 1 for csel
+                    try aarch64.movRegImm64(buf, .x12, 1);
+
+                    // Get left comparison result
+                    if (left.op == .eq or left.op == .ne or left.op == .lt or
+                        left.op == .le or left.op == .gt or left.op == .ge)
+                    {
+                        try self.generateAArch64Comparison(buf, func, left.*);
+                        const cond: aarch64.Cond = switch (left.op) {
+                            .eq => .eq,
+                            .ne => .ne,
+                            .lt => .lt,
+                            .le => .le,
+                            .gt => .gt,
+                            .ge => .ge,
+                            else => .eq,
+                        };
+                        try aarch64.csel(buf, .x10, .x12, aarch64.zr, cond);
+                    } else if (left.op == .@"and" or left.op == .@"or") {
+                        // Left is already and/or - its result should be in x10
+                    }
+
+                    // Get right comparison result
+                    if (right.op == .eq or right.op == .ne or right.op == .lt or
+                        right.op == .le or right.op == .gt or right.op == .ge)
+                    {
+                        try self.generateAArch64Comparison(buf, func, right.*);
+                        const cond: aarch64.Cond = switch (right.op) {
+                            .eq => .eq,
+                            .ne => .ne,
+                            .lt => .lt,
+                            .le => .le,
+                            .gt => .gt,
+                            .ge => .ge,
+                            else => .eq,
+                        };
+                        try aarch64.csel(buf, .x11, .x12, aarch64.zr, cond);
+                    } else if (right.op == .@"and" or right.op == .@"or") {
+                        try aarch64.movRegReg(buf, .x11, .x10);
+                    }
+
+                    // Combine: and x10, x10, x11
+                    try aarch64.andRegReg(buf, .x10, .x10, .x11);
+
+                    // Set flags for subsequent select: cmp x10, #0
+                    // If x10 > 0, both were true (ZF = 0)
+                    // If x10 == 0, at least one was false (ZF = 1)
                     try aarch64.cmpRegImm12(buf, .x10, 0);
                 }
             },
@@ -4682,6 +4899,12 @@ pub const Driver = struct {
                     } else if (cond_val.op == .ge) {
                         // For "if greater or equal", branch to false block if <
                         try aarch64.bCond(buf, .lt, 0);
+                    } else if (cond_val.op == .@"or") {
+                        // For "or" result, branch to false block if result is 0
+                        try aarch64.bCond(buf, .eq, 0);
+                    } else if (cond_val.op == .@"and") {
+                        // For "and" result, branch to false block if result is 0
+                        try aarch64.bCond(buf, .eq, 0);
                     } else {
                         try aarch64.b(buf, 0);
                     }

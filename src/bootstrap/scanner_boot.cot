@@ -1,0 +1,443 @@
+// Lexical scanner for cot bootstrap.
+// Simplified version using only currently-supported features.
+//
+// Changes from original scanner.cot:
+// - No pointer types (*Source, *Scanner)
+// - No optional types (?byte)
+// - No if/while with capture
+// - No imports
+// - Content passed directly, position tracked as int
+// - Returns Token enum values
+
+// Scanner state - passed to all functions
+struct ScannerState {
+    content: string,
+    pos: int,
+    len: int,
+}
+
+// Scanned token result
+struct TokenResult {
+    tok: Token,
+    start: int,
+    end: int,
+}
+
+// Initialize scanner state from content
+fn scannerInit(content: string) ScannerState {
+    var state: ScannerState = ScannerState{
+        .content = content,
+        .pos = 0,
+        .len = len(content),
+    }
+    return state
+}
+
+// Check if at end of input
+fn scannerAtEnd(state: ScannerState) bool {
+    return state.pos >= state.len
+}
+
+// Get current character (returns 0 if at end)
+fn scannerCurrent(state: ScannerState) int {
+    if state.pos >= state.len {
+        return 0
+    }
+    return state.content[state.pos]
+}
+
+// Peek ahead n characters (returns 0 if past end)
+fn scannerPeek(state: ScannerState, n: int) int {
+    var idx: int = state.pos + n
+    if idx >= state.len {
+        return 0
+    }
+    return state.content[idx]
+}
+
+// Skip whitespace and comments, return new position
+fn skipWhitespace(state: ScannerState) int {
+    var pos: int = state.pos
+    while pos < state.len {
+        var c: int = state.content[pos]
+        if c == 32 or c == 9 or c == 10 or c == 13 {
+            // space, tab, newline, carriage return
+            pos = pos + 1
+        } else if c == 47 and pos + 1 < state.len {
+            // '/' - check for comment
+            var next: int = state.content[pos + 1]
+            if next == 47 {
+                // line comment //
+                pos = pos + 2
+                while pos < state.len and state.content[pos] != 10 {
+                    pos = pos + 1
+                }
+                if pos < state.len {
+                    pos = pos + 1
+                }
+            } else if next == 42 {
+                // block comment /*
+                pos = pos + 2
+                while pos + 1 < state.len {
+                    if state.content[pos] == 42 and state.content[pos + 1] == 47 {
+                        pos = pos + 2
+                        break
+                    }
+                    pos = pos + 1
+                }
+            } else {
+                break
+            }
+        } else {
+            break
+        }
+    }
+    return pos
+}
+
+// Check if character is alphabetic
+fn isAlpha(c: int) bool {
+    return (c >= 97 and c <= 122) or (c >= 65 and c <= 90)
+}
+
+// Check if character is digit
+fn isDigit(c: int) bool {
+    return c >= 48 and c <= 57
+}
+
+// Check if character is alphanumeric
+fn isAlphaNumeric(c: int) bool {
+    return isAlpha(c) or isDigit(c)
+}
+
+// Scan identifier or keyword, return end position
+fn scanIdentifier(state: ScannerState) int {
+    var pos: int = state.pos
+    while pos < state.len {
+        var c: int = state.content[pos]
+        if isAlphaNumeric(c) or c == 95 {
+            pos = pos + 1
+        } else {
+            break
+        }
+    }
+    return pos
+}
+
+// Scan number literal, return end position
+fn scanNumber(state: ScannerState) int {
+    var pos: int = state.pos
+    // Handle hex, octal, binary prefixes
+    if pos < state.len and state.content[pos] == 48 {
+        if pos + 1 < state.len {
+            var next: int = state.content[pos + 1]
+            if next == 120 or next == 88 {
+                // 0x or 0X - hex
+                pos = pos + 2
+                while pos < state.len {
+                    var c: int = state.content[pos]
+                    if isDigit(c) or (c >= 97 and c <= 102) or (c >= 65 and c <= 70) or c == 95 {
+                        pos = pos + 1
+                    } else {
+                        break
+                    }
+                }
+                return pos
+            } else if next == 111 or next == 79 {
+                // 0o or 0O - octal
+                pos = pos + 2
+                while pos < state.len {
+                    var c: int = state.content[pos]
+                    if (c >= 48 and c <= 55) or c == 95 {
+                        pos = pos + 1
+                    } else {
+                        break
+                    }
+                }
+                return pos
+            } else if next == 98 or next == 66 {
+                // 0b or 0B - binary
+                pos = pos + 2
+                while pos < state.len {
+                    var c: int = state.content[pos]
+                    if c == 48 or c == 49 or c == 95 {
+                        pos = pos + 1
+                    } else {
+                        break
+                    }
+                }
+                return pos
+            }
+        }
+    }
+    // Decimal digits
+    while pos < state.len {
+        var c: int = state.content[pos]
+        if isDigit(c) or c == 95 {
+            pos = pos + 1
+        } else {
+            break
+        }
+    }
+    // Fractional part (check for .. range operator)
+    if pos < state.len and state.content[pos] == 46 {
+        if pos + 1 < state.len and state.content[pos + 1] != 46 {
+            pos = pos + 1
+            while pos < state.len {
+                var c: int = state.content[pos]
+                if isDigit(c) or c == 95 {
+                    pos = pos + 1
+                } else {
+                    break
+                }
+            }
+        }
+    }
+    // Exponent
+    if pos < state.len {
+        var c: int = state.content[pos]
+        if c == 101 or c == 69 {
+            pos = pos + 1
+            if pos < state.len {
+                var sign: int = state.content[pos]
+                if sign == 43 or sign == 45 {
+                    pos = pos + 1
+                }
+            }
+            while pos < state.len {
+                var c2: int = state.content[pos]
+                if isDigit(c2) or c2 == 95 {
+                    pos = pos + 1
+                } else {
+                    break
+                }
+            }
+        }
+    }
+    return pos
+}
+
+// Scan string literal, return end position
+fn scanString(state: ScannerState) int {
+    var pos: int = state.pos + 1  // skip opening "
+    while pos < state.len {
+        var c: int = state.content[pos]
+        if c == 34 {
+            // closing "
+            pos = pos + 1
+            break
+        } else if c == 92 {
+            // backslash escape
+            pos = pos + 2
+        } else if c == 10 {
+            // newline - unterminated
+            break
+        } else {
+            pos = pos + 1
+        }
+    }
+    return pos
+}
+
+// Scan character literal, return end position
+fn scanChar(state: ScannerState) int {
+    var pos: int = state.pos + 1  // skip opening '
+    if pos < state.len {
+        if state.content[pos] == 92 {
+            // escape sequence
+            pos = pos + 2
+        } else {
+            pos = pos + 1
+        }
+    }
+    if pos < state.len and state.content[pos] == 39 {
+        pos = pos + 1
+    }
+    return pos
+}
+
+// Scan next token from state
+fn scanNext(state: ScannerState) TokenResult {
+    var pos: int = skipWhitespace(state)
+    var start: int = pos
+
+    // Check for EOF
+    if pos >= state.len {
+        return TokenResult{
+            .tok = Token.eof,
+            .start = start,
+            .end = pos,
+        }
+    }
+
+    var c: int = state.content[pos]
+
+    // Identifier or keyword
+    if isAlpha(c) or c == 95 {
+        var newState: ScannerState = ScannerState{
+            .content = state.content,
+            .pos = pos,
+            .len = state.len,
+        }
+        var end_pos: int = scanIdentifier(newState)
+        var text: string = state.content[start..end_pos]
+        var tok: Token = lookupKeyword(text)
+        if tok == Token.invalid {
+            tok = Token.identifier
+        }
+        return TokenResult{
+            .tok = tok,
+            .start = start,
+            .end = end_pos,
+        }
+    }
+
+    // Number
+    if isDigit(c) {
+        var newState: ScannerState = ScannerState{
+            .content = state.content,
+            .pos = pos,
+            .len = state.len,
+        }
+        var end_pos: int = scanNumber(newState)
+        return TokenResult{
+            .tok = Token.int_literal,
+            .start = start,
+            .end = end_pos,
+        }
+    }
+
+    // String literal
+    if c == 34 {
+        var newState: ScannerState = ScannerState{
+            .content = state.content,
+            .pos = pos,
+            .len = state.len,
+        }
+        var end_pos: int = scanString(newState)
+        return TokenResult{
+            .tok = Token.string_literal,
+            .start = start,
+            .end = end_pos,
+        }
+    }
+
+    // Character literal
+    if c == 39 {
+        var newState: ScannerState = ScannerState{
+            .content = state.content,
+            .pos = pos,
+            .len = state.len,
+        }
+        var end_pos: int = scanChar(newState)
+        return TokenResult{
+            .tok = Token.char_literal,
+            .start = start,
+            .end = end_pos,
+        }
+    }
+
+    // Single character tokens and multi-char operators
+    pos = pos + 1
+
+    if c == 40 { return TokenResult{ .tok = Token.lparen, .start = start, .end = pos } }
+    if c == 41 { return TokenResult{ .tok = Token.rparen, .start = start, .end = pos } }
+    if c == 91 { return TokenResult{ .tok = Token.lbracket, .start = start, .end = pos } }
+    if c == 93 { return TokenResult{ .tok = Token.rbracket, .start = start, .end = pos } }
+    if c == 123 { return TokenResult{ .tok = Token.lbrace, .start = start, .end = pos } }
+    if c == 125 { return TokenResult{ .tok = Token.rbrace, .start = start, .end = pos } }
+    if c == 44 { return TokenResult{ .tok = Token.comma, .start = start, .end = pos } }
+    if c == 59 { return TokenResult{ .tok = Token.semicolon, .start = start, .end = pos } }
+    if c == 58 { return TokenResult{ .tok = Token.colon, .start = start, .end = pos } }
+    if c == 126 { return TokenResult{ .tok = Token.tilde, .start = start, .end = pos } }
+    if c == 64 { return TokenResult{ .tok = Token.at, .start = start, .end = pos } }
+
+    // Two-char operators
+    var next: int = 0
+    if pos < state.len {
+        next = state.content[pos]
+    }
+
+    if c == 43 {
+        if next == 61 { return TokenResult{ .tok = Token.plus_equal, .start = start, .end = pos + 1 } }
+        return TokenResult{ .tok = Token.plus, .start = start, .end = pos }
+    }
+    if c == 45 {
+        if next == 61 { return TokenResult{ .tok = Token.minus_equal, .start = start, .end = pos + 1 } }
+        if next == 62 { return TokenResult{ .tok = Token.arrow, .start = start, .end = pos + 1 } }
+        return TokenResult{ .tok = Token.minus, .start = start, .end = pos }
+    }
+    if c == 42 {
+        if next == 61 { return TokenResult{ .tok = Token.star_equal, .start = start, .end = pos + 1 } }
+        return TokenResult{ .tok = Token.star, .start = start, .end = pos }
+    }
+    if c == 47 {
+        if next == 61 { return TokenResult{ .tok = Token.slash_equal, .start = start, .end = pos + 1 } }
+        return TokenResult{ .tok = Token.slash, .start = start, .end = pos }
+    }
+    if c == 37 {
+        if next == 61 { return TokenResult{ .tok = Token.percent_equal, .start = start, .end = pos + 1 } }
+        return TokenResult{ .tok = Token.percent, .start = start, .end = pos }
+    }
+    if c == 38 {
+        if next == 61 { return TokenResult{ .tok = Token.ampersand_equal, .start = start, .end = pos + 1 } }
+        return TokenResult{ .tok = Token.ampersand, .start = start, .end = pos }
+    }
+    if c == 124 {
+        if next == 61 { return TokenResult{ .tok = Token.pipe_equal, .start = start, .end = pos + 1 } }
+        return TokenResult{ .tok = Token.pipe, .start = start, .end = pos }
+    }
+    if c == 94 {
+        if next == 61 { return TokenResult{ .tok = Token.caret_equal, .start = start, .end = pos + 1 } }
+        return TokenResult{ .tok = Token.caret, .start = start, .end = pos }
+    }
+    if c == 61 {
+        if next == 61 { return TokenResult{ .tok = Token.equal_equal, .start = start, .end = pos + 1 } }
+        if next == 62 { return TokenResult{ .tok = Token.fat_arrow, .start = start, .end = pos + 1 } }
+        return TokenResult{ .tok = Token.equal, .start = start, .end = pos }
+    }
+    if c == 33 {
+        if next == 61 { return TokenResult{ .tok = Token.bang_equal, .start = start, .end = pos + 1 } }
+        return TokenResult{ .tok = Token.bang, .start = start, .end = pos }
+    }
+    if c == 60 {
+        if next == 61 { return TokenResult{ .tok = Token.less_equal, .start = start, .end = pos + 1 } }
+        if next == 60 { return TokenResult{ .tok = Token.less_less, .start = start, .end = pos + 1 } }
+        return TokenResult{ .tok = Token.less, .start = start, .end = pos }
+    }
+    if c == 62 {
+        if next == 61 { return TokenResult{ .tok = Token.greater_equal, .start = start, .end = pos + 1 } }
+        if next == 62 { return TokenResult{ .tok = Token.greater_greater, .start = start, .end = pos + 1 } }
+        return TokenResult{ .tok = Token.greater, .start = start, .end = pos }
+    }
+    if c == 46 {
+        if next == 46 { return TokenResult{ .tok = Token.dot_dot, .start = start, .end = pos + 1 } }
+        if next == 42 { return TokenResult{ .tok = Token.dot_star, .start = start, .end = pos + 1 } }
+        if next == 63 { return TokenResult{ .tok = Token.dot_question, .start = start, .end = pos + 1 } }
+        return TokenResult{ .tok = Token.dot, .start = start, .end = pos }
+    }
+    if c == 63 {
+        if next == 63 { return TokenResult{ .tok = Token.question_question, .start = start, .end = pos + 1 } }
+        if next == 46 { return TokenResult{ .tok = Token.question_dot, .start = start, .end = pos + 1 } }
+        return TokenResult{ .tok = Token.question, .start = start, .end = pos }
+    }
+
+    return TokenResult{
+        .tok = Token.invalid,
+        .start = start,
+        .end = pos,
+    }
+}
+
+// Simple test
+fn main() int {
+    var content: string = "fn main() { return 42 }"
+    var state: ScannerState = scannerInit(content)
+
+    // Scan first token - should be 'fn' keyword
+    var result: TokenResult = scanNext(state)
+    if result.tok == Token.kw_fn {
+        return 42
+    }
+    return 1
+}

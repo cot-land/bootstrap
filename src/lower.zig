@@ -1836,6 +1836,20 @@ pub const Lowerer = struct {
                         .withAux(@intCast(elem_size));
                     log.debug("  slice index: local={d}, elem_size={d}", .{ local_idx, elem_size });
                     return try fb.emit(slice_idx_node);
+                } else if (local_type == .basic and local_type.basic == .string_type) {
+                    // String indexing: string is ptr+len at local (same as slice), returns byte
+                    const elem_size: u32 = 1; // strings are byte arrays
+
+                    // Lower the index expression
+                    const idx_node = try self.lowerExpr(index.index);
+
+                    // Emit slice_index op - strings use same pattern as slices
+                    // args[0] = string local index, args[1] = index value, aux = elem_size
+                    const str_idx_node = ir.Node.init(.slice_index, TypeRegistry.U8, Span.fromPos(Pos.zero))
+                        .withArgs(&.{ @intCast(local_idx), idx_node })
+                        .withAux(@intCast(elem_size));
+                    log.debug("  string index: local={d}, elem_size={d}", .{ local_idx, elem_size });
+                    return try fb.emit(str_idx_node);
                 }
             }
         }

@@ -1,0 +1,18 @@
+// Test string slicing: str[start:end]
+fn main() int {
+    var s = "hello world";
+    var sub = s[0:5];  // should be "hello"
+    // Check length is 5
+    if len(sub) != 5 {
+        return 1;
+    }
+    // Check first character is 'h' (104)
+    if sub[0] != 104 {
+        return 2;
+    }
+    // Check last character is 'o' (111)
+    if sub[4] != 111 {
+        return 3;
+    }
+    return 42;
+}

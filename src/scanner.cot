@@ -32,6 +32,8 @@ struct Scanner {
     pos: Pos,
     ch: ?byte,              // Current character (or null if at end)
     err: ?*ErrorReporter,   // Error reporter (optional)
+    in_interp_string: bool, // Track if we're inside an interpolated string (after seeing ${ )
+    interp_brace_depth: u32, // Track brace depth for nested expressions in interpolated strings
 }
 
 // Initialize scanner with source.
@@ -46,6 +48,8 @@ fn initWithErrors(src: *Source, err: ?*ErrorReporter) Scanner {
         .pos = Pos.zero,
         .ch = null,
         .err = err,
+        .in_interp_string = false,
+        .interp_brace_depth = 0,
     }
     s.ch = src.at(s.pos)
     return s
@@ -273,11 +277,12 @@ fn scanBinaryDigits(self: *Scanner) {
     }
 }
 
-// Scan a string literal.
+// Scan a string literal (may be interpolated).
 fn scanString(self: *Scanner, start: Pos) TokenInfo {
     self.advance()  // consume opening "
 
     var terminated = false
+    var found_interp = false
     while self.ch |c| {
         if c == '"' {
             self.advance()
@@ -288,6 +293,19 @@ fn scanString(self: *Scanner, start: Pos) TokenInfo {
             if self.ch != null {
                 self.advance()  // skip escaped char
             }
+        } else if c == '$' {
+            // Check for ${ interpolation
+            var next_ch = self.src.at(self.pos.advance(1))
+            if next_ch != null and next_ch.? == '{' {
+                self.advance()  // consume $
+                self.advance()  // consume {
+                found_interp = true
+                self.in_interp_string = true
+                self.interp_brace_depth = 1
+                break
+            } else {
+                self.advance()  // just a regular $
+            }
         } else if c == '\n' {
             // Unterminated string - newline before closing quote
             break
@@ -296,13 +314,76 @@ fn scanString(self: *Scanner, start: Pos) TokenInfo {
         }
     }
 
-    if not terminated {
+    if not terminated and not found_interp {
         self.errorAt(start, .E100, "string literal not terminated")
     }
 
     var text = self.src.content[start.offset..self.pos.offset]
+    if found_interp {
+        return TokenInfo{
+            .tok = .string_interp_start,
+            .span = Span.init(start, self.pos),
+            .text = text,
+        }
+    }
     return TokenInfo{
         .tok = .string_literal,
+        .span = Span.init(start, self.pos),
+        .text = text,
+    }
+}
+
+// Continue scanning an interpolated string after an expression.
+// Called when we see } and are in interpolated string mode.
+fn scanStringContinuation(self: *Scanner, start: Pos) TokenInfo {
+    var terminated = false
+    var found_interp = false
+
+    while self.ch |c| {
+        if c == '"' {
+            self.advance()
+            terminated = true
+            self.in_interp_string = false
+            break
+        } else if c == '\\' {
+            self.advance()  // skip backslash
+            if self.ch != null {
+                self.advance()  // skip escaped char
+            }
+        } else if c == '$' {
+            // Check for ${ interpolation
+            var next_ch = self.src.at(self.pos.advance(1))
+            if next_ch != null and next_ch.? == '{' {
+                self.advance()  // consume $
+                self.advance()  // consume {
+                found_interp = true
+                self.interp_brace_depth = 1
+                break
+            } else {
+                self.advance()  // just a regular $
+            }
+        } else if c == '\n' {
+            // Unterminated string - newline before closing quote
+            break
+        } else {
+            self.advance()
+        }
+    }
+
+    if not terminated and not found_interp {
+        self.errorAt(start, .E100, "string literal not terminated")
+    }
+
+    var text = self.src.content[start.offset..self.pos.offset]
+    if found_interp {
+        return TokenInfo{
+            .tok = .string_interp_mid,
+            .span = Span.init(start, self.pos),
+            .text = text,
+        }
+    }
+    return TokenInfo{
+        .tok = .string_interp_end,
         .span = Span.init(start, self.pos),
         .text = text,
     }
@@ -343,6 +424,29 @@ fn scanChar(self: *Scanner, start: Pos) TokenInfo {
 fn scanOperator(self: *Scanner, start: Pos) TokenInfo {
     var c = self.ch.?
     self.advance()
+
+    // Handle braces specially when in interpolated string mode
+    if c == '{' and self.in_interp_string {
+        self.interp_brace_depth += 1
+        return TokenInfo{
+            .tok = .lbrace,
+            .span = Span.init(start, self.pos),
+            .text = "",
+        }
+    }
+
+    if c == '}' and self.in_interp_string {
+        self.interp_brace_depth -= 1
+        if self.interp_brace_depth == 0 {
+            // End of interpolated expression - continue scanning string
+            return self.scanStringContinuation(start)
+        }
+        return TokenInfo{
+            .tok = .rbrace,
+            .span = Span.init(start, self.pos),
+            .text = "",
+        }
+    }
 
     var tok = switch c {
         '(' => .lparen,
@@ -419,6 +523,9 @@ fn scanOperator(self: *Scanner, start: Pos) TokenInfo {
         '=' => if self.ch == '=' {
             self.advance()
             .equal_equal
+        } else if self.ch == '>' {
+            self.advance()
+            .fat_arrow
         } else {
             .equal
         },
@@ -456,6 +563,9 @@ fn scanOperator(self: *Scanner, start: Pos) TokenInfo {
         } else if self.ch == '*' {
             self.advance()
             .dot_star
+        } else if self.ch == '?' {
+            self.advance()
+            .dot_question
         } else {
             .dot
         },

@@ -80,6 +80,10 @@ get_expected() {
         test_coalesce) echo 42 ;;
         test_var_assign) echo 42 ;;
         test_nested_struct) echo 42 ;;
+        test_string_index) echo 42 ;;
+        test_string_slice) echo 42 ;;
+        test_bool_or) echo 42 ;;
+        test_bool_and) echo 42 ;;
         *) echo "" ;;
     esac
 }

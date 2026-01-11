@@ -1,0 +1,9 @@
+// Test string indexing: str[i]
+fn main() int {
+    var s = "hello";
+    var c = s[0];  // should be 'h' = 104
+    if c == 104 {
+        return 42;
+    }
+    return 0;
+}

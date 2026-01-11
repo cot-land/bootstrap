@@ -1,0 +1,24 @@
+// Test boolean and operator
+fn main() int {
+    var a = 1;
+    var b = 0;
+
+    // Test: true and true = true
+    if a == 1 and b == 0 {
+        // Both are true
+    } else {
+        return 1;
+    }
+
+    // Test: true and false = false
+    if a == 1 and b == 1 {
+        return 2;
+    }
+
+    // Test: false and true = false
+    if a == 0 and b == 0 {
+        return 3;
+    }
+
+    return 42;
+}

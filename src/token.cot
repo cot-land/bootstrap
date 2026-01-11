@@ -23,11 +23,14 @@ enum Token: u8 {
     invalid,
 
     // Literals and identifiers
-    identifier,     // variable names, function names
-    int_literal,    // 123, 0xFF
-    float_literal,  // 3.14, 1e10
-    string_literal, // "hello"
-    char_literal,   // 'a'
+    identifier,         // variable names, function names
+    int_literal,        // 123, 0xFF
+    float_literal,      // 3.14, 1e10
+    string_literal,     // "hello" (non-interpolated)
+    string_interp_start, // "text ${ (start of interpolated string)
+    string_interp_mid,  // } text ${ (middle part between interpolations)
+    string_interp_end,  // } text" (end of interpolated string)
+    char_literal,       // 'a'
 
     // Operators (single char)
     plus,           // +
@@ -64,9 +67,11 @@ enum Token: u8 {
     greater_greater,    // >>
     dot_dot,            // ..
     dot_star,           // .*
+    dot_question,       // .? (optional unwrap)
     question_question,  // ??
     question_dot,       // ?.
     arrow,              // ->
+    fat_arrow,          // =>
 
     // Delimiters
     lparen,     // (
@@ -85,8 +90,12 @@ enum Token: u8 {
     kw_let,
     kw_const,
     kw_struct,
+    kw_enum,
+    kw_union,
+    kw_type,
     kw_if,
     kw_else,
+    kw_switch,
     kw_while,
     kw_for,
     kw_in,
@@ -136,6 +145,9 @@ fn toString(self: Token) string {
         .int_literal => "integer",
         .float_literal => "float",
         .string_literal => "string",
+        .string_interp_start => "string_interp_start",
+        .string_interp_mid => "string_interp_mid",
+        .string_interp_end => "string_interp_end",
         .char_literal => "char",
         .plus => "+",
         .minus => "-",
@@ -169,9 +181,11 @@ fn toString(self: Token) string {
         .greater_greater => ">>",
         .dot_dot => "..",
         .dot_star => ".*",
+        .dot_question => ".?",
         .question_question => "??",
         .question_dot => "?.",
         .arrow => "->",
+        .fat_arrow => "=>",
         .lparen => "(",
         .rparen => ")",
         .lbracket => "[",
@@ -186,8 +200,12 @@ fn toString(self: Token) string {
         .kw_let => "let",
         .kw_const => "const",
         .kw_struct => "struct",
+        .kw_enum => "enum",
+        .kw_union => "union",
+        .kw_type => "type",
         .kw_if => "if",
         .kw_else => "else",
+        .kw_switch => "switch",
         .kw_while => "while",
         .kw_for => "for",
         .kw_in => "in",
@@ -235,8 +253,12 @@ const keywords: Map<string, Token> = {
     "let": .kw_let,
     "const": .kw_const,
     "struct": .kw_struct,
+    "enum": .kw_enum,
+    "union": .kw_union,
+    "type": .kw_type,
     "if": .kw_if,
     "else": .kw_else,
+    "switch": .kw_switch,
     "while": .kw_while,
     "for": .kw_for,
     "in": .kw_in,
@@ -280,17 +302,19 @@ fn lookupKeyword(name: string) ?Token {
 // Follows Go's precedence but with cot's keyword operators.
 enum Precedence: u8 {
     none = 0,
-    or_prec = 1,    // or
-    and_prec = 2,   // and
-    compare = 3,    // == != < <= > >=
-    add = 4,        // + - | ^
-    mul = 5,        // * / % & << >>
-    unary = 6,      // not ! - ~ & *
+    coalesce = 1,   // ?? (null coalescing, lowest binary op)
+    or_prec = 2,    // or
+    and_prec = 3,   // and
+    compare = 4,    // == != < <= > >=
+    add = 5,        // + - | ^
+    mul = 6,        // * / % & << >>
+    unary = 7,      // not ! - ~ & *
 }
 
 // Returns the binary operator precedence for a token.
 fn binaryPrecedence(tok: Token) Precedence {
     return switch tok {
+        .question_question => .coalesce,
         .kw_or => .or_prec,
         .kw_and => .and_prec,
         .equal_equal, .bang_equal, .less, .less_equal, .greater, .greater_equal => .compare,
