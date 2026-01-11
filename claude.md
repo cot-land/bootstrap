@@ -49,6 +49,28 @@ fn genMyOp(self: *CodeGen, value: *ssa.Value) !void {
 
 ---
 
+## DOCUMENTATION MAINTENANCE - KEEP UPDATED
+
+**After completing features or fixing tests, update these tracking documents:**
+
+### STATUS.md - Current Implementation Status
+- Update test counts when tests pass/fail
+- Mark features as "Done" when implemented
+- Add notes about partial implementations
+
+### ROADMAP.md - Self-Hosting Roadmap
+- Move completed items to STATUS.md
+- Update priority levels as blockers change
+- Track .cot file readiness
+
+**When to update:**
+- After implementing a new feature → update STATUS.md
+- After completing a roadmap item → move from ROADMAP.md to STATUS.md
+- After fixing test failures → update test counts in STATUS.md
+- After discovering new blockers → add to ROADMAP.md
+
+---
+
 ## TROUBLESHOOTING - READ THIS FIRST
 
 When debugging compiler issues, **DO NOT read through source code to trace execution**. Instead, use these debug flags to observe what's actually happening:
