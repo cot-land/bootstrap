@@ -55,5 +55,6 @@ test_comprehensive
 test_comp
 test_kw
 test_str
+test_str_var_cmp
 test_vl
 scanner_boot
