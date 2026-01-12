@@ -459,15 +459,31 @@ pub const CodeGen = struct {
         for (caller_saved) |reg| {
             if (self.reg_manager.isFree(reg)) continue;
 
+            // Get the value ID in this register
+            const vid = if (RegisterManager.indexOf(reg)) |idx|
+                self.reg_manager.registers[idx]
+            else
+                null;
+
+            // Skip spilling const_slice - they can be regenerated
+            if (vid) |value_id| {
+                if (value_id < self.func.values.items.len) {
+                    const val = &self.func.values.items[value_id];
+                    if (val.op == .const_slice or val.op == .const_int or val.op == .const_bool) {
+                        // Constants can be regenerated, just free the register
+                        self.reg_manager.markFree(reg);
+                        continue;
+                    }
+                }
+            }
+
             // Check if we should skip spilling this value
             if (self.liveness_info) |lv| {
-                if (RegisterManager.indexOf(reg)) |idx| {
-                    if (self.reg_manager.registers[idx]) |vid| {
-                        // If value is not used after this instruction, just free the register
-                        if (!lv.isUsedAfter(vid, self.current_inst)) {
-                            self.reg_manager.markFree(reg);
-                            continue;
-                        }
+                if (vid) |value_id| {
+                    // If value is not used after this instruction, just free the register
+                    if (!lv.isUsedAfter(value_id, self.current_inst)) {
+                        self.reg_manager.markFree(reg);
+                        continue;
                     }
                 }
             }
@@ -531,6 +547,11 @@ pub const CodeGen = struct {
         // const_slice: aux_int = string index in string_infos
         // Result is a slice (ptr, len) in rax/rdx (x86_64 two-value return convention)
         const string_idx: usize = @intCast(value.aux_int);
+
+        // Spill rax and rdx if they contain other values (to avoid clobbering)
+        try self.spillReg(.rax);
+        try self.spillReg(.rdx);
+
         if (string_idx >= self.string_infos.len) {
             // Invalid string index - emit null slice
             try x86.movRegImm64(self.buf, .rax, 0);
@@ -899,7 +920,7 @@ pub const CodeGen = struct {
 
         // Check source op type for special 16-byte handling
         // These ops leave ptr in rax, len/payload in rdx
-        if (src_value.op == .slice_make or src_value.op == .union_init) {
+        if (src_value.op == .slice_make or src_value.op == .union_init or src_value.op == .const_slice) {
             // Store 16-byte value: ptr/tag at offset, len/payload at offset+8
             try x86.movMemReg(self.buf, .rbp, total_offset, .rax);
             try x86.movMemReg(self.buf, .rbp, total_offset + 8, .rdx);
@@ -956,6 +977,14 @@ pub const CodeGen = struct {
     pub fn genComparison(self: *CodeGen, value: *ssa.Value) !void {
         const args = value.args();
 
+        // Check if we're comparing slices (need runtime call)
+        const left_val = &self.func.values.items[args[0]];
+        const left_type = self.type_reg.get(left_val.type_idx);
+        if (left_type == .slice) {
+            try self.genSliceComparison(value);
+            return;
+        }
+
         const left_mcv = self.getValue(args[0]);
         const right_mcv = self.getValue(args[1]);
 
@@ -984,6 +1013,86 @@ pub const CodeGen = struct {
 
         self.freeDeadOperands(value);
         try self.setResult(value.id, .{ .register = dest });
+    }
+
+    /// Generate slice/string comparison by calling cot_str_eq runtime function
+    fn genSliceComparison(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+
+        // Spill caller-saved registers
+        try self.spillCallerSaved();
+
+        // Load left slice (ptr, len) to rdi, rsi
+        const left_val = &self.func.values.items[args[0]];
+        try self.loadSliceToRegs(left_val, .rdi, .rsi);
+
+        // Load right slice (ptr, len) to rdx, rcx
+        const right_val = &self.func.values.items[args[1]];
+        try self.loadSliceToRegs(right_val, .rdx, .rcx);
+
+        // Call cot_str_eq(ptr1, len1, ptr2, len2) -> returns 1 if equal, 0 if not
+        const func_name = if (self.os == .macos) "_cot_str_eq" else "cot_str_eq";
+        try x86.callSymbol(self.buf, func_name);
+
+        // Result is in rax (1 = equal, 0 = not equal)
+        // For .ne, we need to invert: xor rax, 1
+        if (value.op == .ne) {
+            try x86.xorRegImm32(self.buf, .rax, 1);
+        }
+
+        self.reg_manager.markUsed(.rax, value.id);
+        try self.setResult(value.id, .{ .register = .rax });
+    }
+
+    /// Load a slice value's (ptr, len) into two registers
+    fn loadSliceToRegs(self: *CodeGen, val: *ssa.Value, ptr_reg: x86.Reg, len_reg: x86.Reg) !void {
+        // Check if it's a const_slice (string literal)
+        if (val.op == .const_slice) {
+            // Regenerate the const_slice to get ptr and len
+            const string_idx: usize = @intCast(val.aux_int);
+            if (string_idx < self.string_infos.len) {
+                const info = self.string_infos[string_idx];
+                try x86.leaRipSymbol(self.buf, ptr_reg, info.symbol_name);
+                try x86.movRegImm64(self.buf, len_reg, @intCast(info.len));
+            } else {
+                try x86.movRegImm64(self.buf, ptr_reg, 0);
+                try x86.movRegImm64(self.buf, len_reg, 0);
+            }
+            return;
+        }
+
+        // Check if it's a load from a local (slice stored on stack)
+        if (val.op == .load) {
+            const val_args = val.args();
+            if (val_args.len > 0 and val_args[0] < self.func.locals.len) {
+                const local_idx: u32 = @intCast(val_args[0]);
+                const local = self.func.locals[local_idx];
+                // Slice on stack: ptr at offset, len at offset+8
+                try x86.movRegMem(self.buf, ptr_reg, .rbp, local.offset);
+                try x86.movRegMem(self.buf, len_reg, .rbp, local.offset + 8);
+                return;
+            }
+        }
+
+        // Fallback: try to get from tracking (may only have ptr)
+        const mcv = self.getValue(val.id);
+        switch (mcv) {
+            .register => |reg| {
+                if (reg != ptr_reg) {
+                    try x86.movRegReg(self.buf, ptr_reg, reg);
+                }
+                // Assume len is 0 as fallback - this shouldn't happen for proper slices
+                try x86.movRegImm64(self.buf, len_reg, 0);
+            },
+            .stack => |offset| {
+                try x86.movRegMem(self.buf, ptr_reg, .rbp, offset);
+                try x86.movRegMem(self.buf, len_reg, .rbp, offset + 8);
+            },
+            else => {
+                try x86.movRegImm64(self.buf, ptr_reg, 0);
+                try x86.movRegImm64(self.buf, len_reg, 0);
+            },
+        }
     }
 
     /// Generate code for field access: load from struct local + field offset
@@ -1364,6 +1473,7 @@ pub const CodeGen = struct {
     }
 
     /// Generate code for map_get: args[0]=handle, args[1]=key
+    /// x86_64 calling convention: rdi=handle, rsi=key_ptr, rdx=key_len
     pub fn genMapGet(self: *CodeGen, value: *ssa.Value) !void {
         const args = value.args();
         if (args.len < 2) return;
@@ -1371,12 +1481,37 @@ pub const CodeGen = struct {
         // Spill caller-saved registers
         try self.spillCallerSaved();
 
+        // Load key FIRST to avoid clobbering
+        const key_val = &self.func.values.items[args[1]];
+        const key_type = self.type_reg.get(key_val.type_idx);
+        if (key_type == .slice) {
+            // String key: load directly based on op type
+            if (key_val.op == .const_slice) {
+                // Regenerate const_slice into rsi/rdx
+                const string_idx: usize = @intCast(key_val.aux_int);
+                if (string_idx < self.string_infos.len) {
+                    const info = self.string_infos[string_idx];
+                    try x86.leaRipSymbol(self.buf, .rsi, info.symbol_name);
+                    try x86.movRegImm64(self.buf, .rdx, @intCast(info.len));
+                }
+            } else {
+                // Load slice from stack: ptr to rsi, len to rdx
+                const key_val_args = key_val.args();
+                if (key_val_args.len > 0 and key_val_args[0] < self.func.locals.len) {
+                    const local_idx: u32 = @intCast(key_val_args[0]);
+                    const local = self.func.locals[local_idx];
+                    try x86.movRegMem(self.buf, .rsi, .rbp, local.offset);
+                    try x86.movRegMem(self.buf, .rdx, .rbp, local.offset + 8);
+                }
+            }
+        } else {
+            const key_mcv = self.getValue(args[1]);
+            try self.loadToReg(.rsi, key_mcv);
+        }
+
+        // Load handle LAST to avoid clobber
         const handle_mcv = self.getValue(args[0]);
         try self.loadToReg(.rdi, handle_mcv);
-
-        // Load key
-        const key_mcv = self.getValue(args[1]);
-        try self.loadToReg(.rsi, key_mcv);
 
         try self.emitRuntimeCall("cot_map_get");
 
@@ -1416,40 +1551,91 @@ pub const CodeGen = struct {
     }
 
     /// Generate code for map_set: args[0]=handle, args[1]=key, args[2]=value
+    /// x86_64 calling convention: rdi=handle, rsi=key_ptr, rdx=key_len, rcx=value
     pub fn genMapSet(self: *CodeGen, value: *ssa.Value) !void {
         const args = value.args();
         if (args.len < 3) return;
 
         try self.spillCallerSaved();
 
-        // Load handle into rdi
+        // Load key FIRST to avoid clobbering
+        const key_val = &self.func.values.items[args[1]];
+        const key_type = self.type_reg.get(key_val.type_idx);
+        if (key_type == .slice) {
+            // String key: load directly based on op type
+            if (key_val.op == .const_slice) {
+                // Regenerate const_slice into rsi/rdx
+                const string_idx: usize = @intCast(key_val.aux_int);
+                if (string_idx < self.string_infos.len) {
+                    const info = self.string_infos[string_idx];
+                    try x86.leaRipSymbol(self.buf, .rsi, info.symbol_name);
+                    try x86.movRegImm64(self.buf, .rdx, @intCast(info.len));
+                }
+            } else {
+                // Load slice from stack: ptr to rsi, len to rdx
+                const key_val_args = key_val.args();
+                if (key_val_args.len > 0 and key_val_args[0] < self.func.locals.len) {
+                    const local_idx: u32 = @intCast(key_val_args[0]);
+                    const local = self.func.locals[local_idx];
+                    try x86.movRegMem(self.buf, .rsi, .rbp, local.offset);
+                    try x86.movRegMem(self.buf, .rdx, .rbp, local.offset + 8);
+                }
+            }
+        } else {
+            const key_mcv = self.getValue(args[1]);
+            try self.loadToReg(.rsi, key_mcv);
+        }
+
+        // Load value into rcx (4th arg for string key case)
+        const val_mcv = self.getValue(args[2]);
+        try self.loadToReg(.rcx, val_mcv);
+
+        // Load handle LAST to avoid clobber
         const handle_mcv = self.getValue(args[0]);
         try self.loadToReg(.rdi, handle_mcv);
-
-        // Load key into rsi
-        const key_mcv = self.getValue(args[1]);
-        try self.loadToReg(.rsi, key_mcv);
-
-        // Load value into rdx
-        const val_mcv = self.getValue(args[2]);
-        try self.loadToReg(.rdx, val_mcv);
 
         try self.emitRuntimeCall("cot_map_set");
     }
 
     /// Generate code for map_has: args[0]=handle, args[1]=key
+    /// x86_64 calling convention: rdi=handle, rsi=key_ptr, rdx=key_len
     pub fn genMapHas(self: *CodeGen, value: *ssa.Value) !void {
         const args = value.args();
         if (args.len < 2) return;
 
         try self.spillCallerSaved();
 
+        // Load key FIRST to avoid clobbering handle
+        const key_val = &self.func.values.items[args[1]];
+        const key_type = self.type_reg.get(key_val.type_idx);
+        if (key_type == .slice) {
+            // String key: load directly based on op type
+            if (key_val.op == .const_slice) {
+                // Regenerate const_slice into rsi/rdx
+                const string_idx: usize = @intCast(key_val.aux_int);
+                if (string_idx < self.string_infos.len) {
+                    const info = self.string_infos[string_idx];
+                    try x86.leaRipSymbol(self.buf, .rsi, info.symbol_name);
+                    try x86.movRegImm64(self.buf, .rdx, @intCast(info.len));
+                }
+            } else {
+                // Load slice from stack: ptr to rsi, len to rdx
+                const key_val_args = key_val.args();
+                if (key_val_args.len > 0 and key_val_args[0] < self.func.locals.len) {
+                    const local_idx: u32 = @intCast(key_val_args[0]);
+                    const local = self.func.locals[local_idx];
+                    try x86.movRegMem(self.buf, .rsi, .rbp, local.offset);
+                    try x86.movRegMem(self.buf, .rdx, .rbp, local.offset + 8);
+                }
+            }
+        } else {
+            const key_mcv = self.getValue(args[1]);
+            try self.loadToReg(.rsi, key_mcv);
+        }
+
+        // Load handle LAST to avoid clobber
         const handle_mcv = self.getValue(args[0]);
         try self.loadToReg(.rdi, handle_mcv);
-
-        // Load key
-        const key_mcv = self.getValue(args[1]);
-        try self.loadToReg(.rsi, key_mcv);
 
         try self.emitRuntimeCall("cot_map_has");
         self.reg_manager.markUsed(.rax, value.id);
@@ -1601,10 +1787,20 @@ pub const CodeGen = struct {
         for (args) |arg_id| {
             if (reg_idx >= arg_regs.len) break;
 
-            // Regular argument
-            const arg_mcv = self.getValue(arg_id);
-            try self.loadToReg(arg_regs[reg_idx], arg_mcv);
-            reg_idx += 1;
+            const arg_val = &self.func.values.items[arg_id];
+            const arg_type = self.type_reg.get(arg_val.type_idx);
+
+            if (arg_type == .slice) {
+                // Slice argument: pass ptr in reg[i], len in reg[i+1]
+                if (reg_idx + 1 >= arg_regs.len) break;
+                try self.loadSliceToRegs(arg_val, arg_regs[reg_idx], arg_regs[reg_idx + 1]);
+                reg_idx += 2;
+            } else {
+                // Scalar argument
+                const arg_mcv = self.getValue(arg_id);
+                try self.loadToReg(arg_regs[reg_idx], arg_mcv);
+                reg_idx += 1;
+            }
         }
 
         // Call the function
@@ -1724,6 +1920,9 @@ pub const CodeGen = struct {
         }
 
         // Spill parameters to local slots
+        // Simplified calling convention:
+        // - Scalars (int, bool, enum, ptr): 1 register
+        // - Slices (strings): 2 registers (ptr + len)
         const param_regs = [_]x86.Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
         const num_params = self.func.param_count;
 
@@ -1733,9 +1932,24 @@ pub const CodeGen = struct {
 
             const local = self.func.locals[param_idx];
             const local_offset = local.offset;
+            const param_type = self.type_reg.get(local.type_idx);
 
-            try x86.movMemReg(self.buf, .rbp, local_offset, param_regs[reg_idx]);
-            reg_idx += 1;
+            if (param_type == .slice) {
+                // Slice parameter: 2 registers (ptr + len)
+                if (reg_idx + 1 < param_regs.len) {
+                    // Store ptr at offset, len at offset+8
+                    try x86.movMemReg(self.buf, .rbp, local_offset, param_regs[reg_idx]);
+                    try x86.movMemReg(self.buf, .rbp, local_offset + 8, param_regs[reg_idx + 1]);
+                    reg_idx += 2;
+                } else {
+                    // Not enough registers, just store ptr
+                    try x86.movMemReg(self.buf, .rbp, local_offset, param_regs[reg_idx]);
+                    reg_idx += 1;
+                }
+            } else {
+                try x86.movMemReg(self.buf, .rbp, local_offset, param_regs[reg_idx]);
+                reg_idx += 1;
+            }
         }
     }
 };
