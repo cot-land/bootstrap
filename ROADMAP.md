@@ -54,7 +54,7 @@ Every Zig source file needs a corresponding bootstrap .cot file that uses only s
 | `src/types.zig` | `src/bootstrap/types_boot.cot` | **Done** | Type registry with 14-variant union |
 | `src/parser.zig` | `src/bootstrap/parser_boot.cot` | TODO | Parser |
 | `src/check.zig` | `src/bootstrap/check_boot.cot` | TODO | Type checker |
-| `src/errors.zig` | `src/bootstrap/errors_boot.cot` | TODO | Error handling |
+| `src/errors.zig` | `src/bootstrap/errors_boot.cot` | **Done** | Error handling |
 | `src/ir.zig` | `src/bootstrap/ir_boot.cot` | TODO | IR definitions |
 | `src/lower.zig` | `src/bootstrap/lower_boot.cot` | TODO | AST → IR lowering |
 | `src/ssa.zig` | `src/bootstrap/ssa_boot.cot` | TODO | SSA conversion |
@@ -71,7 +71,7 @@ Every Zig source file needs a corresponding bootstrap .cot file that uses only s
 | `src/debug.zig` | `src/bootstrap/debug_boot.cot` | TODO | Debug output utilities |
 | `src/type_context.zig` | `src/bootstrap/type_context_boot.cot` | TODO | Type context for checker |
 
-**Progress: 5/22 files complete**
+**Progress: 6/22 files complete**
 
 ---
 
@@ -157,7 +157,7 @@ These features exist in wireframe .cot files but are NOT in Zig compiler yet:
 3. ✅ `scanner_boot.cot` - Lexer (DONE)
 4. ✅ `ast_boot.cot` - AST nodes (DONE)
 5. ✅ `types_boot.cot` - Type registry (DONE)
-6. `errors_boot.cot` - Error types (simplified, no callbacks)
+6. ✅ `errors_boot.cot` - Error types (DONE)
 7. `parser_boot.cot` - Parser
 8. `check_boot.cot` - Type checker
 9. `ir_boot.cot` - IR definitions
