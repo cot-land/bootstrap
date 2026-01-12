@@ -58,3 +58,11 @@ test_str
 test_str_var_cmp
 test_vl
 scanner_boot
+test_if
+test_ns
+test_return
+test_struct
+test_types
+test_union_switch
+test_us
+types_boot

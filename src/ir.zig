@@ -276,6 +276,29 @@ pub const Node = struct {
         return n;
     }
 
+    // === Branch accessors ===
+    // These methods provide a single source of truth for the branch format.
+    // Format: args[0]=condition, args[1]=then_block, args[2]=else_block
+    // Used by driver.zig during IR->SSA conversion.
+
+    /// Get branch condition (args[0]). Returns null if not a valid branch.
+    pub fn getBranchCondition(self: *const Node) ?NodeIndex {
+        if (self.op != .branch or self.args_len < 1) return null;
+        return self.args_storage[0];
+    }
+
+    /// Get branch then_block (args[1]). Returns null if not a valid branch.
+    pub fn getBranchThenBlock(self: *const Node) ?BlockIndex {
+        if (self.op != .branch or self.args_len < 2) return null;
+        return self.args_storage[1];
+    }
+
+    /// Get branch else_block (args[2]). Returns null if not a valid branch.
+    pub fn getBranchElseBlock(self: *const Node) ?BlockIndex {
+        if (self.op != .branch or self.args_len < 3) return null;
+        return self.args_storage[2];
+    }
+
     pub fn withBlock(self: Node, block: BlockIndex) Node {
         var n = self;
         n.block = block;
@@ -744,11 +767,11 @@ pub const FuncBuilder = struct {
     }
 
     /// Emit conditional branch.
+    /// Format: args[0]=condition, args[1]=then_block, args[2]=else_block
+    /// This matches what driver.zig expects during IR->SSA conversion.
     pub fn emitBranch(self: *FuncBuilder, cond: NodeIndex, true_block: BlockIndex, false_block: BlockIndex, span: Span) !NodeIndex {
-        const args = try self.allocator.dupe(NodeIndex, &.{cond});
-        // Store both target blocks: aux = true_block, aux2 encoded in high bits
-        const aux: i64 = @intCast(true_block);
-        return self.emit(Node.init(.branch, TypeRegistry.VOID, span).withArgs(args).withAux(aux).withAuxStr(std.mem.asBytes(&false_block)));
+        const args = try self.allocator.dupe(NodeIndex, &.{ cond, true_block, false_block });
+        return self.emit(Node.init(.branch, TypeRegistry.VOID, span).withArgs(args));
     }
 
     /// Emit field access.

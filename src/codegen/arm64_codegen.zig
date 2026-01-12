@@ -27,6 +27,53 @@ const liveness = @import("../liveness.zig");
 // MCValue - Machine Code Value (where a value lives)
 // ============================================================================
 
+// ============================================================================
+// ABI Type Classification (ARM64 AAPCS64)
+// ============================================================================
+
+/// How a type is passed/returned according to ARM64 ABI.
+/// This is the single source of truth for calling convention decisions.
+pub const ABIClass = enum {
+    /// Types ≤ 8 bytes: passed in 1 register (x0-x7)
+    single_reg,
+    /// Types 9-16 bytes: passed in 2 consecutive registers
+    double_reg,
+    /// Types > 16 bytes: passed by pointer (callee allocates for returns)
+    by_pointer,
+    /// Slices: always 2 registers (ptr + len), regardless of size
+    slice,
+};
+
+/// Classify a type for ARM64 ABI purposes.
+/// This function encapsulates all the calling convention decisions.
+pub fn classifyType(type_reg: *const types.TypeRegistry, type_idx: types.TypeIndex) ABIClass {
+    const t = type_reg.get(type_idx);
+    const size = type_reg.sizeOf(type_idx);
+
+    // Slices are special - always passed as ptr+len in 2 registers
+    if (t == .slice) {
+        return .slice;
+    }
+
+    // Size-based classification (ARM64 AAPCS64)
+    if (size > 16) {
+        return .by_pointer;
+    } else if (size > 8) {
+        return .double_reg;
+    } else {
+        return .single_reg;
+    }
+}
+
+/// Returns number of registers needed to pass a type.
+pub fn regsNeeded(class: ABIClass) usize {
+    return switch (class) {
+        .single_reg => 1,
+        .double_reg, .slice => 2,
+        .by_pointer => 1, // pointer uses 1 reg
+    };
+}
+
 pub const MCValue = union(enum) {
     none,
     dead,
@@ -247,6 +294,16 @@ pub const CodeGen = struct {
         self.current_inst += 1;
     }
 
+    /// Get the actual spill space used during code generation.
+    /// This is the difference between current spill offset and initial (16 for fp/lr).
+    pub fn getSpillSize(self: *const CodeGen) u32 {
+        const initial_spill_offset: u32 = 16;
+        return if (self.next_spill_offset > initial_spill_offset)
+            self.next_spill_offset - initial_spill_offset
+        else
+            0;
+    }
+
     // ========================================================================
     // Core allocation functions
     // ========================================================================
@@ -465,33 +522,23 @@ pub const CodeGen = struct {
 
     pub fn genConstSlice(self: *CodeGen, value: *ssa.Value) !void {
         // const_slice: aux_int = string index in string_infos
-        // Result is a slice (ptr, len) in x0/x1
+        // Track as lea_symbol so multiple const_slices can coexist
+        // The actual load happens when the value is used
         const string_idx: usize = @intCast(value.aux_int);
 
-        // Spill x0 and x1 if they contain other values (to avoid clobbering)
-        try self.spillReg(.x0);
-        try self.spillReg(.x1);
-
         if (string_idx >= self.string_infos.len) {
-            // Invalid string index - emit null slice
-            try aarch64.movRegImm64(self.buf, .x0, 0);
-            try aarch64.movRegImm64(self.buf, .x1, 0);
-            self.reg_manager.markUsed(.x0, value.id);
-            try self.setResult(value.id, .{ .register = .x0 });
+            // Invalid string index - use immediate 0
+            try self.setResult(value.id, .{ .immediate = 0 });
             return;
         }
 
         const info = self.string_infos[string_idx];
 
-        // Load string address into x0 using ADRP + ADD with relocations
-        try aarch64.loadSymbolAddr(self.buf, .x0, info.symbol_name);
-
-        // Load length into x1
-        try aarch64.movRegImm64(self.buf, .x1, @intCast(info.len));
-
-        // Result is a fat pointer: x0 = ptr, x1 = len
-        self.reg_manager.markUsed(.x0, value.id);
-        try self.setResult(value.id, .{ .register = .x0 });
+        // Track as lea_symbol so select and other ops can properly load both ptr and len
+        try self.setResult(value.id, .{ .lea_symbol = .{
+            .name = info.symbol_name,
+            .len = info.len,
+        } });
     }
 
     pub fn genAdd(self: *CodeGen, value: *ssa.Value) !void {
@@ -673,6 +720,13 @@ pub const CodeGen = struct {
         // Convert rbp-relative offset to sp-relative
         const sp_offset = convertOffset(local.offset, self.stack_size);
 
+        // For large values (>8 bytes), don't load into a register - just record stack location
+        // The consumer (e.g., genListPush) will access the value from the stack
+        if (size > 8) {
+            try self.setResult(value.id, .{ .stack = sp_offset });
+            return;
+        }
+
         const dest = try self.allocReg(value.id);
 
         switch (size) {
@@ -701,13 +755,70 @@ pub const CodeGen = struct {
         const src_value = &self.func.values.items[src_id];
 
         // Check source op type for special 16-byte handling
-        // These ops leave ptr in x0, len/payload in x1
-        if (src_value.op == .slice_make or src_value.op == .union_init or src_value.op == .const_slice or src_value.op == .str_concat) {
+        // These ops leave ptr in x0, len/payload in x1 (for small unions)
+        // For large unions, union_init puts result on stack
+        if (src_value.op == .slice_make or src_value.op == .str_concat) {
             // Store 16-byte value: ptr/tag at offset, len/payload at offset+8
             try aarch64.strRegImm(self.buf, .x0, .sp, sp_offset);
             const sp_offset_plus8 = convertOffset(total_offset + 8, self.stack_size);
             try aarch64.strRegImm(self.buf, .x1, .sp, sp_offset_plus8);
             return;
+        }
+
+        // Handle const_slice - now tracked as lea_symbol, need to load then store
+        if (src_value.op == .const_slice) {
+            const src_mcv = self.getValue(src_id);
+            switch (src_mcv) {
+                .lea_symbol => |sym| {
+                    // Load symbol address to x0
+                    try aarch64.loadSymbolAddr(self.buf, .x0, sym.name);
+                    // Load length to x1
+                    try aarch64.movRegImm64(self.buf, .x1, @intCast(sym.len));
+                    // Store both
+                    try aarch64.strRegImm(self.buf, .x0, .sp, sp_offset);
+                    const sp_offset_plus8 = convertOffset(total_offset + 8, self.stack_size);
+                    try aarch64.strRegImm(self.buf, .x1, .sp, sp_offset_plus8);
+                },
+                .stack => |offset| {
+                    // Slice on stack (from call or select) - copy both parts
+                    try aarch64.ldrRegImm(self.buf, .x0, .sp, offset);
+                    try aarch64.ldrRegImm(self.buf, .x1, .sp, offset + 8);
+                    try aarch64.strRegImm(self.buf, .x0, .sp, sp_offset);
+                    const sp_offset_plus8 = convertOffset(total_offset + 8, self.stack_size);
+                    try aarch64.strRegImm(self.buf, .x1, .sp, sp_offset_plus8);
+                },
+                else => {
+                    // Fallback - shouldn't happen but handle it
+                    try self.loadToReg(.x0, src_mcv);
+                    try aarch64.strRegImm(self.buf, .x0, .sp, sp_offset);
+                },
+            }
+            return;
+        }
+
+        // Handle union_init - check if it's on stack (large union) or registers (small union)
+        if (src_value.op == .union_init) {
+            const src_mcv = self.getValue(src_id);
+            const union_size = self.type_reg.sizeOf(src_value.type_idx);
+
+            if (src_mcv == .stack) {
+                // Large union on stack - copy to destination
+                var copied: u32 = 0;
+                while (copied < union_size) {
+                    const src_off = src_mcv.stack + @as(u12, @intCast(copied));
+                    const dst_off = convertOffset(total_offset + @as(i32, @intCast(copied)), self.stack_size);
+                    try aarch64.ldrRegImm(self.buf, scratch0, .sp, src_off);
+                    try aarch64.strRegImm(self.buf, scratch0, .sp, dst_off);
+                    copied += 8;
+                }
+                return;
+            } else {
+                // Small union in registers (x0=tag, x1=payload)
+                try aarch64.strRegImm(self.buf, .x0, .sp, sp_offset);
+                const sp_offset_plus8 = convertOffset(total_offset + 8, self.stack_size);
+                try aarch64.strRegImm(self.buf, .x1, .sp, sp_offset_plus8);
+                return;
+            }
         }
 
         // Handle call results
@@ -734,46 +845,76 @@ pub const CodeGen = struct {
             }
         }
 
-        // Standard value store
-        const size = self.type_reg.sizeOf(src_value.type_idx);
-
-        // For ops that leave result in x0 (call, field, slice_index, etc.)
-        const uses_x0 = switch (src_value.op) {
-            .add, .sub, .mul, .div, .call, .field, .index, .slice_index,
-            .union_payload, .map_new, .map_get, .map_has, .map_size,
-            .list_new, .list_get, .list_len => true,
-            else => false,
-        };
-
-        if (uses_x0) {
-            switch (size) {
-                1 => try aarch64.strbRegImm(self.buf, .x0, .sp, sp_offset),
-                else => try aarch64.strRegImm(self.buf, .x0, .sp, sp_offset),
+        // Handle list_get results with large elements (already copied to stack)
+        if (src_value.op == .list_get) {
+            const elem_size = self.type_reg.sizeOf(src_value.type_idx);
+            if (elem_size > 8) {
+                // list_get copied the element to a stack slot
+                const src_mcv = self.getValue(src_id);
+                if (src_mcv == .stack) {
+                    const src_stack_offset = src_mcv.stack;
+                    var copied: u32 = 0;
+                    while (copied < elem_size) {
+                        // Load from spill location
+                        try aarch64.ldrRegImm(self.buf, scratch0, .sp, src_stack_offset + @as(u12, @intCast(copied)));
+                        // Store to destination local
+                        const dst_offset = convertOffset(total_offset + @as(i32, @intCast(copied)), self.stack_size);
+                        try aarch64.strRegImm(self.buf, scratch0, .sp, dst_offset);
+                        copied += 8;
+                    }
+                    return;
+                }
             }
-            return;
         }
 
+        // Standard value store - use MCValue-based approach (Go/Zig pattern)
+        // Key principle: check ACTUAL value location, not operation type
+        const size = self.type_reg.sizeOf(src_value.type_idx);
         const src_mcv = self.getValue(src_id);
 
         switch (src_mcv) {
             .register => |reg| {
+                // Value is in a register - store it
                 switch (size) {
                     1 => try aarch64.strbRegImm(self.buf, reg, .sp, sp_offset),
                     else => try aarch64.strRegImm(self.buf, reg, .sp, sp_offset),
                 }
             },
             .immediate => |imm| {
+                // Value is an immediate - load to scratch then store
                 try aarch64.movRegImm64(self.buf, scratch0, imm);
                 switch (size) {
                     1 => try aarch64.strbRegImm(self.buf, scratch0, .sp, sp_offset),
                     else => try aarch64.strRegImm(self.buf, scratch0, .sp, sp_offset),
                 }
             },
-            .stack => |offset| {
-                try aarch64.ldrRegImm(self.buf, scratch0, .sp, offset);
+            .stack => |src_stack_offset| {
+                // Value is on stack - copy it (size-aware, like Go's decomposition)
+                if (size > 8) {
+                    // Large value: copy all bytes (8 bytes at a time)
+                    var copied: u32 = 0;
+                    while (copied < size) {
+                        const src_off = src_stack_offset + @as(u12, @intCast(copied));
+                        const dst_off = convertOffset(total_offset + @as(i32, @intCast(copied)), self.stack_size);
+                        try aarch64.ldrRegImm(self.buf, scratch0, .sp, src_off);
+                        try aarch64.strRegImm(self.buf, scratch0, .sp, dst_off);
+                        copied += 8;
+                    }
+                } else {
+                    // Small value: single load/store
+                    try aarch64.ldrRegImm(self.buf, scratch0, .sp, src_stack_offset);
+                    switch (size) {
+                        1 => try aarch64.strbRegImm(self.buf, scratch0, .sp, sp_offset),
+                        else => try aarch64.strRegImm(self.buf, scratch0, .sp, sp_offset),
+                    }
+                }
+            },
+            .none => {
+                // No tracked value - operation may have left result in x0
+                // This is the fallback for ops that don't set MCValue
                 switch (size) {
-                    1 => try aarch64.strbRegImm(self.buf, scratch0, .sp, sp_offset),
-                    else => try aarch64.strRegImm(self.buf, scratch0, .sp, sp_offset),
+                    1 => try aarch64.strbRegImm(self.buf, .x0, .sp, sp_offset),
+                    else => try aarch64.strRegImm(self.buf, .x0, .sp, sp_offset),
                 }
             },
             else => {},
@@ -920,49 +1061,108 @@ pub const CodeGen = struct {
         const arg_regs = [_]aarch64.Reg{ .x0, .x1, .x2, .x3, .x4, .x5, .x6, .x7 };
         const args = value.args();
 
-        // Check if callee returns a struct (need to pass result address in x8)
-        const ret_type = self.type_reg.get(value.type_idx);
-        const returns_struct = (ret_type == .struct_type);
+        // Classify return type using ABI rules
+        const ret_class = classifyType(self.type_reg, value.type_idx);
 
-        // If struct return, allocate temp space and set x8
-        // We use a fixed offset at end of current spill area
-        var struct_result_offset: u12 = 0;
-        if (returns_struct) {
+        // If large return (by_pointer), allocate temp space and set x8
+        var large_result_offset: u12 = 0;
+        if (ret_class == .by_pointer) {
             const ret_size = self.type_reg.sizeOf(value.type_idx);
-            struct_result_offset = self.next_spill_offset;
-            // Compute address of result slot: sp + offset
-            try aarch64.addRegImm12(self.buf, .x8, .sp, struct_result_offset);
+            large_result_offset = self.next_spill_offset;
+            try aarch64.addRegImm12(self.buf, .x8, .sp, large_result_offset);
             self.next_spill_offset += @intCast(alignTo(ret_size, 8));
         }
 
+        // First pass: calculate how many registers each argument needs and compute total
+        // We need to know the target register index for each argument
+        var arg_positions: [8]struct { start_reg: usize, count: usize } = undefined;
+        var total_regs: usize = 0;
+        for (args, 0..) |arg_id, i| {
+            if (i >= 8) break;
+            const arg_val = &self.func.values.items[arg_id];
+            const arg_class = classifyType(self.type_reg, arg_val.type_idx);
+            const needed = regsNeeded(arg_class);
+            if (total_regs + needed > arg_regs.len) {
+                arg_positions[i] = .{ .start_reg = 0, .count = 0 }; // Skip this arg
+            } else {
+                arg_positions[i] = .{ .start_reg = total_regs, .count = needed };
+                total_regs += needed;
+            }
+        }
+
+        // Second pass: check if any later argument is in x0 but should go to a later register.
+        // If so, we need to save x0 before loading earlier arguments into it.
+        // This handles the case where genField put a value in x0 but it's used as arg1, arg2, etc.
+        var saved_x0: bool = false;
+        const saved_x0_offset = self.next_spill_offset;
+        for (args, 0..) |arg_id, i| {
+            if (i >= 8 or arg_positions[i].count == 0) continue;
+            if (arg_positions[i].start_reg == 0) continue; // arg0 goes to x0, no conflict
+
+            const arg_mcv = self.getValue(arg_id);
+            if (arg_mcv == .register and arg_mcv.register == .x0) {
+                // This argument is in x0 but should go to a later register
+                // Save x0 to stack before we clobber it with arg0
+                if (!saved_x0) {
+                    try aarch64.strRegImm(self.buf, .x0, .sp, saved_x0_offset);
+                    self.next_spill_offset += 8;
+                    saved_x0 = true;
+                }
+                // Update the tracking so getValue will return stack location
+                try self.setResult(arg_id, .{ .stack = saved_x0_offset });
+            }
+        }
+
+        // Third pass: load arguments in forward order (now safe since x0 conflicts are resolved)
         var reg_idx: usize = 0;
         for (args) |arg_id| {
-            if (reg_idx >= arg_regs.len) break;
-
             const arg_val = &self.func.values.items[arg_id];
-            const arg_type = self.type_reg.get(arg_val.type_idx);
+            const arg_class = classifyType(self.type_reg, arg_val.type_idx);
+            const needed = regsNeeded(arg_class);
 
-            if (arg_type == .struct_type) {
-                // Struct argument: pass pointer to local
-                const arg_val_args = arg_val.args();
-                if (arg_val_args.len > 0 and arg_val_args[0] < self.func.locals.len) {
-                    const local_idx: u32 = @intCast(arg_val_args[0]);
-                    const local = self.func.locals[local_idx];
-                    const sp_offset = convertOffset(local.offset, self.stack_size);
-                    // Compute address: sp + offset
-                    try aarch64.addRegImm12(self.buf, arg_regs[reg_idx], .sp, sp_offset);
-                }
-                reg_idx += 1;
-            } else if (arg_type == .slice) {
-                // Slice argument: pass ptr in reg[i], len in reg[i+1]
-                if (reg_idx + 1 >= arg_regs.len) break;
-                try self.loadSliceToRegs(arg_val, arg_regs[reg_idx], arg_regs[reg_idx + 1]);
-                reg_idx += 2;
-            } else {
-                // Scalar argument
-                const arg_mcv = self.getValue(arg_id);
-                try self.loadToReg(arg_regs[reg_idx], arg_mcv);
-                reg_idx += 1;
+            if (reg_idx + needed > arg_regs.len) break;
+
+            switch (arg_class) {
+                .by_pointer => {
+                    // Large type: pass pointer to storage location
+                    const arg_mcv = self.getValue(arg_id);
+                    if (arg_mcv == .stack) {
+                        // Value is on spill stack - pass pointer to that location
+                        try aarch64.addRegImm12(self.buf, arg_regs[reg_idx], .sp, arg_mcv.stack);
+                    } else {
+                        // Fallback: try to pass pointer to local
+                        const arg_val_args = arg_val.args();
+                        if (arg_val_args.len > 0 and arg_val_args[0] < self.func.locals.len) {
+                            const local_idx: u32 = @intCast(arg_val_args[0]);
+                            const local = self.func.locals[local_idx];
+                            const sp_offset = convertOffset(local.offset, self.stack_size);
+                            try aarch64.addRegImm12(self.buf, arg_regs[reg_idx], .sp, sp_offset);
+                        }
+                    }
+                    reg_idx += 1;
+                },
+                .double_reg => {
+                    // Medium type: pass in 2 registers
+                    const arg_mcv = self.getValue(arg_id);
+                    if (arg_mcv == .stack) {
+                        try aarch64.ldrRegImm(self.buf, arg_regs[reg_idx], .sp, arg_mcv.stack);
+                        try aarch64.ldrRegImm(self.buf, arg_regs[reg_idx + 1], .sp, arg_mcv.stack + 8);
+                    } else {
+                        try self.loadToReg(arg_regs[reg_idx], arg_mcv);
+                    }
+                    reg_idx += 2;
+                },
+                .slice => {
+                    // Slice: always 2 registers (ptr + len)
+                    try self.loadSliceToRegs(arg_val, arg_regs[reg_idx], arg_regs[reg_idx + 1]);
+                    reg_idx += 2;
+                },
+                .single_reg => {
+                    // Small type: single register
+                    const arg_mcv = self.getValue(arg_id);
+                    try self.loadToReg(arg_regs[reg_idx], arg_mcv);
+                    reg_idx += 1;
+                },
             }
         }
 
@@ -973,15 +1173,32 @@ pub const CodeGen = struct {
             value.aux_str;
         try aarch64.callSymbol(self.buf, sym_name);
 
-        // Handle result
-        if (returns_struct) {
-            // Struct result is at struct_result_offset on stack
-            // Track as stack location for later use
-            try self.setResult(value.id, .{ .stack = struct_result_offset });
-        } else {
-            // Scalar/string result is in x0 (and x1 for string)
-            self.reg_manager.markUsed(.x0, value.id);
-            try self.setResult(value.id, .{ .register = .x0 });
+        // Handle result based on ABI class
+        switch (ret_class) {
+            .by_pointer => {
+                try self.setResult(value.id, .{ .stack = large_result_offset });
+            },
+            .double_reg => {
+                // Medium struct returned in x0+x1 - spill to stack
+                const ret_size = self.type_reg.sizeOf(value.type_idx);
+                const result_offset = self.next_spill_offset;
+                try aarch64.strRegImm(self.buf, .x0, .sp, result_offset);
+                try aarch64.strRegImm(self.buf, .x1, .sp, result_offset + 8);
+                self.next_spill_offset += @intCast(alignTo(ret_size, 8));
+                try self.setResult(value.id, .{ .stack = result_offset });
+            },
+            .single_reg => {
+                self.reg_manager.markUsed(.x0, value.id);
+                try self.setResult(value.id, .{ .register = .x0 });
+            },
+            .slice => {
+                // Slice returned in x0+x1 - spill to stack so both parts are tracked
+                const result_offset = self.next_spill_offset;
+                try aarch64.strRegImm(self.buf, .x0, .sp, result_offset);
+                try aarch64.strRegImm(self.buf, .x1, .sp, result_offset + 8);
+                self.next_spill_offset += 16;
+                try self.setResult(value.id, .{ .stack = result_offset });
+            },
         }
     }
 
@@ -1073,24 +1290,91 @@ pub const CodeGen = struct {
         const args = value.args();
         if (args.len < 3) return;
 
-        // Allocate dest FIRST, then get MCValues (allocReg may spill operand regs)
-        const dest = try self.allocReg(value.id);
-        const cond_mcv = self.getValue(args[0]);
-        const true_mcv = self.getValue(args[1]);
-        const false_mcv = self.getValue(args[2]);
+        const ret_type = self.type_reg.get(value.type_idx);
+        const is_slice = (ret_type == .slice);
 
-        // Load condition and check if non-zero
-        try self.loadToReg(scratch0, cond_mcv);
-        try self.loadToReg(dest, true_mcv);
-        try self.loadToReg(scratch1, false_mcv);
+        if (is_slice) {
+            // Slice select: need to handle both ptr and len
+            // Use x9 for condition to avoid clobbering x16/x17 which we use for true values
+            const cond_mcv = self.getValue(args[0]);
+            const true_mcv = self.getValue(args[1]);
+            const false_mcv = self.getValue(args[2]);
 
-        // CMP scratch0, #0
-        try aarch64.cmpRegImm12(self.buf, scratch0, 0);
-        // CSEL dest, dest, scratch1, NE (if cond != 0, keep true_val, else use false_val)
-        try aarch64.csel(self.buf, dest, dest, scratch1, .ne);
+            // Load condition to x9 (not scratch0=x16, which we need for true ptr)
+            try self.loadToReg(.x9, cond_mcv);
 
-        self.freeDeadOperands(value);
-        try self.setResult(value.id, .{ .register = dest });
+            // Allocate stack space for result
+            const result_offset = self.next_spill_offset;
+            self.next_spill_offset += 16;
+
+            // Load true ptr (x16) and len (x17)
+            switch (true_mcv) {
+                .stack => |offset| {
+                    // Offset is already sp-relative (from spill slots)
+                    try aarch64.ldrRegImm(self.buf, .x16, .sp, offset);
+                    try aarch64.ldrRegImm(self.buf, .x17, .sp, offset + 8);
+                },
+                .lea_symbol => |sym| {
+                    try aarch64.loadSymbolAddr(self.buf, .x16, sym.name);
+                    try aarch64.movRegImm64(self.buf, .x17, @intCast(sym.len));
+                },
+                else => {
+                    try self.loadToReg(.x16, true_mcv);
+                    try aarch64.movRegImm64(self.buf, .x17, 0);
+                },
+            }
+
+            // Load false ptr (x10) and len (x11)
+            switch (false_mcv) {
+                .stack => |offset| {
+                    // Offset is already sp-relative (from spill slots)
+                    try aarch64.ldrRegImm(self.buf, .x10, .sp, offset);
+                    try aarch64.ldrRegImm(self.buf, .x11, .sp, offset + 8);
+                },
+                .lea_symbol => |sym| {
+                    try aarch64.loadSymbolAddr(self.buf, .x10, sym.name);
+                    try aarch64.movRegImm64(self.buf, .x11, @intCast(sym.len));
+                },
+                else => {
+                    try self.loadToReg(.x10, false_mcv);
+                    try aarch64.movRegImm64(self.buf, .x11, 0);
+                },
+            }
+
+            // CMP x9, #0
+            try aarch64.cmpRegImm12(self.buf, .x9, 0);
+            // CSEL for ptr: x16 = (cond != 0) ? x16 : x10
+            try aarch64.csel(self.buf, .x16, .x16, .x10, .ne);
+            // CSEL for len: x17 = (cond != 0) ? x17 : x11
+            try aarch64.csel(self.buf, .x17, .x17, .x11, .ne);
+
+            // Store result to stack
+            try aarch64.strRegImm(self.buf, .x16, .sp, result_offset);
+            try aarch64.strRegImm(self.buf, .x17, .sp, result_offset + 8);
+
+            self.freeDeadOperands(value);
+            try self.setResult(value.id, .{ .stack = result_offset });
+        } else {
+            // Regular single-value select
+            // Allocate dest FIRST, then get MCValues (allocReg may spill operand regs)
+            const dest = try self.allocReg(value.id);
+            const cond_mcv = self.getValue(args[0]);
+            const true_mcv = self.getValue(args[1]);
+            const false_mcv = self.getValue(args[2]);
+
+            // Load condition and check if non-zero
+            try self.loadToReg(scratch0, cond_mcv);
+            try self.loadToReg(dest, true_mcv);
+            try self.loadToReg(scratch1, false_mcv);
+
+            // CMP scratch0, #0
+            try aarch64.cmpRegImm12(self.buf, scratch0, 0);
+            // CSEL dest, dest, scratch1, NE (if cond != 0, keep true_val, else use false_val)
+            try aarch64.csel(self.buf, dest, dest, scratch1, .ne);
+
+            self.freeDeadOperands(value);
+            try self.setResult(value.id, .{ .register = dest });
+        }
     }
 
     pub fn genIndex(self: *CodeGen, value: *ssa.Value) !void {
@@ -1242,39 +1526,59 @@ pub const CodeGen = struct {
 
     /// Generate code for union_tag: extract tag from union
     /// CRITICAL: args[0] can be a local index OR an SSA value reference
+    /// IMPORTANT: Always spill to stack immediately after loading, because union_payload
+    /// in other branches may call spillReg(x0) which corrupts the tracking for values
+    /// that are used across multiple control flow paths.
     pub fn genUnionTag(self: *CodeGen, value: *ssa.Value) !void {
         const args = value.args();
         if (args.len == 0) return;
 
         const maybe_local_or_ssa = args[0];
 
-        // If args[0] is a load op, get the local index from it
+        // Determine source offset for the union tag
+        var src_offset: ?u12 = null;
+
+        // If args[0] is an SSA value, check its MCValue location
         if (maybe_local_or_ssa < self.func.values.items.len) {
             const union_val = &self.func.values.items[maybe_local_or_ssa];
-            if (union_val.op == .load) {
+
+            // First check if we have a tracked MCValue for this union
+            const mcv = self.getValue(maybe_local_or_ssa);
+            if (mcv == .stack) {
+                // Union is on stack at this offset - tag is at offset 0
+                src_offset = mcv.stack;
+            } else if (union_val.op == .load) {
                 // The load's local index is in args[0], not aux_int
                 const load_args = union_val.args();
-                if (load_args.len == 0) return;
-                const local_idx: usize = @intCast(load_args[0]);
-                if (local_idx < self.func.locals.len) {
-                    const local = self.func.locals[local_idx];
-                    const sp_offset = convertOffset(local.offset, self.stack_size);
-                    // Load tag into x0 (use fixed register for simpler tracking)
-                    try aarch64.ldrRegImm(self.buf, .x0, .sp, sp_offset);
-                    self.reg_manager.markUsed(.x0, value.id);
-                    try self.setResult(value.id, .{ .register = .x0 });
-                    return;
+                if (load_args.len > 0) {
+                    const local_idx: usize = @intCast(load_args[0]);
+                    if (local_idx < self.func.locals.len) {
+                        const local = self.func.locals[local_idx];
+                        src_offset = convertOffset(local.offset, self.stack_size);
+                    }
                 }
             }
         }
 
         // Fallback: treat as direct local index (legacy behavior)
-        if (maybe_local_or_ssa < self.func.locals.len) {
+        if (src_offset == null and maybe_local_or_ssa < self.func.locals.len) {
             const local = self.func.locals[@intCast(maybe_local_or_ssa)];
-            const sp_offset = convertOffset(local.offset, self.stack_size);
-            try aarch64.ldrRegImm(self.buf, .x0, .sp, sp_offset);
-            self.reg_manager.markUsed(.x0, value.id);
-            try self.setResult(value.id, .{ .register = .x0 });
+            src_offset = convertOffset(local.offset, self.stack_size);
+        }
+
+        if (src_offset) |offset| {
+            // Load tag into x0
+            try aarch64.ldrRegImm(self.buf, .x0, .sp, offset);
+
+            // CRITICAL: Immediately spill to stack to ensure consistent location
+            // across all control flow paths. This prevents corruption when
+            // genUnionPayload in another branch calls spillReg(x0).
+            const spill_offset = self.next_spill_offset;
+            self.next_spill_offset += 8;
+            try aarch64.strRegImm(self.buf, .x0, .sp, spill_offset);
+
+            // Record result as stack location (not register)
+            try self.setResult(value.id, .{ .stack = spill_offset });
         }
     }
 
@@ -1286,9 +1590,36 @@ pub const CodeGen = struct {
 
         const maybe_local_or_ssa = args[0];
 
-        // If args[0] is a load op, get the local index from it
+        // Spill x0 if it's holding a live value (e.g., union_tag result)
+        // This is critical because both union_tag and union_payload use x0
+        try self.spillReg(.x0);
+
+        // If args[0] is an SSA value, check its MCValue location
         if (maybe_local_or_ssa < self.func.values.items.len) {
             const union_val = &self.func.values.items[maybe_local_or_ssa];
+
+            // First check if we have a tracked MCValue for this union
+            const mcv = self.getValue(maybe_local_or_ssa);
+
+            // Get the payload size
+            const payload_size = self.type_reg.sizeOf(value.type_idx);
+
+            if (mcv == .stack) {
+                // Union is on stack at this offset - payload is at offset +8
+                const payload_offset = mcv.stack + 8;
+
+                if (payload_size > 8) {
+                    // Large payload - return stack reference to payload location
+                    try self.setResult(value.id, .{ .stack = payload_offset });
+                    return;
+                }
+
+                try aarch64.ldrRegImm(self.buf, .x0, .sp, payload_offset);
+                self.reg_manager.markUsed(.x0, value.id);
+                try self.setResult(value.id, .{ .register = .x0 });
+                return;
+            }
+
             if (union_val.op == .load) {
                 // The load's local index is in args[0], not aux_int
                 const load_args = union_val.args();
@@ -1297,6 +1628,13 @@ pub const CodeGen = struct {
                 if (local_idx < self.func.locals.len) {
                     const local = self.func.locals[local_idx];
                     const payload_offset = convertOffset(local.offset + 8, self.stack_size);
+
+                    if (payload_size > 8) {
+                        // Large payload - return stack reference to payload location
+                        try self.setResult(value.id, .{ .stack = payload_offset });
+                        return;
+                    }
+
                     // Load payload into x0
                     try aarch64.ldrRegImm(self.buf, .x0, .sp, payload_offset);
                     self.reg_manager.markUsed(.x0, value.id);
@@ -1310,6 +1648,14 @@ pub const CodeGen = struct {
         if (maybe_local_or_ssa < self.func.locals.len) {
             const local = self.func.locals[@intCast(maybe_local_or_ssa)];
             const payload_offset = convertOffset(local.offset + 8, self.stack_size);
+            const payload_size = self.type_reg.sizeOf(value.type_idx);
+
+            if (payload_size > 8) {
+                // Large payload - return stack reference
+                try self.setResult(value.id, .{ .stack = payload_offset });
+                return;
+            }
+
             try aarch64.ldrRegImm(self.buf, .x0, .sp, payload_offset);
             self.reg_manager.markUsed(.x0, value.id);
             try self.setResult(value.id, .{ .register = .x0 });
@@ -1323,20 +1669,73 @@ pub const CodeGen = struct {
         const variant_idx: i64 = value.aux_int;
         const args = value.args();
 
-        // If there's a payload, check if it comes from a computation (in x0)
+        // Get the union's total size to determine how to handle it
+        const union_size = self.type_reg.sizeOf(value.type_idx);
+
+        // For large unions (> 16 bytes), build on stack
+        if (union_size > 16) {
+            // Allocate stack space for the union
+            const dest_offset = self.next_spill_offset;
+            self.next_spill_offset +|= @intCast(alignTo(union_size, 8));
+
+            // Store tag at offset 0
+            try aarch64.movRegImm64(self.buf, scratch0, variant_idx);
+            try aarch64.strRegImm(self.buf, scratch0, .sp, dest_offset);
+
+            // If there's a payload, copy it to offset 8
+            if (args.len > 0) {
+                const payload_val = &self.func.values.items[args[0]];
+                const payload_mcv = self.getValue(args[0]);
+                const payload_size = self.type_reg.sizeOf(payload_val.type_idx);
+
+                if (payload_mcv == .stack) {
+                    // Payload is on stack - copy it
+                    var copied: u32 = 0;
+                    while (copied < payload_size) {
+                        const src_off = payload_mcv.stack + @as(u12, @intCast(copied));
+                        const dst_off = dest_offset + 8 + @as(u12, @intCast(copied));
+                        try aarch64.ldrRegImm(self.buf, scratch0, .sp, src_off);
+                        try aarch64.strRegImm(self.buf, scratch0, .sp, dst_off);
+                        copied += 8;
+                    }
+                } else if (payload_val.op == .const_int) {
+                    // Constant payload - store directly
+                    try aarch64.movRegImm64(self.buf, scratch0, payload_val.aux_int);
+                    try aarch64.strRegImm(self.buf, scratch0, .sp, dest_offset + 8);
+                } else if (payload_mcv == .register) {
+                    // Payload in a register (small value)
+                    try aarch64.strRegImm(self.buf, payload_mcv.register, .sp, dest_offset + 8);
+                }
+            }
+
+            // Result is on stack
+            try self.setResult(value.id, .{ .stack = dest_offset });
+            return;
+        }
+
+        // If there's a payload, get its MCValue first (before any spilling)
         if (args.len > 0) {
             const payload_val = &self.func.values.items[args[0]];
+            const payload_mcv = self.getValue(args[0]);
+
             if (payload_val.op == .const_int) {
-                // Payload is constant - load tag first, then payload
+                // Payload is constant - safe to spill x0 and load both directly
+                try self.spillReg(.x0);
                 try aarch64.movRegImm64(self.buf, .x0, variant_idx);
                 try aarch64.movRegImm64(self.buf, .x1, payload_val.aux_int);
-            } else {
-                // Payload comes from computation (in x0) - save it, load tag, swap
+            } else if (payload_mcv == .register and payload_mcv.register == .x0) {
+                // Payload is in x0 - save to x1 BEFORE spilling anything
                 try aarch64.movRegReg(self.buf, .x1, .x0); // save payload to x1
+                try aarch64.movRegImm64(self.buf, .x0, variant_idx); // load tag to x0
+            } else {
+                // Payload is elsewhere (stack, other register) - spill x0 and load properly
+                try self.spillReg(.x0);
+                try self.loadToReg(.x1, payload_mcv); // load payload to x1
                 try aarch64.movRegImm64(self.buf, .x0, variant_idx); // load tag to x0
             }
         } else {
             // No payload - just set tag
+            try self.spillReg(.x0);
             try aarch64.movRegImm64(self.buf, .x0, variant_idx);
             try aarch64.movRegImm64(self.buf, .x1, 0); // zero payload
         }
@@ -1347,7 +1746,8 @@ pub const CodeGen = struct {
     }
 
     /// Generate code for list_get: call runtime cot_list_get(handle, index)
-    /// Uses MCValue for all operands
+    /// For elements <= 8 bytes: result is the value in x0
+    /// For elements > 8 bytes: result is a pointer to the element in x0, copy to stack
     pub fn genListGet(self: *CodeGen, value: *ssa.Value) !void {
         const args = value.args();
         if (args.len < 2) return;
@@ -1365,9 +1765,31 @@ pub const CodeGen = struct {
 
         try aarch64.callSymbol(self.buf, "_cot_list_get");
 
-        // Result in x0
-        self.reg_manager.markUsed(.x0, value.id);
-        try self.setResult(value.id, .{ .register = .x0 });
+        // Check if element type is > 8 bytes (returns pointer)
+        const elem_size = self.type_reg.sizeOf(value.type_idx);
+        if (elem_size > 8) {
+            // x0 contains a pointer to the element, copy to stack
+            const dest_offset = self.next_spill_offset;
+            self.next_spill_offset +|= @intCast(alignTo(elem_size, 8));
+
+            // x0 = pointer to element, copy to [sp + dest_offset]
+            var copied: u32 = 0;
+            while (copied < elem_size) {
+                // Load 8 bytes from source pointer
+                try aarch64.ldrRegImm(self.buf, scratch0, .x0, @intCast(copied));
+                // Store to stack
+                const stack_off = dest_offset + @as(u12, @intCast(copied));
+                try aarch64.strRegImm(self.buf, scratch0, .sp, stack_off);
+                copied += 8;
+            }
+
+            // Result is now on stack
+            try self.setResult(value.id, .{ .stack = dest_offset });
+        } else {
+            // Small element - value is directly in x0
+            self.reg_manager.markUsed(.x0, value.id);
+            try self.setResult(value.id, .{ .register = .x0 });
+        }
     }
 
     pub fn genMapGet(self: *CodeGen, value: *ssa.Value) !void {
@@ -1549,27 +1971,86 @@ pub const CodeGen = struct {
         try aarch64.callSymbol(self.buf, "_cot_map_free");
     }
 
-    /// Generate code for list_new: call cot_list_new() runtime function
+    /// Generate code for list_new: call cot_list_new(elem_size) runtime function
     pub fn genListNew(self: *CodeGen, value: *ssa.Value) !void {
+        // Get element size from list type
+        var elem_size: i64 = 8; // default to 8 bytes
+        const list_type = self.type_reg.get(value.type_idx);
+        if (list_type == .list_type) {
+            elem_size = @intCast(self.type_reg.sizeOf(list_type.list_type.elem));
+        }
+
+        // Pass elem_size in x0
+        try aarch64.movRegImm64(self.buf, .x0, elem_size);
         try aarch64.callSymbol(self.buf, "_cot_list_new");
+
         // x0 now has list handle
         self.reg_manager.markUsed(.x0, value.id);
         try self.setResult(value.id, .{ .register = .x0 });
     }
 
     /// Generate code for list_push: args[0]=handle, args[1]=value
-    /// Uses MCValue for all operands
+    /// For small elements (<= 8 bytes): x0=handle, x1=value
+    /// For large elements (> 8 bytes): x0=handle, x1=pointer to value
     pub fn genListPush(self: *CodeGen, value: *ssa.Value) !void {
         const args = value.args();
         if (args.len < 2) return;
 
-        // Load handle into x0 via MCValue
-        const handle_mcv = self.getValue(args[0]);
-        try self.loadToReg(.x0, handle_mcv);
+        // Get the value's type to determine element size
+        const value_ssa = &self.func.values.items[args[1]];
+        const elem_size = self.type_reg.sizeOf(value_ssa.type_idx);
 
-        // Load value into x1 via MCValue
+        const handle_mcv = self.getValue(args[0]);
         const val_mcv = self.getValue(args[1]);
-        try self.loadToReg(.x1, val_mcv);
+
+        if (elem_size <= 8) {
+            // Small element - pass value directly in x1
+            // Handle register clobbering: if value is in x0, we must load it first
+            if (val_mcv == .register and val_mcv.register == .x0) {
+                // Value is in x0 - move it to x1 first
+                try aarch64.movRegReg(self.buf, .x1, .x0);
+                // Then load handle into x0
+                try self.loadToReg(.x0, handle_mcv);
+            } else {
+                // Normal order: load handle to x0, then value to x1
+                try self.loadToReg(.x0, handle_mcv);
+                try self.loadToReg(.x1, val_mcv);
+            }
+        } else {
+            // Large element - pass pointer in x1
+            // Use MCValue to determine where the value actually is (not operation type)
+            switch (val_mcv) {
+                .stack => |stack_offset| {
+                    // Value already on stack - use its address directly
+                    try self.loadToReg(.x0, handle_mcv);
+                    try aarch64.addRegImm12(self.buf, .x1, .sp, stack_offset);
+                },
+                .register => |reg| {
+                    // Value in single register - need to copy to stack first
+                    // This handles union_init results for 9-16 byte unions
+                    const temp_offset = self.next_spill_offset;
+                    self.next_spill_offset +|= @intCast(alignTo(elem_size, 8));
+
+                    // For 16-byte unions, tag in x0, payload in x1
+                    if (elem_size > 8 and elem_size <= 16 and value_ssa.op == .union_init) {
+                        try aarch64.strRegImm(self.buf, .x0, .sp, temp_offset);
+                        try aarch64.strRegImm(self.buf, .x1, .sp, temp_offset + 8);
+                    } else {
+                        try aarch64.strRegImm(self.buf, reg, .sp, temp_offset);
+                    }
+
+                    try self.loadToReg(.x0, handle_mcv);
+                    try aarch64.addRegImm12(self.buf, .x1, .sp, temp_offset);
+                },
+                else => {
+                    // Unknown location - allocate temp and try to copy
+                    const temp_offset = self.next_spill_offset;
+                    self.next_spill_offset +|= @intCast(alignTo(elem_size, 8));
+                    try self.loadToReg(.x0, handle_mcv);
+                    try aarch64.addRegImm12(self.buf, .x1, .sp, temp_offset);
+                },
+            }
+        }
 
         try aarch64.callSymbol(self.buf, "_cot_list_push");
     }
@@ -1697,33 +2178,90 @@ pub const CodeGen = struct {
     }
 
     pub fn genReturn(self: *CodeGen, block: *ssa.Block) !void {
-        const ret_type = self.type_reg.get(self.func.return_type);
+        const ret_class = classifyType(self.type_reg, self.func.return_type);
 
         if (block.control != ssa.null_value) {
             const ret_val = &self.func.values.items[block.control];
 
-            if (ret_type == .struct_type) {
-                // Struct return: copy result to address in x19 (saved from x8 in prologue)
-                // Find source local and copy all bytes
-                const args = ret_val.args();
-                if (args.len > 0 and args[0] < self.func.locals.len) {
-                    const local_idx: u32 = @intCast(args[0]);
-                    const local = self.func.locals[local_idx];
-                    const struct_size = local.size;
-                    var copied: u32 = 0;
-                    while (copied < struct_size) {
-                        const src_offset = convertOffset(local.offset + @as(i32, @intCast(copied)), self.stack_size);
-                        // Load from our local
-                        try aarch64.ldrRegImm(self.buf, scratch0, .sp, src_offset);
-                        // Store to caller's result address
-                        try aarch64.strRegImm(self.buf, scratch0, .x19, @intCast(copied));
-                        copied += 8;
+            switch (ret_class) {
+                .by_pointer => {
+                    // Large struct return: copy result to address in x19 (saved from x8 in prologue)
+                    const struct_size = self.type_reg.sizeOf(self.func.return_type);
+                    const ret_mcv = self.getValue(block.control);
+
+                    if (ret_mcv == .stack) {
+                        // Result is in a spill slot - copy from there
+                        var copied: u32 = 0;
+                        while (copied < struct_size) {
+                            const src_offset = ret_mcv.stack + @as(u12, @intCast(copied));
+                            try aarch64.ldrRegImm(self.buf, scratch0, .sp, src_offset);
+                            try aarch64.strRegImm(self.buf, scratch0, .x19, @intCast(copied));
+                            copied += 8;
+                        }
+                    } else {
+                        // Fallback: try to load from local if available
+                        const args = ret_val.args();
+                        if (args.len > 0 and args[0] < self.func.locals.len) {
+                            const local_idx: u32 = @intCast(args[0]);
+                            const local = self.func.locals[local_idx];
+                            var copied: u32 = 0;
+                            while (copied < struct_size) {
+                                const src_offset = convertOffset(local.offset + @as(i32, @intCast(copied)), self.stack_size);
+                                try aarch64.ldrRegImm(self.buf, scratch0, .sp, src_offset);
+                                try aarch64.strRegImm(self.buf, scratch0, .x19, @intCast(copied));
+                                copied += 8;
+                            }
+                        }
                     }
-                }
-            } else {
-                // Scalar return: load to x0
-                const ret_mcv = self.getValue(block.control);
-                try self.loadToReg(.x0, ret_mcv);
+                },
+                .double_reg => {
+                    // Medium struct (9-16 bytes): return in x0 + x1
+                    // Use getValue to handle any MCValue (local, spill slot, etc.)
+                    const ret_mcv = self.getValue(block.control);
+                    if (ret_mcv == .stack) {
+                        try aarch64.ldrRegImm(self.buf, .x0, .sp, ret_mcv.stack);
+                        try aarch64.ldrRegImm(self.buf, .x1, .sp, ret_mcv.stack + 8);
+                    } else {
+                        // Fallback: try to load from local if available
+                        const args = ret_val.args();
+                        if (args.len > 0 and args[0] < self.func.locals.len) {
+                            const local_idx: u32 = @intCast(args[0]);
+                            const local = self.func.locals[local_idx];
+                            const sp_offset = convertOffset(local.offset, self.stack_size);
+                            try aarch64.ldrRegImm(self.buf, .x0, .sp, sp_offset);
+                            const sp_offset_plus8 = convertOffset(local.offset + 8, self.stack_size);
+                            try aarch64.ldrRegImm(self.buf, .x1, .sp, sp_offset_plus8);
+                        }
+                    }
+                },
+                .single_reg => {
+                    // Small type: load to x0
+                    const ret_mcv = self.getValue(block.control);
+                    try self.loadToReg(.x0, ret_mcv);
+                },
+                .slice => {
+                    // Slice: load ptr to x0, len to x1
+                    const ret_mcv = self.getValue(block.control);
+                    switch (ret_mcv) {
+                        .stack => |offset| {
+                            // Offset is already sp-relative (from spill during select/call)
+                            // Don't use convertOffset - it expects fp-relative negative offsets
+                            try aarch64.ldrRegImm(self.buf, .x0, .sp, offset);
+                            try aarch64.ldrRegImm(self.buf, .x1, .sp, offset + 8);
+                        },
+                        .register => |reg| {
+                            // Slice in register means it's already in x0/x1 (or needs move)
+                            if (reg != .x0) {
+                                try aarch64.movRegReg(self.buf, .x0, reg);
+                            }
+                            // Assume x1 is already set if this is a returned slice from a call
+                        },
+                        else => {
+                            // Fallback - try to load to x0, might need more work for other cases
+                            try self.loadToReg(.x0, ret_mcv);
+                        },
+                    }
+                },
             }
         }
 
@@ -1842,20 +2380,16 @@ pub const CodeGen = struct {
         // mov fp, sp
         try aarch64.movFromSp(self.buf, .fp);
 
-        // For struct returns, save x8 (result pointer) to x19 (callee-saved)
+        // For large struct returns (>16 bytes), save x8 (result pointer) to x19 (callee-saved)
         // IMPORTANT: Also mark x19 as reserved so it won't be allocated
-        const ret_type = self.type_reg.get(self.func.return_type);
-        if (ret_type == .struct_type) {
+        const ret_class = classifyType(self.type_reg, self.func.return_type);
+        if (ret_class == .by_pointer) {
             try aarch64.movRegReg(self.buf, .x19, .x8);
             // Mark x19 as used so the register allocator won't clobber it
             self.reg_manager.markUsed(.x19, 0xFFFFFFFF); // Use sentinel value
         }
 
-        // Spill parameters to local slots
-        // Simplified calling convention:
-        // - Scalars (int, bool, enum, ptr): 1 register
-        // - Strings: 2 registers (ptr + len) - special case for efficiency
-        // - Structs: passed by pointer, copy to local slot
+        // Spill parameters to local slots using ABIClass for consistent decisions
         const param_regs = [_]aarch64.Reg{ .x0, .x1, .x2, .x3, .x4, .x5, .x6, .x7 };
         const num_params = self.func.param_count;
 
@@ -1865,40 +2399,44 @@ pub const CodeGen = struct {
 
             const local = self.func.locals[param_idx];
             const sp_offset = convertOffset(local.offset, self.stack_size);
-            const param_type = self.type_reg.get(local.type_idx);
+            const param_class = classifyType(self.type_reg, local.type_idx);
+            const needed = regsNeeded(param_class);
 
-            if (param_type == .struct_type) {
-                // Struct parameter: register holds pointer to caller's copy
-                // Copy entire struct from that address to our local slot
-                const src_addr = param_regs[reg_idx];
-                const param_size = local.size;
-                var copied: u32 = 0;
-                while (copied < param_size) {
-                    const dst_offset = convertOffset(local.offset + @as(i32, @intCast(copied)), self.stack_size);
-                    // Load 8 bytes from source
-                    try aarch64.ldrRegImm(self.buf, scratch0, src_addr, @intCast(copied));
-                    // Store to our stack slot
-                    try aarch64.strRegImm(self.buf, scratch0, .sp, dst_offset);
-                    copied += 8;
-                }
-                reg_idx += 1;
-            } else if (param_type == .slice) {
-                // Slice parameter: 2 registers (ptr + len)
-                if (reg_idx + 1 < param_regs.len) {
-                    // Store ptr at offset, len at offset+8
+            if (reg_idx + needed > param_regs.len) break;
+
+            switch (param_class) {
+                .by_pointer => {
+                    // Large type: register holds pointer to caller's copy
+                    // Copy entire value from that address to our local slot
+                    const src_addr = param_regs[reg_idx];
+                    const param_size = local.size;
+                    var copied: u32 = 0;
+                    while (copied < param_size) {
+                        const dst_offset = convertOffset(local.offset + @as(i32, @intCast(copied)), self.stack_size);
+                        try aarch64.ldrRegImm(self.buf, scratch0, src_addr, @intCast(copied));
+                        try aarch64.strRegImm(self.buf, scratch0, .sp, dst_offset);
+                        copied += 8;
+                    }
+                    reg_idx += 1;
+                },
+                .double_reg, .slice => {
+                    // Medium type or slice: 2 registers
                     try aarch64.strRegImm(self.buf, param_regs[reg_idx], .sp, sp_offset);
                     const sp_offset_plus8 = convertOffset(local.offset + 8, self.stack_size);
                     try aarch64.strRegImm(self.buf, param_regs[reg_idx + 1], .sp, sp_offset_plus8);
                     reg_idx += 2;
-                } else {
-                    // Not enough registers, just store ptr
-                    try aarch64.strRegImm(self.buf, param_regs[reg_idx], .sp, sp_offset);
+                },
+                .single_reg => {
+                    // Small type: single register
+                    // Use appropriate store size based on type
+                    const param_size = self.type_reg.sizeOf(local.type_idx);
+                    if (param_size == 1) {
+                        try aarch64.strbRegImm(self.buf, param_regs[reg_idx], .sp, sp_offset);
+                    } else {
+                        try aarch64.strRegImm(self.buf, param_regs[reg_idx], .sp, sp_offset);
+                    }
                     reg_idx += 1;
-                }
-            } else {
-                // Scalar: single register
-                try aarch64.strRegImm(self.buf, param_regs[reg_idx], .sp, sp_offset);
-                reg_idx += 1;
+                },
             }
         }
     }

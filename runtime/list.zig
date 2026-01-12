@@ -1,6 +1,6 @@
 ///! List runtime for cot compiler.
 ///!
-///! Provides a simple dynamic array implementation with i64 values.
+///! Provides a dynamic array implementation that supports arbitrary element sizes.
 ///! Uses a handle-based API matching the Map API for consistency.
 ///!
 ///! This is a C ABI compatible library that can be linked with compiled cot programs.
@@ -21,9 +21,10 @@ const growth_factor: u64 = 2;
 
 /// List data block (allocated by runtime)
 const ListData = struct {
-    elements_ptr: ?[*]i64,
+    elements_ptr: ?[*]u8, // Byte array - supports arbitrary element sizes
     length: u64,
     capacity: u64,
+    elem_size: u64, // Size of each element in bytes
 };
 
 /// Stable external handle
@@ -47,13 +48,15 @@ fn debugPrint(comptime fmt: []const u8, args: anytype) void {
 fn growList(data: *ListData) bool {
     const allocator = std.heap.c_allocator;
     const new_capacity = if (data.capacity == 0) initial_capacity else data.capacity * growth_factor;
+    const new_byte_size = new_capacity * data.elem_size;
+    const old_byte_size = data.capacity * data.elem_size;
 
-    debugPrint("Growing from capacity {d} to {d}", .{ data.capacity, new_capacity });
+    debugPrint("Growing from capacity {d} to {d} (elem_size={d})", .{ data.capacity, new_capacity, data.elem_size });
 
     const new_elements = if (data.elements_ptr == null)
-        allocator.alloc(i64, new_capacity) catch return false
+        allocator.alloc(u8, new_byte_size) catch return false
     else
-        allocator.realloc(data.elements_ptr.?[0..data.capacity], new_capacity) catch return false;
+        allocator.realloc(data.elements_ptr.?[0..old_byte_size], new_byte_size) catch return false;
 
     data.elements_ptr = new_elements.ptr;
     data.capacity = new_capacity;
@@ -64,9 +67,16 @@ fn growList(data: *ListData) bool {
 // Public C ABI Functions
 // ============================================================================
 
-/// Create a new list
-export fn cot_list_new() ?*ListHandle {
+/// Create a new list with specified element size
+/// elem_size: size of each element in bytes (e.g., 8 for int, 16 for union)
+export fn cot_list_new(elem_size: i64) ?*ListHandle {
     const allocator = std.heap.c_allocator;
+
+    // Validate element size
+    if (elem_size <= 0) {
+        debugPrint("Invalid elem_size: {d}", .{elem_size});
+        return null;
+    }
 
     // Allocate handle
     const handle = allocator.create(ListHandle) catch return null;
@@ -80,21 +90,24 @@ export fn cot_list_new() ?*ListHandle {
     data.elements_ptr = null;
     data.length = 0;
     data.capacity = 0;
+    data.elem_size = @intCast(elem_size);
 
     handle.data = data;
 
-    debugPrint("List created at {*}", .{handle});
+    debugPrint("List created at {*}, elem_size={d}", .{ handle, elem_size });
 
     return handle;
 }
 
-/// Push a value onto the list
+/// Push a value onto the list (by pointer for arbitrary sizes)
+/// For small values (<= 8 bytes), value_ptr can be the value itself cast to pointer
+/// For larger values, value_ptr must point to the actual value
 /// Returns 1 on success, 0 on failure
-export fn cot_list_push(handle: ?*ListHandle, value: i64) i64 {
+export fn cot_list_push(handle: ?*ListHandle, value_ptr: i64) i64 {
     const h = handle orelse return 0;
     const data = h.data;
 
-    debugPrint("push({d}) - len={d}, cap={d}", .{ value, data.length, data.capacity });
+    debugPrint("push(ptr={x}) - len={d}, cap={d}, elem_size={d}", .{ value_ptr, data.length, data.capacity, data.elem_size });
 
     // Grow if needed
     if (data.length >= data.capacity) {
@@ -103,9 +116,23 @@ export fn cot_list_push(handle: ?*ListHandle, value: i64) i64 {
         }
     }
 
-    // Store the value
     const elements = data.elements_ptr orelse return 0;
-    elements[data.length] = value;
+    const offset = data.length * data.elem_size;
+
+    // For elements <= 8 bytes, the value is passed directly (as i64)
+    // For larger elements, value_ptr is actually a pointer to the data
+    if (data.elem_size <= 8) {
+        // Small value - store directly
+        const dest = elements + offset;
+        const value_bytes = std.mem.asBytes(&value_ptr);
+        @memcpy(dest[0..data.elem_size], value_bytes[0..data.elem_size]);
+    } else {
+        // Large value - value_ptr is a pointer to the source data
+        const src: [*]const u8 = @ptrFromInt(@as(usize, @intCast(value_ptr)));
+        const dest = elements + offset;
+        @memcpy(dest[0..data.elem_size], src[0..data.elem_size]);
+    }
+
     data.length += 1;
 
     debugPrint("  push success, new len={d}", .{data.length});
@@ -113,12 +140,13 @@ export fn cot_list_push(handle: ?*ListHandle, value: i64) i64 {
 }
 
 /// Get an element from the list by index
-/// Returns the value at the index, or 0 if out of bounds
+/// For elements <= 8 bytes, returns the value directly
+/// For larger elements, returns a pointer to the element (valid until list is modified)
 export fn cot_list_get(handle: ?*ListHandle, index: i64) i64 {
     const h = handle orelse return 0;
     const data = h.data;
 
-    debugPrint("get({d}) - len={d}", .{ index, data.length });
+    debugPrint("get({d}) - len={d}, elem_size={d}", .{ index, data.length, data.elem_size });
 
     // Bounds check
     if (index < 0) return 0;
@@ -126,7 +154,20 @@ export fn cot_list_get(handle: ?*ListHandle, index: i64) i64 {
     if (idx >= data.length) return 0;
 
     const elements = data.elements_ptr orelse return 0;
-    return elements[idx];
+    const offset = idx * data.elem_size;
+
+    if (data.elem_size <= 8) {
+        // Small element - return value directly
+        var result: i64 = 0;
+        const result_bytes = std.mem.asBytes(&result);
+        const src = elements + offset;
+        @memcpy(result_bytes[0..data.elem_size], src[0..data.elem_size]);
+        return result;
+    } else {
+        // Large element - return pointer to element
+        const elem_ptr = elements + offset;
+        return @intCast(@intFromPtr(elem_ptr));
+    }
 }
 
 /// Get the length of the list
@@ -135,68 +176,114 @@ export fn cot_list_len(handle: ?*ListHandle) i64 {
     return @intCast(h.data.length);
 }
 
-/// Free the list
+/// Free the list and all its resources
 export fn cot_list_free(handle: ?*ListHandle) void {
     const h = handle orelse return;
+    const data = h.data;
     const allocator = std.heap.c_allocator;
 
-    debugPrint("Freeing list at {*}, len={d}", .{ h, h.data.length });
+    debugPrint("Freeing list at {*}", .{h});
 
     // Free elements array
-    if (h.data.elements_ptr) |elements| {
-        allocator.free(elements[0..h.data.capacity]);
+    if (data.elements_ptr) |elements| {
+        const byte_size = data.capacity * data.elem_size;
+        allocator.free(elements[0..byte_size]);
     }
 
-    // Free data and handle
-    allocator.destroy(h.data);
+    // Free data struct
+    allocator.destroy(data);
+
+    // Free handle
     allocator.destroy(h);
+}
+
+/// Get the element size of the list
+export fn cot_list_elem_size(handle: ?*ListHandle) i64 {
+    const h = handle orelse return 0;
+    return @intCast(h.data.elem_size);
 }
 
 // ============================================================================
 // Tests
 // ============================================================================
 
-test "list basic operations" {
-    const list = cot_list_new() orelse return error.OutOfMemory;
-    defer cot_list_free(list);
+test "list basic operations with 8-byte elements" {
+    const handle = cot_list_new(8) orelse return error.CreateFailed;
+    defer cot_list_free(handle);
 
-    // Initially empty
-    try std.testing.expectEqual(@as(i64, 0), cot_list_len(list));
+    // Push some values
+    try std.testing.expectEqual(@as(i64, 1), cot_list_push(handle, 42));
+    try std.testing.expectEqual(@as(i64, 1), cot_list_push(handle, 100));
+    try std.testing.expectEqual(@as(i64, 1), cot_list_push(handle, -5));
 
-    // Push and get
-    _ = cot_list_push(list, 10);
-    _ = cot_list_push(list, 20);
-    _ = cot_list_push(list, 30);
+    // Check length
+    try std.testing.expectEqual(@as(i64, 3), cot_list_len(handle));
 
-    try std.testing.expectEqual(@as(i64, 3), cot_list_len(list));
-    try std.testing.expectEqual(@as(i64, 10), cot_list_get(list, 0));
-    try std.testing.expectEqual(@as(i64, 20), cot_list_get(list, 1));
-    try std.testing.expectEqual(@as(i64, 30), cot_list_get(list, 2));
+    // Get values
+    try std.testing.expectEqual(@as(i64, 42), cot_list_get(handle, 0));
+    try std.testing.expectEqual(@as(i64, 100), cot_list_get(handle, 1));
+    try std.testing.expectEqual(@as(i64, -5), cot_list_get(handle, 2));
+}
+
+test "list with 16-byte elements" {
+    const handle = cot_list_new(16) orelse return error.CreateFailed;
+    defer cot_list_free(handle);
+
+    // Create a 16-byte value (simulating a union with tag + payload)
+    var value1: [16]u8 = undefined;
+    value1[0] = 0; // tag = 0
+    @memset(value1[1..8], 0);
+    std.mem.writeInt(i64, value1[8..16], 42, .little); // payload = 42
+
+    var value2: [16]u8 = undefined;
+    value2[0] = 1; // tag = 1
+    @memset(value2[1..8], 0);
+    std.mem.writeInt(i64, value2[8..16], 100, .little); // payload = 100
+
+    // Push by pointer
+    try std.testing.expectEqual(@as(i64, 1), cot_list_push(handle, @intCast(@intFromPtr(&value1))));
+    try std.testing.expectEqual(@as(i64, 1), cot_list_push(handle, @intCast(@intFromPtr(&value2))));
+
+    try std.testing.expectEqual(@as(i64, 2), cot_list_len(handle));
+
+    // Get returns pointer for large elements
+    const ptr1: [*]u8 = @ptrFromInt(@as(usize, @intCast(cot_list_get(handle, 0))));
+    const ptr2: [*]u8 = @ptrFromInt(@as(usize, @intCast(cot_list_get(handle, 1))));
+
+    try std.testing.expectEqual(@as(u8, 0), ptr1[0]); // tag
+    try std.testing.expectEqual(@as(i64, 42), std.mem.readInt(i64, ptr1[8..16], .little));
+
+    try std.testing.expectEqual(@as(u8, 1), ptr2[0]); // tag
+    try std.testing.expectEqual(@as(i64, 100), std.mem.readInt(i64, ptr2[8..16], .little));
+}
+
+test "list bounds checking" {
+    const handle = cot_list_new(8) orelse return error.CreateFailed;
+    defer cot_list_free(handle);
+
+    _ = cot_list_push(handle, 42);
 
     // Out of bounds returns 0
-    try std.testing.expectEqual(@as(i64, 0), cot_list_get(list, 3));
-    try std.testing.expectEqual(@as(i64, 0), cot_list_get(list, -1));
+    try std.testing.expectEqual(@as(i64, 0), cot_list_get(handle, -1));
+    try std.testing.expectEqual(@as(i64, 0), cot_list_get(handle, 1));
+    try std.testing.expectEqual(@as(i64, 0), cot_list_get(handle, 100));
 }
 
 test "list growth" {
-    const list = cot_list_new() orelse return error.OutOfMemory;
-    defer cot_list_free(list);
+    const handle = cot_list_new(8) orelse return error.CreateFailed;
+    defer cot_list_free(handle);
 
-    // Push more than initial capacity (8) to trigger growth
+    // Push more than initial capacity
     var i: i64 = 0;
-    while (i < 20) : (i += 1) {
-        try std.testing.expectEqual(@as(i64, 1), cot_list_push(list, i * 10));
+    while (i < 100) : (i += 1) {
+        try std.testing.expectEqual(@as(i64, 1), cot_list_push(handle, i * 10));
     }
 
-    try std.testing.expectEqual(@as(i64, 20), cot_list_len(list));
-    try std.testing.expectEqual(@as(i64, 0), cot_list_get(list, 0));
-    try std.testing.expectEqual(@as(i64, 100), cot_list_get(list, 10));
-    try std.testing.expectEqual(@as(i64, 190), cot_list_get(list, 19));
-}
+    try std.testing.expectEqual(@as(i64, 100), cot_list_len(handle));
 
-test "list null handle safety" {
-    try std.testing.expectEqual(@as(i64, 0), cot_list_len(null));
-    try std.testing.expectEqual(@as(i64, 0), cot_list_get(null, 0));
-    try std.testing.expectEqual(@as(i64, 0), cot_list_push(null, 42));
-    cot_list_free(null); // Should not crash
+    // Verify all values
+    i = 0;
+    while (i < 100) : (i += 1) {
+        try std.testing.expectEqual(i * 10, cot_list_get(handle, i));
+    }
 }

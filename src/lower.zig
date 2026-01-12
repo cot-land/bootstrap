@@ -76,7 +76,7 @@ pub const Lowerer = struct {
             .err = err,
             .builder = ir.Builder.init(allocator, type_reg),
             .checker = chk,
-            .type_ctx = type_context.TypeContext.init(tree, type_reg),
+            .type_ctx = type_context.TypeContext.initWithScope(tree, type_reg, chk.scope),
             .string_literals = .{ .items = &.{}, .capacity = 0 },
             .loop_stack = .{ .items = &.{}, .capacity = 0 },
             .const_values = std.StringHashMap(i64).init(allocator),
@@ -672,10 +672,8 @@ pub const Lowerer = struct {
             null;
         const merge_block = try fb.newBlock("if.merge");
 
-        // Emit branch
-        const branch = ir.Node.init(.branch, TypeRegistry.VOID, Span.fromPos(Pos.zero))
-            .withArgs(&.{ cond_node, then_block, else_block orelse merge_block });
-        _ = try fb.emit(branch);
+        // Emit branch using standard format (args[0]=cond, args[1]=then, args[2]=else)
+        _ = try fb.emitBranch(cond_node, then_block, else_block orelse merge_block, Span.fromPos(Pos.zero));
 
         // Lower then block
         fb.setBlock(then_block);
@@ -1263,7 +1261,7 @@ pub const Lowerer = struct {
 
         const op: ir.Op = switch (un.op) {
             .minus => .neg,
-            .bang => .not,
+            .bang, .kw_not => .not,
             else => .neg,
         };
 
@@ -1332,6 +1330,40 @@ pub const Lowerer = struct {
                                     if (self.checker.lookupMethod(struct_name, fa.field)) |method| {
                                         log.debug("  struct ptr method call: {s}.{s}", .{ var_name, fa.field });
                                         return self.lowerStructMethodCall(call, method, @intCast(local_idx), true);
+                                    }
+                                }
+                            }
+                        }
+                    } else if (be == .field_access) {
+                        // Handle nested field access: struct.list_field.method()
+                        // e.g., reg.types.push(...) where reg is a struct and types is a List<T> field
+                        const inner_fa = be.field_access;
+                        const inner_base = self.tree.getExpr(inner_fa.base);
+                        if (inner_base) |ib| {
+                            if (ib == .identifier) {
+                                const struct_var = ib.identifier.name;
+                                if (fb.lookupLocal(struct_var)) |struct_local_idx| {
+                                    const struct_local = fb.locals.items[struct_local_idx];
+                                    const struct_type = self.type_reg.get(struct_local.type_idx);
+                                    if (struct_type == .struct_type) {
+                                        // Find the field type
+                                        const st = struct_type.struct_type;
+                                        for (st.fields) |field| {
+                                            if (std.mem.eql(u8, field.name, inner_fa.field)) {
+                                                const field_type = self.type_reg.get(field.type_idx);
+                                                if (field_type == .list_type) {
+                                                    log.debug("  struct.list_field method call: {s}.{s}.{s}", .{ struct_var, inner_fa.field, fa.field });
+                                                    // Emit field access to get list handle, then call list method
+                                                    const list_handle = try self.lowerFieldAccess(inner_fa);
+                                                    return self.lowerListMethodCallWithHandle(call, fa.field, list_handle, field.type_idx);
+                                                } else if (field_type == .map_type) {
+                                                    log.debug("  struct.map_field method call: {s}.{s}.{s}", .{ struct_var, inner_fa.field, fa.field });
+                                                    const map_handle = try self.lowerFieldAccess(inner_fa);
+                                                    return self.lowerMapMethodCallWithHandle(call, fa.field, map_handle, field.type_idx);
+                                                }
+                                                break;
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1482,7 +1514,46 @@ pub const Lowerer = struct {
                                     log.debug("  len(array var) constant folded to {d}", .{a.length});
                                     return try fb.emit(node);
                                 },
+                                .list_type => {
+                                    // List length via runtime call
+                                    const list_node = try fb.emitLocalLoad(@intCast(local_idx), local.type_idx, Span.fromPos(Pos.zero));
+                                    const node = ir.Node.init(.list_len, TypeRegistry.INT, Span.fromPos(Pos.zero))
+                                        .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{list_node}));
+                                    log.debug("  len(list var) runtime: local={d}", .{local_idx});
+                                    return try fb.emit(node);
+                                },
                                 else => {},
+                            }
+                        }
+                    },
+                    .field_access => |fa| {
+                        // len(struct.field) - need to get field type and check if it's a list
+                        // First, get base variable type
+                        const base_node = self.tree.getNode(fa.base);
+                        if (base_node == .expr and base_node.expr == .identifier) {
+                            const ident = base_node.expr.identifier;
+                            if (fb.lookupLocal(ident.name)) |local_idx| {
+                                const local = fb.locals.items[local_idx];
+                                const base_type = self.type_reg.get(local.type_idx);
+
+                                // Find the field type
+                                if (base_type == .struct_type) {
+                                    const st = base_type.struct_type;
+                                    for (st.fields) |f| {
+                                        if (std.mem.eql(u8, f.name, fa.field)) {
+                                            const field_type = self.type_reg.get(f.type_idx);
+                                            if (field_type == .list_type) {
+                                                // Lower the field access to get the list handle
+                                                const list_node = try self.lowerFieldAccess(fa);
+                                                const node = ir.Node.init(.list_len, TypeRegistry.INT, Span.fromPos(Pos.zero))
+                                                    .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{list_node}));
+                                                log.debug("  len(struct.list_field) runtime: field={s}", .{fa.field});
+                                                return try fb.emit(node);
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
                             }
                         }
                     },
@@ -1872,6 +1943,132 @@ pub const Lowerer = struct {
         }
     }
 
+    /// Lower List method calls with a pre-computed handle (for struct field access chains)
+    fn lowerListMethodCallWithHandle(
+        self: *Lowerer,
+        call: ast.Call,
+        method_name: []const u8,
+        list_handle: ir.NodeIndex,
+        list_type_idx: TypeIndex,
+    ) Allocator.Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+
+        // Get the list's element type for get() operations
+        const elem_type = self.type_ctx.getListElementType(list_type_idx) orelse TypeRegistry.INT;
+
+        if (std.mem.eql(u8, method_name, "push")) {
+            // list.push(value) -> list_push(handle, value)
+            if (call.args.len != 1) {
+                log.debug("  list.push() expects 1 argument, got {d}", .{call.args.len});
+                return ir.null_node;
+            }
+
+            const value_node = try self.lowerExpr(call.args[0]);
+
+            const node = ir.Node.init(.list_push, TypeRegistry.VOID, Span.fromPos(Pos.zero))
+                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ list_handle, value_node }));
+
+            log.debug("  list.push() -> list_push IR op (via handle)", .{});
+            return try fb.emit(node);
+        } else if (std.mem.eql(u8, method_name, "get")) {
+            // list.get(index) -> list_get(handle, index)
+            if (call.args.len != 1) {
+                log.debug("  list.get() expects 1 argument, got {d}", .{call.args.len});
+                return ir.null_node;
+            }
+
+            const index_node = try self.lowerExpr(call.args[0]);
+
+            // Use the list's element type for the result
+            const node = ir.Node.init(.list_get, elem_type, Span.fromPos(Pos.zero))
+                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ list_handle, index_node }));
+
+            log.debug("  list.get() -> list_get IR op (via handle), elem_type={d}", .{elem_type});
+            return try fb.emit(node);
+        } else if (std.mem.eql(u8, method_name, "len")) {
+            // list.len() -> list_len(handle)
+            if (call.args.len != 0) {
+                log.debug("  list.len() expects 0 arguments, got {d}", .{call.args.len});
+                return ir.null_node;
+            }
+
+            const node = ir.Node.init(.list_len, TypeRegistry.INT, Span.fromPos(Pos.zero))
+                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{list_handle}));
+
+            log.debug("  list.len() -> list_len IR op (via handle)", .{});
+            return try fb.emit(node);
+        } else {
+            log.debug("  unknown list method: {s}", .{method_name});
+            return ir.null_node;
+        }
+    }
+
+    /// Lower Map method calls with a pre-computed handle (for struct field access chains)
+    fn lowerMapMethodCallWithHandle(
+        self: *Lowerer,
+        call: ast.Call,
+        method_name: []const u8,
+        map_handle: ir.NodeIndex,
+        map_type_idx: TypeIndex,
+    ) Allocator.Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+
+        // Get key and value types from map type
+        const key_type = self.type_ctx.getMapKeyType(map_type_idx) orelse TypeRegistry.INT;
+        const value_type = self.type_ctx.getMapValueType(map_type_idx) orelse TypeRegistry.INT;
+
+        if (std.mem.eql(u8, method_name, "set")) {
+            // map.set(key, value)
+            if (call.args.len != 2) {
+                log.debug("  map.set() expects 2 arguments, got {d}", .{call.args.len});
+                return ir.null_node;
+            }
+
+            const key_node = try self.lowerExpr(call.args[0]);
+            const value_node = try self.lowerExpr(call.args[1]);
+
+            const node = ir.Node.init(.map_set, TypeRegistry.VOID, Span.fromPos(Pos.zero))
+                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ map_handle, key_node, value_node }))
+                .withAux(key_type);
+
+            log.debug("  map.set() -> map_set IR op (via handle)", .{});
+            return try fb.emit(node);
+        } else if (std.mem.eql(u8, method_name, "get")) {
+            // map.get(key)
+            if (call.args.len != 1) {
+                log.debug("  map.get() expects 1 argument, got {d}", .{call.args.len});
+                return ir.null_node;
+            }
+
+            const key_node = try self.lowerExpr(call.args[0]);
+
+            const node = ir.Node.init(.map_get, value_type, Span.fromPos(Pos.zero))
+                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ map_handle, key_node }))
+                .withAux(key_type);
+
+            log.debug("  map.get() -> map_get IR op (via handle), value_type={d}", .{value_type});
+            return try fb.emit(node);
+        } else if (std.mem.eql(u8, method_name, "has")) {
+            // map.has(key)
+            if (call.args.len != 1) {
+                log.debug("  map.has() expects 1 argument, got {d}", .{call.args.len});
+                return ir.null_node;
+            }
+
+            const key_node = try self.lowerExpr(call.args[0]);
+
+            const node = ir.Node.init(.map_has, TypeRegistry.BOOL, Span.fromPos(Pos.zero))
+                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ map_handle, key_node }))
+                .withAux(key_type);
+
+            log.debug("  map.has() -> map_has IR op (via handle)", .{});
+            return try fb.emit(node);
+        } else {
+            log.debug("  unknown map method: {s}", .{method_name});
+            return ir.null_node;
+        }
+    }
+
     /// Lower a struct method call: obj.method(args) -> method(&obj, args) or method(obj, args)
     fn lowerStructMethodCall(self: *Lowerer, call: ast.Call, method: check.MethodInfo, local_idx: u32, is_ptr: bool) Allocator.Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
@@ -2186,18 +2383,26 @@ pub const Lowerer = struct {
     fn lowerStructInit(self: *Lowerer, si: ast.StructInit) Allocator.Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
 
-        // For now, emit a placeholder struct_init op
-        // Full implementation will allocate stack space and initialize fields
         log.debug("  struct_init: {s}", .{si.type_name});
 
-        // Lower each field value
-        for (si.fields) |field_init| {
-            _ = try self.lowerExpr(field_init.value);
-        }
+        // Get struct type
+        const struct_type_idx = self.type_reg.lookupByName(si.type_name) orelse {
+            log.debug("  struct_init: unknown type {s}", .{si.type_name});
+            return ir.null_node;
+        };
+        const struct_size = self.type_reg.sizeOf(struct_type_idx);
 
-        // Placeholder: return null_node until full codegen is implemented
-        _ = fb;
-        return ir.null_node;
+        // Create a temp local to hold the struct
+        const temp_local_idx = try fb.addLocalWithSize("__struct_tmp", struct_type_idx, false, struct_size);
+        log.debug("  struct_init: created temp local {d} size {d}", .{ temp_local_idx, struct_size });
+
+        // Initialize fields into temp local
+        try self.lowerStructInitInline(si, temp_local_idx);
+
+        // Emit a load to get the struct value (returns reference to the temp)
+        const load = ir.Node.init(.load, struct_type_idx, Span.fromPos(Pos.zero))
+            .withArgs(&.{@intCast(temp_local_idx)});
+        return try fb.emit(load);
     }
 
     fn lowerArrayLiteral(self: *Lowerer, al: ast.ArrayLiteral) Allocator.Error!ir.NodeIndex {
@@ -2232,9 +2437,9 @@ pub const Lowerer = struct {
         return try fb.emit(node);
     }
 
-    /// Lower switch expression to nested selects.
-    /// switch x { 1 => a, 2 => b, else => c } becomes:
-    /// select(x == 1, a, select(x == 2, b, c))
+    /// Lower switch expression.
+    /// For union switches: uses proper control flow (branches) to avoid evaluating all branches.
+    /// For non-union switches: uses nested selects.
     fn lowerSwitchExpr(self: *Lowerer, switch_expr: ast.SwitchExpr) Allocator.Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
 
@@ -2254,16 +2459,14 @@ pub const Lowerer = struct {
         const subject_type_idx = self.inferTypeFromExpr(switch_expr.subject);
         const subject_type = self.type_reg.get(subject_type_idx);
 
-        // Check if this is a union switch
-        const is_union_switch = subject_type == .union_type;
-        var union_tag: ir.NodeIndex = ir.null_node;
-        if (is_union_switch) {
-            // Extract tag from union
-            const tag_node = ir.Node.init(.union_tag, TypeRegistry.U8, Span.fromPos(Pos.zero))
-                .withArgs(&.{subject});
-            union_tag = try fb.emit(tag_node);
-            log.debug("  union switch: extracting tag", .{});
+        // Check if this is a union switch - use branch-based lowering
+        if (subject_type == .union_type) {
+            // Use proper control flow to avoid evaluating all branches
+            // (select-based lowering would cause infinite recursion for recursive types)
+            return self.lowerUnionSwitchExpr(switch_expr, subject, subject_type.union_type, result_type);
         }
+
+        // Non-union switch: use select-based lowering (safe for enums, ints, etc.)
 
         // Get the else value (default), or use a placeholder if no else
         var result = if (switch_expr.else_body) |else_idx|
@@ -2279,125 +2482,51 @@ pub const Lowerer = struct {
             case_idx -= 1;
             const case = switch_expr.cases[case_idx];
 
-            var case_body: ir.NodeIndex = undefined;
-
-            // Handle payload capture for union switch
-            if (case.capture) |capture_name| {
-                if (is_union_switch) {
-                    const ut = subject_type.union_type;
-                    // Get variant info from case value
-                    if (case.values.len > 0) {
-                        const val_node = self.tree.getNode(case.values[0]);
-                        if (val_node == .expr and val_node.expr == .field_access) {
-                            const variant_name = val_node.expr.field_access.field;
-                            var variant_idx: u32 = 0;
-                            var payload_type: TypeIndex = TypeRegistry.VOID;
-
-                            for (ut.variants, 0..) |v, i| {
-                                if (std.mem.eql(u8, v.name, variant_name)) {
-                                    variant_idx = @intCast(i);
-                                    payload_type = v.type_idx;
-                                    break;
-                                }
-                            }
-
-                            // Create local for captured payload
-                            const payload_size = self.type_reg.sizeOf(payload_type);
-                            const local_idx = try fb.addLocalWithSize(capture_name, payload_type, false, payload_size);
-                            log.debug("  payload capture: {s} type={d} size={d}", .{ capture_name, payload_type, payload_size });
-
-                            // Extract payload and store in local
-                            const payload_node = ir.Node.init(.union_payload, payload_type, Span.fromPos(Pos.zero))
-                                .withAux(variant_idx)
-                                .withArgs(&.{subject});
-                            const payload_val = try fb.emit(payload_node);
-
-                            const store = ir.Node.init(.store, payload_type, Span.fromPos(Pos.zero))
-                                .withArgs(&.{ @intCast(local_idx), payload_val });
-                            _ = try fb.emit(store);
-                            // Local is already registered in fb.local_map by addLocalWithSize
-                        }
-                    }
-                }
-                // Now lower the body (which may reference the captured variable)
-                case_body = try self.lowerExpr(case.body);
-            } else {
-                // No capture - evaluate case body normally
-                case_body = try self.lowerExpr(case.body);
-            }
+            // Evaluate case body (union payload captures are handled in lowerUnionSwitchExpr)
+            const case_body = try self.lowerExpr(case.body);
 
             // Build OR of all value comparisons for this case
             // For case "1, 2 => x", build: (subject == 1) or (subject == 2)
             var cond: ir.NodeIndex = ir.null_node;
-            for (case.values, 0..) |val_idx, val_i| {
-                _ = val_i;
-                if (is_union_switch) {
-                    // For union switch, compare tag to variant index
-                    const val_node = self.tree.getNode(val_idx);
-                    if (val_node == .expr and val_node.expr == .field_access) {
-                        const variant_name = val_node.expr.field_access.field;
-                        const ut = subject_type.union_type;
-                        for (ut.variants, 0..) |v, i| {
-                            if (std.mem.eql(u8, v.name, variant_name)) {
-                                // Compare tag to variant index
-                                const idx_node = ir.Node.init(.const_int, TypeRegistry.U8, Span.fromPos(Pos.zero))
-                                    .withAux(@intCast(i));
-                                const idx_val = try fb.emit(idx_node);
-                                const cmp = ir.Node.init(.eq, TypeRegistry.BOOL, Span.fromPos(Pos.zero))
-                                    .withArgs(&.{ union_tag, idx_val });
-                                const cmp_idx = try fb.emit(cmp);
-
-                                if (cond == ir.null_node) {
-                                    cond = cmp_idx;
-                                } else {
-                                    const or_node = ir.Node.init(.@"or", TypeRegistry.BOOL, Span.fromPos(Pos.zero))
-                                        .withArgs(&.{ cond, cmp_idx });
-                                    cond = try fb.emit(or_node);
+            for (case.values) |val_idx| {
+                // Non-union switch - compare values directly
+                // Check for short-form enum variant (e.g., .kw_fn in switch)
+                var val: ir.NodeIndex = ir.null_node;
+                const val_node = self.tree.getNode(val_idx);
+                if (val_node == .expr and val_node.expr == .field_access) {
+                    const fa = val_node.expr.field_access;
+                    // Check if this is a short-form field access (base == null_node)
+                    if (fa.base == ast.null_node) {
+                        // Infer type from switch subject and look up enum variant
+                        if (subject_type == .enum_type) {
+                            const et = subject_type.enum_type;
+                            for (et.variants) |variant| {
+                                if (std.mem.eql(u8, variant.name, fa.field)) {
+                                    const const_node = ir.Node.init(.const_int, et.backing_type, Span.fromPos(Pos.zero))
+                                        .withAux(variant.value);
+                                    val = try fb.emit(const_node);
+                                    break;
                                 }
-                                break;
                             }
                         }
                     }
+                }
+                // Fall back to normal lowering if not handled above
+                if (val == ir.null_node) {
+                    val = try self.lowerExpr(val_idx);
+                }
+                // Generate comparison: subject == val
+                const cmp = ir.Node.init(.eq, TypeRegistry.BOOL, Span.fromPos(Pos.zero))
+                    .withArgs(&.{ subject, val });
+                const cmp_idx = try fb.emit(cmp);
+
+                if (cond == ir.null_node) {
+                    cond = cmp_idx;
                 } else {
-                    // Non-union switch - compare values directly
-                    // Check for short-form enum variant (e.g., .kw_fn in switch)
-                    var val: ir.NodeIndex = ir.null_node;
-                    const val_node = self.tree.getNode(val_idx);
-                    if (val_node == .expr and val_node.expr == .field_access) {
-                        const fa = val_node.expr.field_access;
-                        // Check if this is a short-form field access (base == null_node)
-                        if (fa.base == ast.null_node) {
-                            // Infer type from switch subject and look up enum variant
-                            if (subject_type == .enum_type) {
-                                const et = subject_type.enum_type;
-                                for (et.variants) |variant| {
-                                    if (std.mem.eql(u8, variant.name, fa.field)) {
-                                        const const_node = ir.Node.init(.const_int, et.backing_type, Span.fromPos(Pos.zero))
-                                            .withAux(variant.value);
-                                        val = try fb.emit(const_node);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // Fall back to normal lowering if not handled above
-                    if (val == ir.null_node) {
-                        val = try self.lowerExpr(val_idx);
-                    }
-                    // Generate comparison: subject == val
-                    const cmp = ir.Node.init(.eq, TypeRegistry.BOOL, Span.fromPos(Pos.zero))
-                        .withArgs(&.{ subject, val });
-                    const cmp_idx = try fb.emit(cmp);
-
-                    if (cond == ir.null_node) {
-                        cond = cmp_idx;
-                    } else {
-                        // OR with previous condition
-                        const or_node = ir.Node.init(.@"or", TypeRegistry.BOOL, Span.fromPos(Pos.zero))
-                            .withArgs(&.{ cond, cmp_idx });
-                        cond = try fb.emit(or_node);
-                    }
+                    // OR with previous condition
+                    const or_node = ir.Node.init(.@"or", TypeRegistry.BOOL, Span.fromPos(Pos.zero))
+                        .withArgs(&.{ cond, cmp_idx });
+                    cond = try fb.emit(or_node);
                 }
             }
 
@@ -2416,6 +2545,121 @@ pub const Lowerer = struct {
         }
 
         return result;
+    }
+
+    /// Lower union switch expression using proper control flow (branches).
+    /// This ensures only the matching case body is evaluated, avoiding side effects in other branches.
+    fn lowerUnionSwitchExpr(
+        self: *Lowerer,
+        switch_expr: ast.SwitchExpr,
+        subject: ir.NodeIndex,
+        union_type: types.UnionType,
+        result_type: TypeIndex,
+    ) Allocator.Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+
+        // Extract union tag once
+        const tag_node = ir.Node.init(.union_tag, TypeRegistry.U8, Span.fromPos(Pos.zero))
+            .withArgs(&.{subject});
+        const union_tag = try fb.emit(tag_node);
+        log.debug("  union switch (branching): extracting tag", .{});
+
+        // Allocate result local to hold the switch result
+        const result_size = self.type_reg.sizeOf(result_type);
+        const result_local = try fb.addLocalWithSize("__switch_result", result_type, true, result_size);
+
+        // Create continuation block (where all cases jump to after executing)
+        const cont_block = try fb.newBlock("switch_cont");
+
+        // Process cases in order, creating if-else chain with branches
+        for (switch_expr.cases, 0..) |case, case_i| {
+            _ = case_i;
+
+            // Get variant info from case value
+            if (case.values.len == 0) continue;
+            const val_node = self.tree.getNode(case.values[0]);
+            if (val_node != .expr or val_node.expr != .field_access) continue;
+
+            const variant_name = val_node.expr.field_access.field;
+            var variant_idx: u32 = 0;
+            var payload_type: TypeIndex = TypeRegistry.VOID;
+
+            for (union_type.variants, 0..) |v, i| {
+                if (std.mem.eql(u8, v.name, variant_name)) {
+                    variant_idx = @intCast(i);
+                    payload_type = v.type_idx;
+                    break;
+                }
+            }
+
+            // Create case block and next-check block
+            const case_block = try fb.newBlock("case");
+            const next_block = try fb.newBlock("next");
+
+            // Compare tag to variant index
+            const idx_const = ir.Node.init(.const_int, TypeRegistry.U8, Span.fromPos(Pos.zero))
+                .withAux(variant_idx);
+            const idx_val = try fb.emit(idx_const);
+            const cmp = ir.Node.init(.eq, TypeRegistry.BOOL, Span.fromPos(Pos.zero))
+                .withArgs(&.{ union_tag, idx_val });
+            const cond = try fb.emit(cmp);
+
+            // Branch: if tag matches, go to case_block; else go to next_block
+            _ = try fb.emitBranch(cond, case_block, next_block, Span.fromPos(Pos.zero));
+
+            // Switch to case block
+            fb.setBlock(case_block);
+
+            // Handle payload capture
+            if (case.capture) |capture_name| {
+                const payload_size = self.type_reg.sizeOf(payload_type);
+                const local_idx = try fb.addLocalWithSize(capture_name, payload_type, false, payload_size);
+                log.debug("  payload capture: {s} type={d} size={d}", .{ capture_name, payload_type, payload_size });
+
+                // Extract payload and store in local
+                const payload_node = ir.Node.init(.union_payload, payload_type, Span.fromPos(Pos.zero))
+                    .withAux(variant_idx)
+                    .withArgs(&.{subject});
+                const payload_val = try fb.emit(payload_node);
+
+                const store = ir.Node.init(.store, payload_type, Span.fromPos(Pos.zero))
+                    .withArgs(&.{ @intCast(local_idx), payload_val });
+                _ = try fb.emit(store);
+            }
+
+            // Evaluate case body (only evaluated when this case matches!)
+            const case_body = try self.lowerExpr(case.body);
+
+            // Store result to result local
+            const store_result = ir.Node.init(.store, result_type, Span.fromPos(Pos.zero))
+                .withArgs(&.{ @intCast(result_local), case_body });
+            _ = try fb.emit(store_result);
+
+            // Jump to continuation
+            _ = try fb.emitJump(cont_block, Span.fromPos(Pos.zero));
+
+            // Switch to next block for checking next case
+            fb.setBlock(next_block);
+        }
+
+        // Handle else body (if any) or use default value
+        if (switch_expr.else_body) |else_idx| {
+            const else_body = try self.lowerExpr(else_idx);
+            const store_else = ir.Node.init(.store, result_type, Span.fromPos(Pos.zero))
+                .withArgs(&.{ @intCast(result_local), else_body });
+            _ = try fb.emit(store_else);
+        }
+
+        // Jump to continuation (from else or fallthrough)
+        _ = try fb.emitJump(cont_block, Span.fromPos(Pos.zero));
+
+        // Switch to continuation block
+        fb.setBlock(cont_block);
+
+        // Load and return result from result local
+        const load_result = ir.Node.init(.load, result_type, Span.fromPos(Pos.zero))
+            .withArgs(&.{@intCast(result_local)});
+        return try fb.emit(load_result);
     }
 
     // ========================================================================
@@ -2445,6 +2689,12 @@ pub const Lowerer = struct {
                         if (std.mem.eql(u8, name, "bool")) return TypeRegistry.BOOL;
                         if (std.mem.eql(u8, name, "void")) return TypeRegistry.VOID;
                         if (std.mem.eql(u8, name, "string")) return TypeRegistry.STRING;
+                        // Check for type aliases in the checker's scope
+                        if (self.checker.scope.lookup(name)) |sym| {
+                            if (sym.kind == .type_name) {
+                                return sym.type_idx;
+                            }
+                        }
                         // Look up in registry
                         return self.type_reg.lookupByName(name) orelse TypeRegistry.VOID;
                     },
@@ -2453,6 +2703,27 @@ pub const Lowerer = struct {
                         const elem_type = self.resolveTypeExprNode(ptr_elem);
                         // Create pointer type in registry
                         return self.type_reg.makePointer(elem_type) catch TypeRegistry.VOID;
+                    },
+                    .list => |elem_node| {
+                        // List type: List<T>
+                        const elem_type = self.resolveTypeExprNode(elem_node);
+                        return self.type_reg.makeList(elem_type) catch TypeRegistry.VOID;
+                    },
+                    .map => |m| {
+                        // Map type: Map<K, V>
+                        const key_type = self.resolveTypeExprNode(m.key);
+                        const value_type = self.resolveTypeExprNode(m.value);
+                        return self.type_reg.makeMap(key_type, value_type) catch TypeRegistry.VOID;
+                    },
+                    .optional => |elem_node| {
+                        // Optional type: ?T
+                        const elem_type = self.resolveTypeExprNode(elem_node);
+                        return self.type_reg.makeOptional(elem_type) catch TypeRegistry.VOID;
+                    },
+                    .slice => |elem_node| {
+                        // Slice type: []T
+                        const elem_type = self.resolveTypeExprNode(elem_node);
+                        return self.type_reg.makeSlice(elem_type) catch TypeRegistry.VOID;
                     },
                     else => return TypeRegistry.VOID,
                 }

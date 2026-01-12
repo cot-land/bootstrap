@@ -9,21 +9,34 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const types = @import("types.zig");
+const check = @import("check.zig");
 
 const Ast = ast.Ast;
 const NodeIndex = ast.NodeIndex;
 const TypeIndex = types.TypeIndex;
 const TypeRegistry = types.TypeRegistry;
+const Scope = check.Scope;
 
 pub const TypeContext = struct {
     tree: *const Ast,
     type_reg: *TypeRegistry,
+    scope: ?*const Scope,
 
     /// Initialize a TypeContext with references to the AST and type registry.
     pub fn init(tree: *const Ast, type_reg: *TypeRegistry) TypeContext {
         return .{
             .tree = tree,
             .type_reg = type_reg,
+            .scope = null,
+        };
+    }
+
+    /// Initialize with scope for type alias resolution.
+    pub fn initWithScope(tree: *const Ast, type_reg: *TypeRegistry, scope: *const Scope) TypeContext {
+        return .{
+            .tree = tree,
+            .type_reg = type_reg,
+            .scope = scope,
         };
     }
 
@@ -92,6 +105,15 @@ pub const TypeContext = struct {
         if (std.mem.eql(u8, name, "bool")) return TypeRegistry.BOOL;
         if (std.mem.eql(u8, name, "string")) return self.type_reg.makeSlice(TypeRegistry.U8) catch TypeRegistry.VOID;
         if (std.mem.eql(u8, name, "void")) return TypeRegistry.VOID;
+
+        // Check for type aliases in scope
+        if (self.scope) |scope| {
+            if (scope.lookup(name)) |sym| {
+                if (sym.kind == .type_name) {
+                    return sym.type_idx;
+                }
+            }
+        }
 
         // Look up user-defined types in registry
         return self.type_reg.lookupByName(name) orelse TypeRegistry.VOID;

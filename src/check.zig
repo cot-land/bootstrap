@@ -618,12 +618,13 @@ pub const Checker = struct {
 
     /// Check literal expression.
     fn checkLiteral(self: *Checker, lit: ast.Literal) CheckError!TypeIndex {
+        _ = self;
         return switch (lit.kind) {
-            .int => TypeRegistry.INT, // Could use untyped_int for more flexibility
-            .float => TypeRegistry.FLOAT,
-            .string => try self.types.makeSlice(TypeRegistry.U8), // String literals are []u8
+            .int => TypeRegistry.UNTYPED_INT, // Untyped - can be assigned to any integer type
+            .float => TypeRegistry.UNTYPED_FLOAT, // Untyped - can be assigned to any float type
+            .string => TypeRegistry.STRING, // String literals are []u8
             .char => TypeRegistry.U8, // char is u8
-            .true_lit, .false_lit => TypeRegistry.BOOL,
+            .true_lit, .false_lit => TypeRegistry.UNTYPED_BOOL, // Untyped - can be assigned to bool
             .null_lit => invalid_type, // null needs context
         };
     }
@@ -813,15 +814,15 @@ pub const Checker = struct {
         const arg_type = try self.checkExpr(c.args[0]);
         const arg = self.types.get(arg_type);
 
-        // len() works on arrays and slices
+        // len() works on arrays, slices, and lists
         switch (arg) {
-            .array, .slice => {
+            .array, .slice, .list_type => {
                 return TypeRegistry.INT;
             },
             else => {},
         }
 
-        self.err.errorWithCode(c.span.start, .E300, "len() argument must be array or slice");
+        self.err.errorWithCode(c.span.start, .E300, "len() argument must be array, slice, or list");
         return invalid_type;
     }
 
@@ -1221,9 +1222,9 @@ pub const Checker = struct {
                     for (st.fields) |struct_field| {
                         if (std.mem.eql(u8, struct_field.name, field_init.name)) {
                             found = true;
-                            // Check the value type matches the field type
+                            // Check the value type is assignable to the field type
                             const value_type = try self.checkExpr(field_init.value);
-                            if (!self.types.equal(value_type, struct_field.type_idx)) {
+                            if (!self.isAssignable(value_type, struct_field.type_idx)) {
                                 self.err.errorWithCode(field_init.span.start, .E300, "type mismatch in field initializer");
                             }
                             break;
@@ -1401,11 +1402,15 @@ pub const Checker = struct {
             }
 
             if (first_case) {
-                result_type = body_type;
+                // Materialize untyped types for result
+                result_type = self.materializeType(body_type);
                 first_case = false;
             } else {
-                // All case bodies must have same type
-                if (!self.types.equal(result_type, body_type)) {
+                // All case bodies must be compatible with result type
+                // Allow untyped -> typed conversions (e.g., untyped_int -> int)
+                const compatible = self.types.equal(result_type, body_type) or
+                    self.isAssignable(body_type, result_type);
+                if (!compatible) {
                     self.err.errorWithCode(case.span.start, .E300, "switch case has different type than previous cases");
                 }
             }
@@ -1414,11 +1419,15 @@ pub const Checker = struct {
         // Check else body if present
         if (se.else_body) |else_idx| {
             const else_type = try self.checkExpr(else_idx);
-            if (!first_case and !self.types.equal(result_type, else_type)) {
-                self.err.errorWithCode(se.span.start, .E300, "switch else has different type than cases");
+            if (!first_case) {
+                const compatible = self.types.equal(result_type, else_type) or
+                    self.isAssignable(else_type, result_type);
+                if (!compatible) {
+                    self.err.errorWithCode(se.span.start, .E300, "switch else has different type than cases");
+                }
             }
             if (first_case) {
-                result_type = else_type;
+                result_type = self.materializeType(else_type);
             }
         }
 

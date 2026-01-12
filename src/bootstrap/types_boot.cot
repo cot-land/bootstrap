@@ -1,0 +1,563 @@
+// Type representation for cot bootstrap.
+// Simplified version using only currently-supported features.
+//
+// Changes from original types.zig:
+// - Standalone functions instead of methods on enums
+// - List<Type> for storage (runtime FFI)
+// - No format/print methods (complex writer interface)
+
+// =============================================================================
+// Type Index
+// =============================================================================
+
+type TypeIndex = int
+const invalid_type: int = @maxInt(i64)
+
+// =============================================================================
+// Basic Types
+// =============================================================================
+
+enum BasicKind: u8 {
+    invalid,
+    bool_type,
+    i8_type,
+    i16_type,
+    i32_type,
+    i64_type,
+    u8_type,
+    u16_type,
+    u32_type,
+    u64_type,
+    f32_type,
+    f64_type,
+    void_type,
+    untyped_int,
+    untyped_float,
+    untyped_bool,
+    untyped_null,
+}
+
+fn basicKindName(kind: BasicKind) string {
+    return switch kind {
+        .invalid => "invalid",
+        .bool_type => "bool",
+        .i8_type => "i8",
+        .i16_type => "i16",
+        .i32_type => "i32",
+        .i64_type => "i64",
+        .u8_type => "u8",
+        .u16_type => "u16",
+        .u32_type => "u32",
+        .u64_type => "u64",
+        .f32_type => "f32",
+        .f64_type => "f64",
+        .void_type => "void",
+        .untyped_int => "untyped int",
+        .untyped_float => "untyped float",
+        .untyped_bool => "untyped bool",
+        .untyped_null => "untyped null",
+    }
+}
+
+fn basicKindIsInteger(kind: BasicKind) bool {
+    return switch kind {
+        .i8_type => true,
+        .i16_type => true,
+        .i32_type => true,
+        .i64_type => true,
+        .u8_type => true,
+        .u16_type => true,
+        .u32_type => true,
+        .u64_type => true,
+        .untyped_int => true,
+        else => false,
+    }
+}
+
+fn basicKindIsSigned(kind: BasicKind) bool {
+    return switch kind {
+        .i8_type => true,
+        .i16_type => true,
+        .i32_type => true,
+        .i64_type => true,
+        else => false,
+    }
+}
+
+fn basicKindIsFloat(kind: BasicKind) bool {
+    return switch kind {
+        .f32_type => true,
+        .f64_type => true,
+        .untyped_float => true,
+        else => false,
+    }
+}
+
+fn basicKindIsNumeric(kind: BasicKind) bool {
+    return basicKindIsInteger(kind) or basicKindIsFloat(kind)
+}
+
+fn basicKindIsUntyped(kind: BasicKind) bool {
+    return switch kind {
+        .untyped_int => true,
+        .untyped_float => true,
+        .untyped_bool => true,
+        .untyped_null => true,
+        else => false,
+    }
+}
+
+fn basicKindSize(kind: BasicKind) int {
+    return switch kind {
+        .bool_type => 1,
+        .i8_type => 1,
+        .u8_type => 1,
+        .i16_type => 2,
+        .u16_type => 2,
+        .i32_type => 4,
+        .u32_type => 4,
+        .f32_type => 4,
+        .i64_type => 8,
+        .u64_type => 8,
+        .f64_type => 8,
+        else => 0,
+    }
+}
+
+// =============================================================================
+// Composite Types
+// =============================================================================
+
+struct PointerType {
+    elem: TypeIndex,
+}
+
+struct OptionalType {
+    elem: TypeIndex,
+}
+
+struct SliceType {
+    elem: TypeIndex,
+}
+
+struct ArrayType {
+    elem: TypeIndex,
+    length: int,
+}
+
+struct StructField {
+    name: string,
+    type_idx: TypeIndex,
+    offset: int,
+}
+
+struct StructType {
+    name: string,
+    fields: []StructField,
+    size: int,
+    alignment: int,
+}
+
+struct EnumVariant {
+    name: string,
+    value: int,
+}
+
+struct EnumType {
+    name: string,
+    backing_type: TypeIndex,
+    variants: []EnumVariant,
+}
+
+struct UnionVariant {
+    name: string,
+    type_idx: TypeIndex,
+}
+
+struct UnionType {
+    name: string,
+    variants: []UnionVariant,
+    tag_type: TypeIndex,
+}
+
+struct FuncParam {
+    name: string,
+    type_idx: TypeIndex,
+}
+
+struct FuncType {
+    params: []FuncParam,
+    return_type: TypeIndex,
+}
+
+struct NamedType {
+    name: string,
+    underlying: TypeIndex,
+}
+
+struct MapType {
+    key: TypeIndex,
+    value: TypeIndex,
+}
+
+struct ListType {
+    elem: TypeIndex,
+}
+
+// =============================================================================
+// Fixed Types (for DBL compatibility)
+// =============================================================================
+
+struct AlphaType {
+    length: int,
+}
+
+struct DecimalType {
+    precision: int,
+    scale: int,
+}
+
+// =============================================================================
+// Type Union
+// =============================================================================
+
+union Type {
+    basic: BasicKind,
+    alpha_type: AlphaType,
+    decimal_type: DecimalType,
+    pointer: PointerType,
+    optional: OptionalType,
+    slice: SliceType,
+    array: ArrayType,
+    struct_type: StructType,
+    enum_type: EnumType,
+    union_type: UnionType,
+    func: FuncType,
+    named: NamedType,
+    map_type: MapType,
+    list_type: ListType,
+}
+
+// =============================================================================
+// Pre-defined Type Indices
+// =============================================================================
+
+const TYPE_INVALID: TypeIndex = 0
+const TYPE_BOOL: TypeIndex = 1
+const TYPE_I8: TypeIndex = 2
+const TYPE_I16: TypeIndex = 3
+const TYPE_I32: TypeIndex = 4
+const TYPE_I64: TypeIndex = 5
+const TYPE_U8: TypeIndex = 6
+const TYPE_U16: TypeIndex = 7
+const TYPE_U32: TypeIndex = 8
+const TYPE_U64: TypeIndex = 9
+const TYPE_F32: TypeIndex = 10
+const TYPE_F64: TypeIndex = 11
+const TYPE_VOID: TypeIndex = 12
+const TYPE_STRING: TypeIndex = 13
+
+// Type aliases
+const TYPE_INT: TypeIndex = 5
+const TYPE_FLOAT: TypeIndex = 11
+const TYPE_BYTE: TypeIndex = 6
+
+// =============================================================================
+// Type Registry
+// =============================================================================
+
+struct TypeRegistry {
+    types: List<Type>,
+}
+
+fn typeRegistryInit() TypeRegistry {
+    var reg: TypeRegistry = TypeRegistry{
+        .types = new List<Type>(),
+    }
+
+    // Pre-register basic types in order (indices 0-13)
+    reg.types.push(Type.basic(BasicKind.invalid))
+    reg.types.push(Type.basic(BasicKind.bool_type))
+    reg.types.push(Type.basic(BasicKind.i8_type))
+    reg.types.push(Type.basic(BasicKind.i16_type))
+    reg.types.push(Type.basic(BasicKind.i32_type))
+    reg.types.push(Type.basic(BasicKind.i64_type))
+    reg.types.push(Type.basic(BasicKind.u8_type))
+    reg.types.push(Type.basic(BasicKind.u16_type))
+    reg.types.push(Type.basic(BasicKind.u32_type))
+    reg.types.push(Type.basic(BasicKind.u64_type))
+    reg.types.push(Type.basic(BasicKind.f32_type))
+    reg.types.push(Type.basic(BasicKind.f64_type))
+    reg.types.push(Type.basic(BasicKind.void_type))
+    reg.types.push(Type.slice(SliceType{ .elem = TYPE_U8 }))
+
+    return reg
+}
+
+fn typeRegistryGet(reg: TypeRegistry, idx: TypeIndex) Type {
+    if idx == invalid_type {
+        return Type.basic(BasicKind.invalid)
+    }
+    if idx >= len(reg.types) {
+        return Type.basic(BasicKind.invalid)
+    }
+    return reg.types.get(idx)
+}
+
+fn typeRegistryAdd(reg: TypeRegistry, t: Type) TypeIndex {
+    var idx: TypeIndex = len(reg.types)
+    reg.types.push(t)
+    return idx
+}
+
+fn typeRegistrySizeOf(reg: TypeRegistry, idx: TypeIndex) int {
+    var t: Type = typeRegistryGet(reg, idx)
+    return switch t {
+        .basic |b| => basicKindSize(b),
+        .pointer |p| => 8,
+        .optional |o| => typeRegistrySizeOf(reg, o.elem) + 8,
+        .slice |s| => 16,
+        .array |a| => typeRegistrySizeOf(reg, a.elem) * a.length,
+        .struct_type |st| => st.size,
+        .enum_type |e| => typeRegistrySizeOf(reg, e.backing_type),
+        .union_type |u| => typeRegistryUnionSize(reg, u),
+        .map_type |m| => 8,
+        .list_type |l| => 8,
+        .alpha_type |a| => a.length,
+        .decimal_type |d| => 8,
+        .func |f| => 8,
+        .named |n| => typeRegistrySizeOf(reg, n.underlying),
+    }
+}
+
+fn typeRegistryUnionSize(reg: TypeRegistry, u: UnionType) int {
+    var max_payload: int = 0
+    for v in u.variants {
+        if v.type_idx != invalid_type {
+            var payload_size: int = typeRegistrySizeOf(reg, v.type_idx)
+            if payload_size > max_payload {
+                max_payload = payload_size
+            }
+        }
+    }
+    // 8-byte tag + max payload aligned to 8
+    var payload_aligned: int = ((max_payload + 7) / 8) * 8
+    return 8 + payload_aligned
+}
+
+fn typeRegistryMakePointer(reg: TypeRegistry, elem: TypeIndex) TypeIndex {
+    return typeRegistryAdd(reg, Type.pointer(PointerType{ .elem = elem }))
+}
+
+fn typeRegistryMakeOptional(reg: TypeRegistry, elem: TypeIndex) TypeIndex {
+    return typeRegistryAdd(reg, Type.optional(OptionalType{ .elem = elem }))
+}
+
+fn typeRegistryMakeSlice(reg: TypeRegistry, elem: TypeIndex) TypeIndex {
+    return typeRegistryAdd(reg, Type.slice(SliceType{ .elem = elem }))
+}
+
+fn typeRegistryMakeArray(reg: TypeRegistry, elem: TypeIndex, length: int) TypeIndex {
+    return typeRegistryAdd(reg, Type.array(ArrayType{ .elem = elem, .length = length }))
+}
+
+fn typeRegistryMakeMap(reg: TypeRegistry, key: TypeIndex, value: TypeIndex) TypeIndex {
+    return typeRegistryAdd(reg, Type.map_type(MapType{ .key = key, .value = value }))
+}
+
+fn typeRegistryMakeList(reg: TypeRegistry, elem: TypeIndex) TypeIndex {
+    return typeRegistryAdd(reg, Type.list_type(ListType{ .elem = elem }))
+}
+
+fn typeRegistryLookupBasic(name: string) TypeIndex {
+    if name == "bool" { return TYPE_BOOL }
+    if name == "i8" { return TYPE_I8 }
+    if name == "i16" { return TYPE_I16 }
+    if name == "i32" { return TYPE_I32 }
+    if name == "i64" { return TYPE_I64 }
+    if name == "u8" { return TYPE_U8 }
+    if name == "u16" { return TYPE_U16 }
+    if name == "u32" { return TYPE_U32 }
+    if name == "u64" { return TYPE_U64 }
+    if name == "f32" { return TYPE_F32 }
+    if name == "f64" { return TYPE_F64 }
+    if name == "void" { return TYPE_VOID }
+    if name == "int" { return TYPE_INT }
+    if name == "float" { return TYPE_FLOAT }
+    if name == "byte" { return TYPE_BYTE }
+    if name == "string" { return TYPE_STRING }
+    return invalid_type
+}
+
+fn typeRegistryLookupByName(reg: TypeRegistry, name: string) TypeIndex {
+    // Check basic types first
+    var basic_idx: TypeIndex = typeRegistryLookupBasic(name)
+    if basic_idx != invalid_type {
+        return basic_idx
+    }
+
+    // Search user-defined types
+    var i: int = 0
+    while i < len(reg.types) {
+        var t: Type = reg.types.get(i)
+        // Check each named type variant
+        var match: bool = switch t {
+            .struct_type |st| => st.name == name,
+            .enum_type |et| => et.name == name,
+            .union_type |ut| => ut.name == name,
+            else => false,
+        }
+        if match {
+            return i
+        }
+        i = i + 1
+    }
+    return invalid_type
+}
+
+fn typeRegistryEqual(reg: TypeRegistry, a: TypeIndex, b: TypeIndex) bool {
+    if a == b {
+        return true
+    }
+
+    var ta: Type = typeRegistryGet(reg, a)
+    var tb: Type = typeRegistryGet(reg, b)
+
+    // Helper to check if types match by variant
+    var result: bool = switch ta {
+        .basic |ka| => typeEqualBasic(ka, tb),
+        .pointer |pa| => typeEqualPointer(reg, pa, tb),
+        .optional |oa| => typeEqualOptional(reg, oa, tb),
+        .slice |sa| => typeEqualSlice(reg, sa, tb),
+        .array |aa| => typeEqualArray(reg, aa, tb),
+        else => false,
+    }
+    return result
+}
+
+fn typeEqualBasic(ka: BasicKind, tb: Type) bool {
+    return switch tb {
+        .basic |kb| => ka == kb,
+        else => false,
+    }
+}
+
+fn typeEqualPointer(reg: TypeRegistry, pa: PointerType, tb: Type) bool {
+    return switch tb {
+        .pointer |pb| => typeRegistryEqual(reg, pa.elem, pb.elem),
+        else => false,
+    }
+}
+
+fn typeEqualOptional(reg: TypeRegistry, oa: OptionalType, tb: Type) bool {
+    return switch tb {
+        .optional |ob| => typeRegistryEqual(reg, oa.elem, ob.elem),
+        else => false,
+    }
+}
+
+fn typeEqualSlice(reg: TypeRegistry, sa: SliceType, tb: Type) bool {
+    return switch tb {
+        .slice |sb| => typeRegistryEqual(reg, sa.elem, sb.elem),
+        else => false,
+    }
+}
+
+fn typeEqualArray(reg: TypeRegistry, aa: ArrayType, tb: Type) bool {
+    return switch tb {
+        .array |ab| => aa.length == ab.length and typeRegistryEqual(reg, aa.elem, ab.elem),
+        else => false,
+    }
+}
+
+fn typeRegistryIsAssignable(reg: TypeRegistry, from: TypeIndex, to: TypeIndex) bool {
+    if typeRegistryEqual(reg, from, to) {
+        return true
+    }
+
+    var tf: Type = typeRegistryGet(reg, from)
+    var tt: Type = typeRegistryGet(reg, to)
+
+    var result: bool = switch tf {
+        .basic |kf| => isAssignableBasic(kf, tt),
+        else => false,
+    }
+    return result
+}
+
+fn isAssignableBasic(kf: BasicKind, tt: Type) bool {
+    return switch tt {
+        .basic |kt| => isAssignableBasicToBasic(kf, kt),
+        .optional |o| => true,
+        else => false,
+    }
+}
+
+fn isAssignableBasicToBasic(kf: BasicKind, kt: BasicKind) bool {
+    if kf == BasicKind.untyped_int and basicKindIsInteger(kt) {
+        return true
+    }
+    if kf == BasicKind.untyped_float and basicKindIsFloat(kt) {
+        return true
+    }
+    if kf == BasicKind.untyped_bool and kt == BasicKind.bool_type {
+        return true
+    }
+    return false
+}
+
+// =============================================================================
+// Simple test
+// =============================================================================
+
+fn main() int {
+    // Test type registry initialization
+    var reg: TypeRegistry = typeRegistryInit()
+
+    // Test basic type retrieval
+    var bool_type: Type = typeRegistryGet(reg, TYPE_BOOL)
+    var is_bool: bool = switch bool_type {
+        .basic |k| => k == BasicKind.bool_type,
+        else => false,
+    }
+    if not is_bool {
+        return 1
+    }
+
+    // Test basic lookup
+    var int_idx: TypeIndex = typeRegistryLookupBasic("int")
+    if int_idx != TYPE_INT {
+        return 2
+    }
+
+    // Test size calculation
+    var i64_size: int = typeRegistrySizeOf(reg, TYPE_I64)
+    if i64_size != 8 {
+        return 3
+    }
+
+    // Test making a pointer type
+    var ptr_int: TypeIndex = typeRegistryMakePointer(reg, TYPE_INT)
+    var ptr_type: Type = typeRegistryGet(reg, ptr_int)
+    var is_ptr: bool = switch ptr_type {
+        .pointer |p| => p.elem == TYPE_INT,
+        else => false,
+    }
+    if not is_ptr {
+        return 4
+    }
+
+    // Test type equality
+    if not typeRegistryEqual(reg, TYPE_INT, TYPE_I64) {
+        return 5
+    }
+
+    // Test slice type
+    var slice_u8: TypeIndex = typeRegistryMakeSlice(reg, TYPE_U8)
+    var slice_size: int = typeRegistrySizeOf(reg, slice_u8)
+    if slice_size != 16 {
+        return 6
+    }
+
+    return 42
+}

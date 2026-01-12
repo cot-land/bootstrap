@@ -382,23 +382,23 @@ pub const Driver = struct {
             switch (node.op) {
                 // Terminators set block metadata, not values
                 .branch => {
-                    // args[0] = condition, args[1] = then_block, args[2] = else_block
+                    // Use ir.Node accessors for branch format (single source of truth)
                     ssa_block.kind = .@"if";
 
                     // Get condition SSA value
-                    if (node.args_len >= 1) {
-                        if (ir_to_ssa.get(node.args()[0])) |cond_ssa| {
+                    if (node.getBranchCondition()) |cond_ir| {
+                        if (ir_to_ssa.get(cond_ir)) |cond_ssa| {
                             ssa_block.setControl(cond_ssa);
                         }
                     }
 
-                    // Set successors (then_block = succs[0], else_block = succs[1])
-                    if (node.args_len >= 3) {
-                        const then_ir_block = node.args()[1];
-                        const else_ir_block = node.args()[2];
+                    // Set successors using accessor methods
+                    if (node.getBranchThenBlock()) |then_ir_block| {
                         if (ir_block_to_ssa.get(then_ir_block)) |then_ssa| {
                             _ = ssa_block.addSucc(then_ssa);
                         }
+                    }
+                    if (node.getBranchElseBlock()) |else_ir_block| {
                         if (ir_block_to_ssa.get(else_ir_block)) |else_ssa| {
                             _ = ssa_block.addSucc(else_ssa);
                         }
@@ -667,12 +667,15 @@ pub const Driver = struct {
 
     fn generateAArch64Function(self: *Driver, buf: *be.CodeBuffer, func: *ssa.Func, string_infos: []const StringInfo) !void {
         const type_reg = self.type_reg orelse return error.NoTypeRegistry;
-        // +16 for fp/lr, +32 for spill slots (frame_size already includes space for struct return temps)
-        // Spill padding ensures spill slots don't overlap with locals
-        const spill_padding: u32 = 32; // 4 spill slots
-        const stack_size = alignTo(func.frame_size + 16 + spill_padding, 16);
 
-        // Create CodeGen with integrated register allocation
+        // Pre-analyze SSA to estimate spill requirements before codegen
+        // This avoids the complexity of body-first with separate epilogue patching
+        const estimated_spill = estimateSpillRequirements(func, type_reg);
+
+        // Stack size: frame_size (locals) + 16 (fp/lr) + estimated spill space
+        const stack_size = alignTo(func.frame_size + 16 + estimated_spill, 16);
+
+        // Create CodeGen with pre-calculated stack size
         var cg = arm64_codegen.CodeGen.init(
             self.allocator,
             buf,
@@ -707,7 +710,7 @@ pub const Driver = struct {
             for (block.values.items) |vid| {
                 const value = &func.values.items[vid];
                 try cg.genValue(value);
-                cg.advanceInst(); // Track instruction progress for liveness
+                cg.advanceInst();
             }
 
             // Generate block terminator
@@ -721,7 +724,6 @@ pub const Driver = struct {
                 else
                     null;
                 if (next_block == null or target != next_block.?) {
-                    // B (unconditional branch)
                     try aarch64.bImm(buf, 0);
                     try jump_patches.append(self.allocator, .{
                         .patch_offset = @intCast(buf.pos()),
@@ -731,8 +733,6 @@ pub const Driver = struct {
             } else if (block.kind == .@"if" and block.numSuccs() >= 2 and block.control != ssa.null_value) {
                 const cond_mcv = cg.getValue(block.control);
                 try cg.loadToReg(arm64_codegen.scratch0, cond_mcv);
-                // CBZ/CBNZ - if zero branch to else, otherwise fall through to then
-                // Or use CMP + conditional branch
 
                 const then_block = block.succs()[0].block;
                 const else_block = block.succs()[1].block;
@@ -742,14 +742,12 @@ pub const Driver = struct {
                     null;
 
                 if (next_block != null and else_block == next_block.?) {
-                    // CBNZ to then_block, fallthrough to else
                     try aarch64.cbnz(buf, arm64_codegen.scratch0, 0);
                     try jump_patches.append(self.allocator, .{
                         .patch_offset = @intCast(buf.pos()),
                         .target_block = then_block,
                     });
                 } else {
-                    // CBNZ to then_block, B to else_block
                     try aarch64.cbnz(buf, arm64_codegen.scratch0, 0);
                     try jump_patches.append(self.allocator, .{
                         .patch_offset = @intCast(buf.pos()),
@@ -771,11 +769,78 @@ pub const Driver = struct {
                 block_offsets.items[patch.target_block]
             else
                 @as(u32, @intCast(buf.pos()));
-            // ARM64 branch offset is relative to instruction address (patch_offset - 4)
             const inst_addr = patch.patch_offset - 4;
             const rel_offset: i32 = (@as(i32, @intCast(target_offset)) - @as(i32, @intCast(inst_addr))) >> 2;
             aarch64.patchBranch(buf, patch.patch_offset, rel_offset);
         }
+    }
+
+    /// Pre-analyze SSA to estimate spill space requirements.
+    /// This counts operations that need temporary stack space:
+    /// - list_push with large elements (>8 bytes) needs temp storage
+    /// - Register spills for complex expressions
+    fn estimateSpillRequirements(func: *ssa.Func, type_reg: *types.TypeRegistry) u32 {
+        var estimated: u32 = 64; // Base spill space for register pressure
+
+        for (func.blocks.items) |*block| {
+            for (block.values.items) |vid| {
+                const value = &func.values.items[vid];
+                switch (value.op) {
+                    .list_push => {
+                        // list_push with large elements needs temp space
+                        if (value.args().len >= 2) {
+                            const elem_val = &func.values.items[value.args()[1]];
+                            const elem_size = type_reg.sizeOf(elem_val.type_idx);
+                            if (elem_size > 8) {
+                                estimated += alignTo(elem_size, 8);
+                            }
+                        }
+                    },
+                    .union_init => {
+                        // union_init builds large unions (>16 bytes) on stack
+                        const union_size = type_reg.sizeOf(value.type_idx);
+                        if (union_size > 16) {
+                            estimated += alignTo(union_size, 8);
+                        } else {
+                            estimated += 8;
+                        }
+                    },
+                    .call => {
+                        // Function calls may need to spill caller-saved registers
+                        estimated += 64;
+                    },
+                    .eq, .ne => {
+                        // String comparisons generate calls to cot_str_eq
+                        // which need spill space for caller-saved registers
+                        const args = value.args();
+                        if (args.len >= 1) {
+                            const left_val = &func.values.items[args[0]];
+                            const left_type = type_reg.get(left_val.type_idx);
+                            if (left_type == .slice) {
+                                estimated += 32; // Spill space for string comparison call
+                            }
+                        }
+                    },
+                    .list_get => {
+                        // list_get with large elements needs space to copy result
+                        const elem_size = type_reg.sizeOf(value.type_idx);
+                        if (elem_size > 8) {
+                            estimated += alignTo(elem_size, 8);
+                        }
+                    },
+                    .select => {
+                        // select on slice types uses 16 bytes of spill space
+                        const ret_type = type_reg.get(value.type_idx);
+                        if (ret_type == .slice) {
+                            estimated += 16;
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        return estimated;
     }
 
     // ========================================================================

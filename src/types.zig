@@ -325,6 +325,11 @@ pub const TypeRegistry = struct {
     pub const VOID: TypeIndex = 12;
     pub const STRING: TypeIndex = 13; // []u8 slice (string alias)
 
+    // Untyped literals (resolved during type checking)
+    pub const UNTYPED_INT: TypeIndex = 14;
+    pub const UNTYPED_FLOAT: TypeIndex = 15;
+    pub const UNTYPED_BOOL: TypeIndex = 16;
+
     // Type aliases (cot's friendly names)
     pub const INT: TypeIndex = I64; // int = i64
     pub const FLOAT: TypeIndex = F64; // float = f64
@@ -351,6 +356,11 @@ pub const TypeRegistry = struct {
         try reg.types.append(allocator, .{ .basic = .f64_type }); // 11
         try reg.types.append(allocator, .{ .basic = .void_type }); // 12
         try reg.types.append(allocator, .{ .slice = .{ .elem = U8 } }); // 13 = []u8 (string)
+
+        // Untyped literals
+        try reg.types.append(allocator, .{ .basic = .untyped_int }); // 14
+        try reg.types.append(allocator, .{ .basic = .untyped_float }); // 15
+        try reg.types.append(allocator, .{ .basic = .untyped_bool }); // 16
 
         return reg;
     }
@@ -514,6 +524,14 @@ pub const TypeRegistry = struct {
             },
             .array => |aa| switch (tb) {
                 .array => |ab| aa.length == ab.length and self.equal(aa.elem, ab.elem),
+                else => false,
+            },
+            .list_type => |la| switch (tb) {
+                .list_type => |lb| self.equal(la.elem, lb.elem),
+                else => false,
+            },
+            .map_type => |ma| switch (tb) {
+                .map_type => |mb| self.equal(ma.key, mb.key) and self.equal(ma.value, mb.value),
                 else => false,
             },
             else => false, // struct, func, named need more complex comparison
@@ -697,4 +715,22 @@ test "basic kind properties" {
     try std.testing.expect(BasicKind.f64_type.isNumeric());
     try std.testing.expect(BasicKind.untyped_int.isUntyped());
     try std.testing.expectEqual(@as(u8, 8), BasicKind.i64_type.size());
+}
+
+test "isAssignable untyped to typed" {
+    var reg = try TypeRegistry.init(std.testing.allocator);
+    defer reg.deinit();
+
+    // Create untyped_int type
+    const untyped_int_idx = try reg.add(.{ .basic = .untyped_int });
+
+    // untyped_int should be assignable to all integer types
+    try std.testing.expect(reg.isAssignable(untyped_int_idx, TypeRegistry.I64));
+    try std.testing.expect(reg.isAssignable(untyped_int_idx, TypeRegistry.I32));
+    try std.testing.expect(reg.isAssignable(untyped_int_idx, TypeRegistry.U32));
+    try std.testing.expect(reg.isAssignable(untyped_int_idx, TypeRegistry.U8));
+
+    // untyped_int should NOT be assignable to float or bool
+    try std.testing.expect(!reg.isAssignable(untyped_int_idx, TypeRegistry.F64));
+    try std.testing.expect(!reg.isAssignable(untyped_int_idx, TypeRegistry.BOOL));
 }
