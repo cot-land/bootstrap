@@ -1,0 +1,611 @@
+// Abstract Syntax Tree node definitions for cot bootstrap.
+// Simplified version using only currently-supported features.
+//
+// Changes from original ast.cot:
+// - No imports (Pos, Span, Token inlined)
+// - No optional types (?NodeIndex) - use null_node sentinel instead
+// - Standalone functions instead of methods on unions
+// - Module-level const uses literal instead of @maxInt
+
+// =============================================================================
+// Inlined from source_boot.cot
+// =============================================================================
+
+struct Pos {
+    offset: int,
+}
+
+const zero_pos: Pos = Pos{ .offset = 0 }
+
+fn posFromOffset(offset: int) Pos {
+    return Pos{ .offset = offset }
+}
+
+struct Span {
+    start: Pos,
+    end: Pos,
+}
+
+fn spanInit(s: Pos, e: Pos) Span {
+    return Span{ .start = s, .end = e }
+}
+
+fn spanFromPos(pos: Pos) Span {
+    return Span{ .start = pos, .end = pos }
+}
+
+// =============================================================================
+// Inlined Token enum (minimal subset needed for AST)
+// =============================================================================
+
+enum Token: u8 {
+    eof,
+    invalid,
+    identifier,
+    int_literal,
+    float_literal,
+    string_literal,
+    char_literal,
+    plus,
+    minus,
+    star,
+    slash,
+    percent,
+    ampersand,
+    pipe,
+    caret,
+    bang,
+    equal,
+    less,
+    greater,
+    dot,
+    question,
+    plus_equal,
+    minus_equal,
+    star_equal,
+    slash_equal,
+    equal_equal,
+    bang_equal,
+    less_equal,
+    greater_equal,
+    question_question,
+    kw_and,
+    kw_or,
+    kw_not,
+}
+
+// =============================================================================
+// Core Types
+// =============================================================================
+
+type NodeIndex = u32
+const null_node: u32 = @maxInt(u32)
+
+type NodeList = []NodeIndex
+
+// =============================================================================
+// Helper structs (must be defined before use)
+// =============================================================================
+
+struct Field {
+    name: string,
+    type_expr: NodeIndex,
+    span: Span,
+}
+
+struct EnumVariant {
+    name: string,
+    value: NodeIndex,         // null_node = auto
+    span: Span,
+}
+
+struct UnionVariant {
+    name: string,
+    type_expr: NodeIndex,     // null_node = unit variant
+    span: Span,
+}
+
+struct FieldInit {
+    name: string,
+    value: NodeIndex,
+    span: Span,
+}
+
+struct SwitchCase {
+    values: []NodeIndex,
+    body: NodeIndex,
+    capture: string,          // empty string = no capture
+    span: Span,
+}
+
+// String interpolation segment
+enum SegmentTag: u8 {
+    text_seg,
+    expr_seg,
+}
+
+struct StringSegment {
+    tag: SegmentTag,
+    text_value: string,       // used if tag == text_seg
+    expr_value: NodeIndex,    // used if tag == expr_seg
+}
+
+// =============================================================================
+// Type expression helpers
+// =============================================================================
+
+struct TypeArray {
+    size: NodeIndex,
+    elem: NodeIndex,
+}
+
+struct TypeFunction {
+    params: []NodeIndex,
+    return_type: NodeIndex,   // null_node = void
+}
+
+struct TypeMap {
+    key: NodeIndex,
+    value: NodeIndex,
+}
+
+enum TypeKindTag: u8 {
+    named,
+    pointer,
+    optional,
+    slice,
+    array,
+    function,
+    map_type,
+    list_type,
+}
+
+// Type expression with flattened kind representation
+struct TypeExprNode {
+    kind_tag: TypeKindTag,
+    // Fields used depending on kind_tag:
+    name: string,             // for named
+    inner: NodeIndex,         // for pointer, optional, slice, list
+    arr: TypeArray,           // for array
+    func: TypeFunction,       // for function
+    map_t: TypeMap,           // for map
+    span: Span,
+}
+
+// =============================================================================
+// File (top-level)
+// =============================================================================
+
+struct File {
+    filename: string,
+    decls: []NodeIndex,
+    span: Span,
+}
+
+// =============================================================================
+// Declarations
+// =============================================================================
+
+enum DeclTag: u8 {
+    fn_decl,
+    var_decl,
+    const_decl,
+    struct_decl,
+    enum_decl,
+    union_decl,
+    type_alias,
+    bad_decl,
+}
+
+struct FnDecl {
+    name: string,
+    params: []Field,
+    return_type: NodeIndex,   // null_node = void
+    body: NodeIndex,          // null_node = forward declaration
+    span: Span,
+}
+
+struct VarDecl {
+    name: string,
+    type_expr: NodeIndex,     // null_node = inferred
+    value: NodeIndex,         // null_node = uninitialized
+    span: Span,
+}
+
+struct ConstDecl {
+    name: string,
+    type_expr: NodeIndex,     // null_node = inferred
+    value: NodeIndex,
+    span: Span,
+}
+
+struct StructDecl {
+    name: string,
+    fields: []Field,
+    span: Span,
+}
+
+struct EnumDecl {
+    name: string,
+    backing_type: NodeIndex,  // null_node = default
+    variants: []EnumVariant,
+    span: Span,
+}
+
+struct UnionDecl {
+    name: string,
+    variants: []UnionVariant,
+    span: Span,
+}
+
+struct TypeAliasDecl {
+    name: string,
+    target_type: NodeIndex,
+    span: Span,
+}
+
+struct BadDecl {
+    span: Span,
+}
+
+// Tagged union for declarations
+union Decl {
+    fn_decl: FnDecl,
+    var_decl: VarDecl,
+    const_decl: ConstDecl,
+    struct_decl: StructDecl,
+    enum_decl: EnumDecl,
+    union_decl: UnionDecl,
+    type_alias: TypeAliasDecl,
+    bad_decl: BadDecl,
+}
+
+fn declSpan(d: Decl) Span {
+    return switch d {
+        .fn_decl |v| => v.span,
+        .var_decl |v| => v.span,
+        .const_decl |v| => v.span,
+        .struct_decl |v| => v.span,
+        .enum_decl |v| => v.span,
+        .union_decl |v| => v.span,
+        .type_alias |v| => v.span,
+        .bad_decl |v| => v.span,
+    }
+}
+
+// =============================================================================
+// Expressions
+// =============================================================================
+
+enum ExprTag: u8 {
+    identifier,
+    literal,
+    binary,
+    unary,
+    call,
+    index_expr,
+    slice_expr,
+    field_access,
+    array_literal,
+    paren,
+    if_expr,
+    switch_expr,
+    block,
+    struct_init,
+    new_expr,
+    string_interp,
+    optional_unwrap,
+    type_expr,
+    bad_expr,
+}
+
+struct Identifier {
+    name: string,
+    span: Span,
+}
+
+enum LiteralKind: u8 {
+    int_lit,
+    float_lit,
+    string_lit,
+    char_lit,
+    true_lit,
+    false_lit,
+    null_lit,
+}
+
+struct Literal {
+    kind: LiteralKind,
+    value: string,
+    span: Span,
+}
+
+struct Binary {
+    op: Token,
+    left: NodeIndex,
+    right: NodeIndex,
+    span: Span,
+}
+
+struct Unary {
+    op: Token,
+    operand: NodeIndex,
+    span: Span,
+}
+
+struct Call {
+    callee: NodeIndex,
+    args: []NodeIndex,
+    span: Span,
+}
+
+struct Index {
+    base: NodeIndex,
+    idx: NodeIndex,
+    span: Span,
+}
+
+struct SliceExpr {
+    base: NodeIndex,
+    start_idx: NodeIndex,     // null_node = from beginning
+    end_idx: NodeIndex,       // null_node = to end
+    span: Span,
+}
+
+struct FieldAccess {
+    base: NodeIndex,
+    field: string,
+    span: Span,
+}
+
+struct ArrayLiteral {
+    elements: []NodeIndex,
+    span: Span,
+}
+
+struct Paren {
+    inner: NodeIndex,
+    span: Span,
+}
+
+struct IfExpr {
+    condition: NodeIndex,
+    then_branch: NodeIndex,
+    else_branch: NodeIndex,   // null_node = no else
+    span: Span,
+}
+
+struct SwitchExpr {
+    subject: NodeIndex,
+    cases: []SwitchCase,
+    else_body: NodeIndex,     // null_node = no else
+    span: Span,
+}
+
+struct Block {
+    stmts: []NodeIndex,
+    expr: NodeIndex,          // null_node = no result expression
+    span: Span,
+}
+
+struct StructInit {
+    type_name: string,
+    fields: []FieldInit,
+    span: Span,
+}
+
+struct NewExpr {
+    type_expr: NodeIndex,
+    span: Span,
+}
+
+struct StringInterp {
+    segments: []StringSegment,
+    span: Span,
+}
+
+struct OptionalUnwrap {
+    operand: NodeIndex,
+    span: Span,
+}
+
+struct BadExpr {
+    span: Span,
+}
+
+// Tagged union for expressions
+union Expr {
+    identifier: Identifier,
+    literal: Literal,
+    binary: Binary,
+    unary: Unary,
+    call: Call,
+    index_expr: Index,
+    slice_expr: SliceExpr,
+    field_access: FieldAccess,
+    array_literal: ArrayLiteral,
+    paren: Paren,
+    if_expr: IfExpr,
+    switch_expr: SwitchExpr,
+    block: Block,
+    struct_init: StructInit,
+    new_expr: NewExpr,
+    string_interp: StringInterp,
+    optional_unwrap: OptionalUnwrap,
+    type_expr: TypeExprNode,
+    bad_expr: BadExpr,
+}
+
+fn exprSpan(e: Expr) Span {
+    return switch e {
+        .identifier |v| => v.span,
+        .literal |v| => v.span,
+        .binary |v| => v.span,
+        .unary |v| => v.span,
+        .call |v| => v.span,
+        .index_expr |v| => v.span,
+        .slice_expr |v| => v.span,
+        .field_access |v| => v.span,
+        .array_literal |v| => v.span,
+        .paren |v| => v.span,
+        .if_expr |v| => v.span,
+        .switch_expr |v| => v.span,
+        .block |v| => v.span,
+        .struct_init |v| => v.span,
+        .new_expr |v| => v.span,
+        .string_interp |v| => v.span,
+        .optional_unwrap |v| => v.span,
+        .type_expr |v| => v.span,
+        .bad_expr |v| => v.span,
+    }
+}
+
+// =============================================================================
+// Statements
+// =============================================================================
+
+enum StmtTag: u8 {
+    expr_stmt,
+    return_stmt,
+    var_stmt,
+    assign_stmt,
+    if_stmt,
+    while_stmt,
+    for_stmt,
+    block_stmt,
+    break_stmt,
+    continue_stmt,
+    bad_stmt,
+}
+
+struct ExprStmt {
+    expr: NodeIndex,
+    span: Span,
+}
+
+struct ReturnStmt {
+    value: NodeIndex,         // null_node = void return
+    span: Span,
+}
+
+struct VarStmt {
+    name: string,
+    type_expr: NodeIndex,     // null_node = inferred
+    value: NodeIndex,         // null_node = uninitialized
+    is_const: bool,
+    span: Span,
+}
+
+struct AssignStmt {
+    target: NodeIndex,
+    op: Token,                // Token.equal for simple assign, else compound
+    value: NodeIndex,
+    span: Span,
+}
+
+struct IfStmt {
+    condition: NodeIndex,
+    then_branch: NodeIndex,
+    else_branch: NodeIndex,   // null_node = no else
+    span: Span,
+}
+
+struct WhileStmt {
+    condition: NodeIndex,
+    body: NodeIndex,
+    span: Span,
+}
+
+struct ForStmt {
+    binding: string,
+    iterable: NodeIndex,
+    body: NodeIndex,
+    span: Span,
+}
+
+struct BlockStmt {
+    stmts: []NodeIndex,
+    span: Span,
+}
+
+struct BreakStmt {
+    span: Span,
+}
+
+struct ContinueStmt {
+    span: Span,
+}
+
+struct BadStmt {
+    span: Span,
+}
+
+// Tagged union for statements
+union Stmt {
+    expr_stmt: ExprStmt,
+    return_stmt: ReturnStmt,
+    var_stmt: VarStmt,
+    assign_stmt: AssignStmt,
+    if_stmt: IfStmt,
+    while_stmt: WhileStmt,
+    for_stmt: ForStmt,
+    block_stmt: BlockStmt,
+    break_stmt: BreakStmt,
+    continue_stmt: ContinueStmt,
+    bad_stmt: BadStmt,
+}
+
+fn stmtSpan(s: Stmt) Span {
+    return switch s {
+        .expr_stmt |v| => v.span,
+        .return_stmt |v| => v.span,
+        .var_stmt |v| => v.span,
+        .assign_stmt |v| => v.span,
+        .if_stmt |v| => v.span,
+        .while_stmt |v| => v.span,
+        .for_stmt |v| => v.span,
+        .block_stmt |v| => v.span,
+        .break_stmt |v| => v.span,
+        .continue_stmt |v| => v.span,
+        .bad_stmt |v| => v.span,
+    }
+}
+
+// =============================================================================
+// Unified Node
+// =============================================================================
+
+union Node {
+    decl: Decl,
+    expr: Expr,
+    stmt: Stmt,
+}
+
+fn nodeSpan(n: Node) Span {
+    return switch n {
+        .decl |d| => declSpan(d),
+        .expr |e| => exprSpan(e),
+        .stmt |s| => stmtSpan(s),
+    }
+}
+
+// =============================================================================
+// Simple test
+// =============================================================================
+
+fn main() int {
+    // Test basic struct creation
+    var pos: Pos = Pos{ .offset = 100 }
+
+    // Test span creation
+    var sp: Span = spanFromPos(pos)
+
+    // Test enum value
+    var tok: Token = Token.plus
+
+    // Test null_node sentinel
+    if null_node == 4294967295 {
+        return 42
+    }
+    return 1
+}

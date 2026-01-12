@@ -1727,9 +1727,24 @@ pub const CodeGen = struct {
             }
         }
 
-        // Epilogue: ldp fp, lr, [sp], #stack_size; ret
-        const stack_offset: i7 = @intCast(@divExact(self.stack_size, 8));
-        try aarch64.ldpPostIndex(self.buf, .fp, .lr, .sp, stack_offset);
+        // Epilogue: restore fp/lr and deallocate stack frame
+        // Must match prologue: small uses post-index, medium/large use separate add
+        const stack_units = @divExact(self.stack_size, 8);
+
+        if (stack_units <= 63) {
+            // Small frame: single post-index instruction
+            const stack_offset: i7 = @intCast(stack_units);
+            try aarch64.ldpPostIndex(self.buf, .fp, .lr, .sp, stack_offset);
+        } else if (self.stack_size <= 4095) {
+            // Medium frame: ldp + add
+            try aarch64.ldpSignedOffset(self.buf, .fp, .lr, .sp, 0);
+            try aarch64.addRegImm12(self.buf, .sp, .sp, @intCast(self.stack_size));
+        } else {
+            // Large frame: ldp + mov + add
+            try aarch64.ldpSignedOffset(self.buf, .fp, .lr, .sp, 0);
+            try aarch64.movRegImm64(self.buf, .x16, @intCast(self.stack_size));
+            try aarch64.addRegReg(self.buf, .sp, .sp, .x16);
+        }
         try aarch64.ret(self.buf);
     }
 
@@ -1803,10 +1818,27 @@ pub const CodeGen = struct {
     }
 
     pub fn genPrologue(self: *CodeGen) !void {
-        // stp fp, lr, [sp, #-stack_size]!
-        // Note: self.stack_size already includes room for fp/lr (alignTo(frame_size+16, 16))
-        const neg_offset: i7 = -@as(i7, @intCast(@divExact(self.stack_size, 8)));
-        try aarch64.stpPreIndex(self.buf, .fp, .lr, .sp, neg_offset);
+        // Allocate stack frame and save fp/lr
+        // Three cases based on frame size:
+        //   Small (≤504 bytes):  stp fp, lr, [sp, #-N]!
+        //   Medium (≤4095 bytes): sub sp, sp, #N; stp fp, lr, [sp]
+        //   Large (>4095 bytes):  mov x16, #N; sub sp, sp, x16; stp fp, lr, [sp]
+        const stack_units = @divExact(self.stack_size, 8);
+
+        if (stack_units <= 63) {
+            // Small frame: single pre-index instruction
+            const neg_offset: i7 = -@as(i7, @intCast(stack_units));
+            try aarch64.stpPreIndex(self.buf, .fp, .lr, .sp, neg_offset);
+        } else if (self.stack_size <= 4095) {
+            // Medium frame: sub + stp
+            try aarch64.subRegImm12(self.buf, .sp, .sp, @intCast(self.stack_size));
+            try aarch64.stpSignedOffset(self.buf, .fp, .lr, .sp, 0);
+        } else {
+            // Large frame: load size to scratch register, sub, stp
+            try aarch64.movRegImm64(self.buf, .x16, @intCast(self.stack_size));
+            try aarch64.subRegReg(self.buf, .sp, .sp, .x16);
+            try aarch64.stpSignedOffset(self.buf, .fp, .lr, .sp, 0);
+        }
         // mov fp, sp
         try aarch64.movFromSp(self.buf, .fp);
 

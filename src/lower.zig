@@ -54,6 +54,9 @@ pub const Lowerer = struct {
     // Loop context stack for break/continue (cond_block, exit_block)
     loop_stack: std.ArrayList(LoopContext),
 
+    // Compile-time constant values (for module-level const declarations)
+    const_values: std.StringHashMap(i64),
+
     const LoopContext = struct {
         cond_block: u32, // Jump target for continue
         exit_block: u32, // Jump target for break
@@ -76,6 +79,7 @@ pub const Lowerer = struct {
             .type_ctx = type_context.TypeContext.init(tree, type_reg),
             .string_literals = .{ .items = &.{}, .capacity = 0 },
             .loop_stack = .{ .items = &.{}, .capacity = 0 },
+            .const_values = std.StringHashMap(i64).init(allocator),
         };
     }
 
@@ -323,6 +327,14 @@ pub const Lowerer = struct {
             type_idx = self.inferTypeFromExpr(const_decl.value);
         }
 
+        // Try to evaluate the const value at compile time
+        if (self.evalConstExpr(const_decl.value)) |value| {
+            try self.const_values.put(const_decl.name, value);
+            log.debug("const: {s} = {d}", .{ const_decl.name, value });
+        } else {
+            log.debug("const: {s} (non-integer)", .{const_decl.name});
+        }
+
         // Constants are similar to immutable globals
         const span = Span.fromPos(Pos.zero);
         const global = ir.Global.init(
@@ -332,7 +344,74 @@ pub const Lowerer = struct {
             span,
         );
         try self.builder.addGlobal(global);
-        log.debug("const: {s}", .{const_decl.name});
+    }
+
+    /// Evaluate a constant expression at compile time.
+    /// Returns the integer value if it can be evaluated, null otherwise.
+    fn evalConstExpr(self: *Lowerer, idx: NodeIndex) ?i64 {
+        const expr = self.tree.getExpr(idx) orelse return null;
+
+        return switch (expr) {
+            .literal => |lit| {
+                if (lit.kind == .int) {
+                    return std.fmt.parseInt(i64, lit.value, 10) catch null;
+                }
+                return null;
+            },
+            .call => |call| {
+                // Handle @maxInt(T) and @minInt(T) builtins
+                const callee = self.tree.getExpr(call.callee) orelse return null;
+                if (callee != .identifier) return null;
+                const name = callee.identifier.name;
+
+                if (std.mem.eql(u8, name, "@maxInt") and call.args.len == 1) {
+                    const type_arg = self.tree.getExpr(call.args[0]) orelse return null;
+                    if (type_arg != .identifier) return null;
+                    const type_name = type_arg.identifier.name;
+                    return self.getMaxInt(type_name);
+                }
+                if (std.mem.eql(u8, name, "@minInt") and call.args.len == 1) {
+                    const type_arg = self.tree.getExpr(call.args[0]) orelse return null;
+                    if (type_arg != .identifier) return null;
+                    const type_name = type_arg.identifier.name;
+                    return self.getMinInt(type_name);
+                }
+                return null;
+            },
+            .identifier => |ident| {
+                // Look up other const values
+                return self.const_values.get(ident.name);
+            },
+            else => null,
+        };
+    }
+
+    fn getMaxInt(self: *Lowerer, type_name: []const u8) ?i64 {
+        _ = self;
+        if (std.mem.eql(u8, type_name, "i8")) return 127;
+        if (std.mem.eql(u8, type_name, "i16")) return 32767;
+        if (std.mem.eql(u8, type_name, "i32")) return 2147483647;
+        if (std.mem.eql(u8, type_name, "i64") or std.mem.eql(u8, type_name, "int")) return 9223372036854775807;
+        if (std.mem.eql(u8, type_name, "u8")) return 255;
+        if (std.mem.eql(u8, type_name, "u16")) return 65535;
+        if (std.mem.eql(u8, type_name, "u32")) return 4294967295;
+        // u64 max doesn't fit in i64, return as signed
+        if (std.mem.eql(u8, type_name, "u64")) return -1; // 0xFFFFFFFFFFFFFFFF as i64
+        return null;
+    }
+
+    fn getMinInt(self: *Lowerer, type_name: []const u8) ?i64 {
+        _ = self;
+        if (std.mem.eql(u8, type_name, "i8")) return -128;
+        if (std.mem.eql(u8, type_name, "i16")) return -32768;
+        if (std.mem.eql(u8, type_name, "i32")) return -2147483648;
+        if (std.mem.eql(u8, type_name, "i64") or std.mem.eql(u8, type_name, "int")) return -9223372036854775808;
+        // Unsigned types have min of 0
+        if (std.mem.eql(u8, type_name, "u8")) return 0;
+        if (std.mem.eql(u8, type_name, "u16")) return 0;
+        if (std.mem.eql(u8, type_name, "u32")) return 0;
+        if (std.mem.eql(u8, type_name, "u64")) return 0;
+        return null;
     }
 
     fn lowerStructDecl(self: *Lowerer, struct_decl: ast.StructDecl) !void {
@@ -1064,7 +1143,15 @@ pub const Lowerer = struct {
             return try fb.emit(load);
         }
 
-        // TODO: Check globals
+        // Check compile-time constants
+        if (self.const_values.get(ident.name)) |value| {
+            const node = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
+                .withAux(value);
+            return try fb.emit(node);
+        }
+
+        // Unknown identifier - shouldn't happen after type checking
+        log.warn("unknown identifier in lowering: {s}", .{ident.name});
         return ir.null_node;
     }
 

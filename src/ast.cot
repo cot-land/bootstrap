@@ -3,40 +3,44 @@
 // Maps to Go's cmd/compile/internal/syntax/nodes.go
 // Uses tagged unions instead of Go interfaces.
 
-// =============================================================================
-// LANGUAGE FEATURES USED:
-// =============================================================================
-// 1. Tagged unions (union Decl { fn_decl: FnDecl, ... })
-// 2. Switch on tagged union with payload capture
-// 3. Enums (LiteralKind, TypeKind)
-// 4. Structs with optional fields (return_type: ?NodeIndex)
-// 5. Type aliases (type NodeIndex = u32)
-// 6. @maxInt builtin
-// 7. Methods on unions (fn span(self: Decl) Span)
-// 8. List<T> generic
-// =============================================================================
+module ast;
 
-import "source"
-import "token"
+import source;
+import token;
+
+// =============================================================================
+// LANGUAGE FEATURES USED (Phase 1-7):
+// =============================================================================
+// 1. Module declaration and pub visibility (Phase 6)
+// 2. Tagged unions (union Decl { fn_decl: FnDecl, ... })
+// 3. Switch on tagged union with payload capture
+// 4. Enums (LiteralKind)
+// 5. Structs with optional fields (return_type: ?NodeIndex)
+// 6. Type aliases (type NodeIndex = u32)
+// 7. @maxInt builtin
+// 8. Methods on unions (fn span(self: Decl) Span)
+// 9. List<T> generic
+// 10. @intCast builtin
+// =============================================================================
 
 // ============================================================================
 // Core Types
 // ============================================================================
 
-// Index into an expression/statement/declaration pool.
-// Using indices instead of pointers allows arena allocation and compact storage.
-type NodeIndex = u32
-const null_node: NodeIndex = @maxInt(u32)
+/// Index into an expression/statement/declaration pool.
+/// Using indices instead of pointers allows arena allocation and compact storage.
+pub type NodeIndex = u32;
+pub const null_node: NodeIndex = @maxInt(u32);
 
-// List of node indices (for parameter lists, statement lists, etc.)
-type NodeList = []NodeIndex
+/// List of node indices (for parameter lists, statement lists, etc.)
+pub type NodeList = []NodeIndex;
 
 // ============================================================================
 // File (top-level)
 // ============================================================================
 
-// A source file containing declarations.
-struct File {
+/// A source file containing declarations.
+pub struct File {
     filename: string,
     decls: []NodeIndex,
     span: Span,
@@ -46,81 +50,128 @@ struct File {
 // Declarations
 // ============================================================================
 
-union Decl {
+pub union Decl {
     fn_decl: FnDecl,
     var_decl: VarDecl,
     const_decl: ConstDecl,
     struct_decl: StructDecl,
     enum_decl: EnumDecl,
+    union_decl: UnionDecl,
+    type_alias: TypeAliasDecl,
+    import_decl: ImportDecl,
     bad_decl: BadDecl,
 }
 
-// Get the span of any declaration
-fn span(self: Decl) Span {
+/// Get the span of any declaration.
+pub fn span(self: Decl) Span {
     return switch self {
         .fn_decl |d| => d.span,
         .var_decl |d| => d.span,
         .const_decl |d| => d.span,
         .struct_decl |d| => d.span,
         .enum_decl |d| => d.span,
+        .union_decl |d| => d.span,
+        .type_alias |d| => d.span,
+        .import_decl |d| => d.span,
         .bad_decl |d| => d.span,
-    }
+    };
 }
 
-// fn name(params) return_type { body }
-struct FnDecl {
+/// fn name(params) return_type { body }
+pub struct FnDecl {
     name: string,
+    type_params: []string,    // Generic type parameters (Phase 7)
     params: []Field,
     return_type: ?NodeIndex,  // null = void
     body: ?NodeIndex,         // null = forward declaration
+    is_pub: bool,             // pub visibility (Phase 6)
     span: Span,
 }
 
-// var name: type = value
-// let name: type = value (alias for var)
-struct VarDecl {
+/// var name: type = value
+/// let name: type = value (alias for var)
+pub struct VarDecl {
     name: string,
     type_expr: ?NodeIndex,    // null = inferred
     value: ?NodeIndex,        // null = uninitialized
+    is_pub: bool,
     span: Span,
 }
 
-// const name: type = value
-struct ConstDecl {
+/// const name: type = value
+pub struct ConstDecl {
     name: string,
     type_expr: ?NodeIndex,
     value: NodeIndex,         // const must have value
+    is_pub: bool,
     span: Span,
 }
 
-// struct { fields }
-struct StructDecl {
+/// struct Name { fields } or struct Name<T> { fields } (generic)
+pub struct StructDecl {
     name: string,
+    type_params: []string,    // Generic type parameters (Phase 7)
     fields: []Field,
+    is_pub: bool,
     span: Span,
 }
 
-// enum { variants }
-struct EnumDecl {
+/// enum Name { variants } or enum Name: BackingType { variants }
+pub struct EnumDecl {
     name: string,
+    backing_type: ?NodeIndex, // optional backing type like u8, i32
     variants: []EnumVariant,
+    is_pub: bool,
     span: Span,
 }
 
-// Placeholder for malformed declaration
-struct BadDecl {
+/// union Name { variants } - Tagged union declaration
+pub struct UnionDecl {
+    name: string,
+    type_params: []string,    // Generic type parameters (Phase 7)
+    variants: []UnionVariant,
+    is_pub: bool,
     span: Span,
 }
 
-// Field in struct or function parameter
-struct Field {
+/// Union variant: name: Type or name (no payload)
+pub struct UnionVariant {
+    name: string,
+    type_expr: ?NodeIndex,    // null = no payload (unit variant)
+    span: Span,
+}
+
+/// type Name = TargetType
+/// Type alias declaration - creates a transparent alias (not a distinct type)
+pub struct TypeAliasDecl {
+    name: string,
+    type_params: []string,    // Generic type parameters (Phase 7)
+    target_type: NodeIndex,   // the type being aliased
+    is_pub: bool,
+    span: Span,
+}
+
+/// import name; or import "path";
+pub struct ImportDecl {
+    path: string,
+    alias: ?string,           // import foo as bar;
+    span: Span,
+}
+
+/// Placeholder for malformed declaration
+pub struct BadDecl {
+    span: Span,
+}
+
+/// Field in struct or function parameter
+pub struct Field {
     name: string,
     type_expr: NodeIndex,
     span: Span,
 }
 
-// Enum variant
-struct EnumVariant {
+/// Enum variant
+pub struct EnumVariant {
     name: string,
     value: ?NodeIndex,        // explicit value
     span: Span,
@@ -130,25 +181,32 @@ struct EnumVariant {
 // Expressions
 // ============================================================================
 
-union Expr {
+pub union Expr {
     identifier: Identifier,
     literal: Literal,
     binary: Binary,
     unary: Unary,
     call: Call,
     index: Index,
+    slice_expr: SliceExpr,
+    range_expr: RangeExpr,
     field_access: FieldAccess,
+    optional_chain: OptionalChain,
     array_literal: ArrayLiteral,
     paren: Paren,
     if_expr: IfExpr,
+    switch_expr: SwitchExpr,
     block: Block,
     struct_init: StructInit,
+    new_expr: NewExpr,
+    string_interp: StringInterp,
+    optional_unwrap: OptionalUnwrap,
     type_expr: TypeExpr,
     bad_expr: BadExpr,
 }
 
-// Get the span of any expression
-fn span(self: Expr) Span {
+/// Get the span of any expression.
+pub fn span(self: Expr) Span {
     return switch self {
         .identifier |e| => e.span,
         .literal |e| => e.span,
@@ -156,31 +214,52 @@ fn span(self: Expr) Span {
         .unary |e| => e.span,
         .call |e| => e.span,
         .index |e| => e.span,
+        .slice_expr |e| => e.span,
+        .range_expr |e| => e.span,
         .field_access |e| => e.span,
+        .optional_chain |e| => e.span,
         .array_literal |e| => e.span,
         .paren |e| => e.span,
         .if_expr |e| => e.span,
+        .switch_expr |e| => e.span,
         .block |e| => e.span,
         .struct_init |e| => e.span,
+        .new_expr |e| => e.span,
+        .string_interp |e| => e.span,
+        .optional_unwrap |e| => e.span,
         .type_expr |e| => e.span,
         .bad_expr |e| => e.span,
-    }
+    };
 }
 
-// Variable or type name
-struct Identifier {
+/// Variable or type name
+pub struct Identifier {
     name: string,
     span: Span,
 }
 
-// Literal value (int, float, string, char, bool)
-struct Literal {
+/// String interpolation segment
+pub union StringSegment {
+    /// Plain text (includes quotes from original token)
+    text: string,
+    /// Interpolated expression
+    expr: NodeIndex,
+}
+
+/// Interpolated string: "text ${expr} more ${expr2} end"
+pub struct StringInterp {
+    segments: []StringSegment,
+    span: Span,
+}
+
+/// Literal value (int, float, string, char, bool)
+pub struct Literal {
     kind: LiteralKind,
     value: string,            // raw text
     span: Span,
 }
 
-enum LiteralKind {
+pub enum LiteralKind {
     int,
     float,
     string,
@@ -190,85 +269,143 @@ enum LiteralKind {
     null_lit,
 }
 
-// Binary operation (x op y)
-struct Binary {
+/// Binary operation (x op y)
+pub struct Binary {
     op: Token,
     left: NodeIndex,
     right: NodeIndex,
     span: Span,
 }
 
-// Unary operation (op x)
-struct Unary {
+/// Unary operation (op x)
+pub struct Unary {
     op: Token,
     operand: NodeIndex,
     span: Span,
 }
 
-// Function call (callee(args))
-struct Call {
+/// Function call (callee(args)) or callee<T>(args) for generics
+pub struct Call {
     callee: NodeIndex,
+    type_args: []NodeIndex,   // Generic type arguments (Phase 7)
     args: []NodeIndex,
     span: Span,
 }
 
-// Index expression (base[index])
-struct Index {
+/// Index expression (base[index])
+pub struct Index {
     base: NodeIndex,
     index: NodeIndex,
     span: Span,
 }
 
-// Field access (base.field)
-struct FieldAccess {
+/// Slice expression (base[start..end])
+/// Creates a slice from an array or another slice.
+pub struct SliceExpr {
+    base: NodeIndex,
+    start: ?NodeIndex,        // null = from beginning
+    end: ?NodeIndex,          // null = to end
+    span: Span,
+}
+
+/// Range expression (start..end or start..=end)
+/// Used in for loops: for i in 0..10
+pub struct RangeExpr {
+    start: NodeIndex,
+    end: NodeIndex,
+    inclusive: bool,          // true for ..= (inclusive), false for .. (exclusive)
+    span: Span,
+}
+
+/// Field access (base.field)
+pub struct FieldAccess {
     base: NodeIndex,
     field: string,
     span: Span,
 }
 
-// Array literal ([elem1, elem2, ...])
-struct ArrayLiteral {
+/// Optional chaining (base?.field or base?.method()) (Phase 5)
+pub struct OptionalChain {
+    base: NodeIndex,
+    field: string,
+    span: Span,
+}
+
+/// Array literal ([elem1, elem2, ...])
+pub struct ArrayLiteral {
     elements: []NodeIndex,
     span: Span,
 }
 
-// Parenthesized expression
-struct Paren {
+/// Parenthesized expression
+pub struct Paren {
     inner: NodeIndex,
     span: Span,
 }
 
-// If expression (if cond then_expr else else_expr)
-struct IfExpr {
+/// If expression (if cond then_expr else else_expr)
+pub struct IfExpr {
     condition: NodeIndex,
+    capture: ?string,         // if x |val| { ... } - capture for optional unwrap
     then_branch: NodeIndex,
     else_branch: ?NodeIndex,
     span: Span,
 }
 
-// Block expression { stmts; expr }
-struct Block {
+/// Switch expression
+/// switch value { .a => x, .b, .c => y, else => z }
+/// With payload capture: switch u { .ok |val| => val, .err |e| => 0 }
+pub struct SwitchExpr {
+    subject: NodeIndex,       // value being switched on
+    cases: []SwitchCase,      // case arms
+    else_body: ?NodeIndex,    // else => body (optional)
+    span: Span,
+}
+
+/// A single switch case arm
+pub struct SwitchCase {
+    values: []NodeIndex,      // can match multiple values: .a, .b => ...
+    body: NodeIndex,          // expression or block
+    capture: ?string,         // optional payload capture: .ok |val| => ...
+    span: Span,
+}
+
+/// Block expression { stmts; expr }
+pub struct Block {
     stmts: []NodeIndex,
     expr: NodeIndex,          // Final expression (value of block), or null_node
     span: Span,
 }
 
-// Struct initialization: Point{.x = 10, .y = 20}
-struct StructInit {
+/// Struct initialization: Point{.x = 10, .y = 20}
+pub struct StructInit {
     type_name: string,        // Type name (e.g., "Point"), or empty for anonymous
+    type_args: []NodeIndex,   // Generic type arguments (Phase 7)
     fields: []FieldInit,
     span: Span,
 }
 
-// Field initializer: .field = value
-struct FieldInit {
+/// Heap allocation expression: new Map<K,V>(), new List<T>()
+pub struct NewExpr {
+    type_expr: NodeIndex,     // The type being allocated (a type expression node)
+    span: Span,
+}
+
+/// Optional unwrap: expr.? - unwraps optional, panics if null
+pub struct OptionalUnwrap {
+    operand: NodeIndex,
+    span: Span,
+}
+
+/// Field initializer: .field = value
+pub struct FieldInit {
     name: string,
     value: NodeIndex,
     span: Span,
 }
 
-// Placeholder for malformed expression
-struct BadExpr {
+/// Placeholder for malformed expression
+pub struct BadExpr {
     span: Span,
 }
 
@@ -276,32 +413,40 @@ struct BadExpr {
 // Type Expressions
 // ============================================================================
 
-struct TypeExpr {
+pub struct TypeExpr {
     kind: TypeKind,
     span: Span,
 }
 
-union TypeKind {
-    // Named type (int, string, MyStruct, etc.)
+pub union TypeKind {
+    /// Named type (int, string, MyStruct, etc.)
     named: string,
-    // Pointer type (*T)
+    /// Generic instantiation: Map<string, i64>, List<T>, etc. (Phase 7)
+    generic: GenericType,
+    /// Pointer type (*T)
     pointer: NodeIndex,
-    // Optional type (?T)
+    /// Optional type (?T)
     optional: NodeIndex,
-    // Slice type ([]T)
+    /// Slice type ([]T)
     slice: NodeIndex,
-    // Array type ([N]T)
+    /// Array type ([N]T)
     array: TypeArray,
-    // Function type (fn(params) ret)
+    /// Function type (fn(params) ret)
     function: TypeFunction,
 }
 
-struct TypeArray {
+/// Generic type instantiation: Type<Arg1, Arg2, ...>
+pub struct GenericType {
+    name: string,
+    args: []NodeIndex,        // type arguments
+}
+
+pub struct TypeArray {
     size: NodeIndex,          // size expression
     elem: NodeIndex,
 }
 
-struct TypeFunction {
+pub struct TypeFunction {
     params: []NodeIndex,
     return_type: ?NodeIndex,
 }
@@ -310,7 +455,7 @@ struct TypeFunction {
 // Statements
 // ============================================================================
 
-union Stmt {
+pub union Stmt {
     expr_stmt: ExprStmt,
     return_stmt: ReturnStmt,
     var_stmt: VarStmt,
@@ -321,11 +466,12 @@ union Stmt {
     block_stmt: BlockStmt,
     break_stmt: BreakStmt,
     continue_stmt: ContinueStmt,
+    defer_stmt: DeferStmt,
     bad_stmt: BadStmt,
 }
 
-// Get the span of any statement
-fn span(self: Stmt) Span {
+/// Get the span of any statement.
+pub fn span(self: Stmt) Span {
     return switch self {
         .expr_stmt |s| => s.span,
         .return_stmt |s| => s.span,
@@ -337,24 +483,25 @@ fn span(self: Stmt) Span {
         .block_stmt |s| => s.span,
         .break_stmt |s| => s.span,
         .continue_stmt |s| => s.span,
+        .defer_stmt |s| => s.span,
         .bad_stmt |s| => s.span,
-    }
+    };
 }
 
-// Expression statement
-struct ExprStmt {
+/// Expression statement
+pub struct ExprStmt {
     expr: NodeIndex,
     span: Span,
 }
 
-// return expr
-struct ReturnStmt {
+/// return expr
+pub struct ReturnStmt {
     value: ?NodeIndex,
     span: Span,
 }
 
-// var/let name: type = value (local variable)
-struct VarStmt {
+/// var/let name: type = value (local variable)
+pub struct VarStmt {
     name: string,
     type_expr: ?NodeIndex,
     value: ?NodeIndex,
@@ -362,55 +509,68 @@ struct VarStmt {
     span: Span,
 }
 
-// name = value, name += value, etc.
-struct AssignStmt {
+/// name = value, name += value, etc.
+pub struct AssignStmt {
     target: NodeIndex,
     op: ?Token,               // null = simple assign, else compound (+=, -=, etc.)
     value: NodeIndex,
     span: Span,
 }
 
-// if condition { then } else { else }
-struct IfStmt {
+/// if condition { then } else { else }
+/// With optional unwrap: if x |val| { use val }
+pub struct IfStmt {
     condition: NodeIndex,
+    capture: ?string,         // for "if x |val|" pattern
     then_branch: NodeIndex,   // block
     else_branch: ?NodeIndex,  // block or another if_stmt
     span: Span,
 }
 
-// while condition { body }
-struct WhileStmt {
+/// while condition { body }
+/// With optional unwrap: while x |val| { use val }
+pub struct WhileStmt {
     condition: NodeIndex,
+    capture: ?string,         // for "while x |val|" pattern
     body: NodeIndex,
     span: Span,
 }
 
-// for item in iterable { body }
-struct ForStmt {
+/// for item in iterable { body }
+/// for item, index in iterable { body } (Phase 4)
+/// for i in 0..10 { body } (Phase 4 - range iteration)
+pub struct ForStmt {
     binding: string,
+    index_binding: ?string,   // for x, i in arr (Phase 4)
     iterable: NodeIndex,
     body: NodeIndex,
     span: Span,
 }
 
-// { statements }
-struct BlockStmt {
+/// { statements }
+pub struct BlockStmt {
     stmts: []NodeIndex,
     span: Span,
 }
 
-// break
-struct BreakStmt {
+/// break
+pub struct BreakStmt {
     span: Span,
 }
 
-// continue
-struct ContinueStmt {
+/// continue
+pub struct ContinueStmt {
     span: Span,
 }
 
-// Placeholder for malformed statement
-struct BadStmt {
+/// defer expr - execute when leaving scope
+pub struct DeferStmt {
+    body: NodeIndex,
+    span: Span,
+}
+
+/// Placeholder for malformed statement
+pub struct BadStmt {
     span: Span,
 }
 
@@ -418,86 +578,91 @@ struct BadStmt {
 // Node Storage (Arena-based)
 // ============================================================================
 
-// Unified node that can be any AST element.
-// This is what gets stored in the node pool.
-union Node {
+/// Unified node that can be any AST element.
+/// This is what gets stored in the node pool.
+pub union Node {
     decl: Decl,
     expr: Expr,
     stmt: Stmt,
 }
 
-// Get the span of any node
-fn span(self: Node) Span {
+/// Get the span of any node.
+pub fn span(self: Node) Span {
     return switch self {
         .decl |d| => d.span(),
         .expr |e| => e.span(),
         .stmt |s| => s.span(),
-    }
+    };
 }
 
-// Storage for all AST nodes.
-// Uses arena allocation for fast allocation and bulk deallocation.
-struct Ast {
+/// Storage for all AST nodes.
+/// Uses arena allocation for fast allocation and bulk deallocation.
+pub struct Ast {
     nodes: List<Node>,
     file: ?File,
 }
 
-// Initialize an empty AST
-fn init() Ast {
+/// Initialize an empty AST.
+pub fn init() Ast {
     return Ast{
-        .nodes = new List<Node>,
+        .nodes = new List<Node>(),
         .file = null,
-    }
+    };
 }
 
-// Add a node and return its index.
-fn addNode(self: *Ast, node: Node) NodeIndex {
-    var idx = @intCast(NodeIndex, len(self.nodes))
-    self.nodes.push(node)
-    return idx
+/// Add a node and return its index.
+pub fn addNode(self: *Ast, node: Node) NodeIndex {
+    var idx = @intCast(NodeIndex, len(self.nodes));
+    self.nodes.push(node);
+    return idx;
 }
 
-// Get a node by index.
-fn getNode(self: *Ast, idx: NodeIndex) Node {
+/// Get a node by index.
+pub fn getNode(self: *Ast, idx: NodeIndex) Node {
     if idx == null_node {
         // Return a bad node for null indices
-        return Node{ .expr = Expr{ .bad_expr = BadExpr{ .span = Span.fromPos(Pos.zero) } } }
+        return Node{ .expr = Expr{ .bad_expr = BadExpr{ .span = Span.fromPos(Pos.zero) } } };
     }
-    return self.nodes[idx]
+    return self.nodes[idx];
 }
 
-// Get a node as an expression.
-fn getExpr(self: *Ast, idx: NodeIndex) ?Expr {
+/// Get a node as an expression.
+pub fn getExpr(self: *Ast, idx: NodeIndex) ?Expr {
     if idx == null_node {
-        return null
+        return null;
     }
-    var node = self.nodes[idx]
+    var node = self.nodes[idx];
     return switch node {
         .expr |e| => e,
         else => null,
-    }
+    };
 }
 
-// Get a node as a statement.
-fn getStmt(self: *Ast, idx: NodeIndex) ?Stmt {
+/// Get a node as a statement.
+pub fn getStmt(self: *Ast, idx: NodeIndex) ?Stmt {
     if idx == null_node {
-        return null
+        return null;
     }
-    var node = self.nodes[idx]
+    var node = self.nodes[idx];
     return switch node {
         .stmt |s| => s,
         else => null,
-    }
+    };
 }
 
-// Get a node as a declaration.
-fn getDecl(self: *Ast, idx: NodeIndex) ?Decl {
+/// Get a node as a declaration.
+pub fn getDecl(self: *Ast, idx: NodeIndex) ?Decl {
     if idx == null_node {
-        return null
+        return null;
     }
-    var node = self.nodes[idx]
+    var node = self.nodes[idx];
     return switch node {
         .decl |d| => d,
         else => null,
-    }
+    };
+}
+
+/// Get the total number of nodes.
+pub fn nodeCount(self: *Ast) int {
+    return len(self.nodes);
 }

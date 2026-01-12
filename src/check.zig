@@ -952,9 +952,8 @@ pub const Checker = struct {
             return invalid_type;
         }
 
-        // Return i64 - the result is a compile-time constant that fits in i64
-        // (except for u64 max, which overflows to negative in i64)
-        return TypeRegistry.I64;
+        // Return the same type as the argument - @maxInt(u32) returns u32
+        return type_idx;
     }
 
     /// Check builtin @minInt() function.
@@ -986,8 +985,8 @@ pub const Checker = struct {
             return invalid_type;
         }
 
-        // Return i64 - the result is a compile-time constant that fits in i64
-        return TypeRegistry.I64;
+        // Return the same type as the argument - @minInt(i32) returns i32
+        return type_idx;
     }
 
     /// Check index expression.

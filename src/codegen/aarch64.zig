@@ -540,6 +540,18 @@ pub fn stpPreIndex(buf: *CodeBuffer, rt: Reg, rt2: Reg, rn: Reg, imm7: i7) !void
     try emit32(buf, loadStorePair(0b10, false, 0b11, false, uimm7, rt2, rn, rt));
 }
 
+/// STP Xt1, Xt2, [Xn, #imm] (signed offset, no writeback)
+pub fn stpSignedOffset(buf: *CodeBuffer, rt: Reg, rt2: Reg, rn: Reg, imm7: i7) !void {
+    const uimm7: u7 = @bitCast(imm7);
+    try emit32(buf, loadStorePair(0b10, false, 0b10, false, uimm7, rt2, rn, rt));
+}
+
+/// LDP Xt1, Xt2, [Xn, #imm] (signed offset, no writeback)
+pub fn ldpSignedOffset(buf: *CodeBuffer, rt: Reg, rt2: Reg, rn: Reg, imm7: i7) !void {
+    const uimm7: u7 = @bitCast(imm7);
+    try emit32(buf, loadStorePair(0b10, false, 0b10, true, uimm7, rt2, rn, rt));
+}
+
 /// LDP Xt1, Xt2, [Xn], #imm (post-index)
 pub fn ldpPostIndex(buf: *CodeBuffer, rt: Reg, rt2: Reg, rn: Reg, imm7: i7) !void {
     const uimm7: u7 = @bitCast(imm7);

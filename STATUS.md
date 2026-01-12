@@ -33,10 +33,10 @@ zig build test                    # 135+ embedded tests
 
 | Progress | Count | Status |
 |----------|-------|--------|
-| Bootstrap .cot files done | 3/22 | 14% |
+| Bootstrap .cot files done | 4/22 | 18% |
 | Zig source files | 22 | Reference implementation |
 
-**Completed:** `token_boot.cot`, `source_boot.cot`, `scanner_boot.cot`
+**Completed:** `token_boot.cot`, `source_boot.cot`, `scanner_boot.cot`, `ast_boot.cot`
 
 ---
 
