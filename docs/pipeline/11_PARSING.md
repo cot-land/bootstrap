@@ -11,7 +11,7 @@
 The scanner gave us a flat list of tokens:
 
 ```
-[fn] [main] [(] [)] [{] [return] [42] [;] [}]
+[fn] [main] [(] [)] [{] [return] [42] [}]
 ```
 
 But this doesn't show the **structure** of the code. The parser builds a tree called an **Abstract Syntax Tree (AST)** that shows how tokens relate to each other:
@@ -631,9 +631,9 @@ Switch expressions are parsed specially because they have complex structure:
 
 ```cot
 switch value {
-    1, 2, 3 => "small",
-    .ok |payload| => payload * 2,
-    else => "default",
+    1, 2, 3 => "small"
+    .ok |payload| => payload * 2
+    else => "default"
 }
 ```
 
@@ -859,7 +859,7 @@ Let's trace parsing:
 
 ```cot
 fn add(a: i64, b: i64) i64 {
-    return a + b;
+    return a + b
 }
 ```
 

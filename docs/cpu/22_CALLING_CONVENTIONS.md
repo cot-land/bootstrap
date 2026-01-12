@@ -36,7 +36,7 @@ Arguments beyond the 8th go on the stack.
 
 ```cot
 fn many(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64, i: i64) i64 {
-    return a + b + c + d + e + f + g + h + i;
+    return a + b + c + d + e + f + g + h + i
 }
 ```
 
@@ -78,13 +78,13 @@ _many:
 
 ```cot
 struct BigStruct {
-    a: i64,
-    b: i64,
-    c: i64,
+    a: i64
+    b: i64
+    c: i64
 }
 
 fn make_big() BigStruct {
-    return BigStruct{ .a = 1, .b = 2, .c = 3 };
+    return BigStruct{ .a = 1, .b = 2, .c = 3 }
 }
 ```
 
@@ -141,7 +141,7 @@ Arguments beyond the 6th go on the stack, **right to left**.
 
 ```cot
 fn add_three(a: i64, b: i64, c: i64) i64 {
-    return a + b + c;
+    return a + b + c
 }
 ```
 

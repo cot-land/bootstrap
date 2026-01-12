@@ -12,7 +12,7 @@ The parser built a tree showing structure, but it didn't check if the code makes
 
 ```cot
 fn broken() i64 {
-    return "hello";  // Error: returning string from int function!
+    return "hello"  // Error: returning string from int function!
 }
 ```
 
@@ -51,11 +51,11 @@ A **scope** is a container for symbols. Scopes nest:
 
 ```cot
 fn outer() {              // <- outer function scope
-    var x: i64 = 1;
+    var x: i64 = 1
 
     if condition {        // <- nested block scope
-        var y: i64 = 2;
-        x = x + y;        // Can see x from outer scope
+        var y: i64 = 2
+        x = x + y        // Can see x from outer scope
     }
     // y is not visible here
 }
@@ -208,7 +208,7 @@ Why two passes? Consider:
 
 ```cot
 fn foo() {
-    bar();  // bar isn't defined yet!
+    bar()  // bar isn't defined yet!
 }
 
 fn bar() {
@@ -321,9 +321,9 @@ fn checkLiteral(self: *Checker, lit: ast.Literal) CheckError!TypeIndex {
 **Untyped literals** can be assigned to any compatible type:
 
 ```cot
-var a: i8 = 42;   // 42 becomes i8
-var b: i64 = 42;  // 42 becomes i64
-var c: f64 = 42;  // 42 becomes f64 (42.0)
+var a: i8 = 42   // 42 becomes i8
+var b: i64 = 42  // 42 becomes i64
+var c: f64 = 42  // 42 becomes f64 (42.0)
 ```
 
 ### Identifiers
@@ -793,7 +793,7 @@ fn errTypeMismatch(self: *Checker, pos: Pos, expected: TypeIndex, got: TypeIndex
 Error output:
 ```
 test.cot:5:12: error E301: undefined variable
-    return x;
+    return x
            ^
 ```
 
@@ -805,7 +805,7 @@ Let's trace type checking for:
 
 ```cot
 fn add(a: i64, b: i64) i64 {
-    return a + b;
+    return a + b
 }
 ```
 

@@ -40,13 +40,13 @@ This is incredibly useful for optimization because:
 What about code like this?
 
 ```cot
-var x: i64;
+var x: i64
 if condition {
-    x = 1;
+    x = 1
 } else {
-    x = 2;
+    x = 2
 }
-return x;
+return x
 ```
 
 After the `if`, which `x` do we use? Both branches assigned to it!

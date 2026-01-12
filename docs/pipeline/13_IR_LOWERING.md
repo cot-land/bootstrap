@@ -12,7 +12,7 @@ The AST represents code as the programmer wrote it. But there's a lot of "sugar"
 
 ```cot
 for item in array {    // Sugar: hides counter, bounds check, indexing
-    total += item;     // Sugar: hides x = x + item
+    total += item      // Sugar: hides x = x + item
 }
 ```
 
@@ -517,7 +517,7 @@ For loops are desugared into while loops:
 
 ```cot
 for item in array {
-    print(item);
+    print(item)
 }
 ```
 
@@ -607,7 +607,7 @@ fn lowerContinueStmt(self: *Lowerer, _: ast.ContinueStmt) !void {
 ### Struct Initialization
 
 ```cot
-var p = Point{ .x = 10, .y = 20 };
+var p = Point{ .x = 10, .y = 20 }
 ```
 
 Becomes a series of field stores:
@@ -732,7 +732,7 @@ Let's trace lowering for:
 
 ```cot
 fn add(a: i64, b: i64) i64 {
-    return a + b;
+    return a + b
 }
 ```
 

@@ -408,7 +408,7 @@ Let's trace the complete pipeline for:
 
 ```cot
 fn main() i64 {
-    return 42;
+    return 42
 }
 ```
 

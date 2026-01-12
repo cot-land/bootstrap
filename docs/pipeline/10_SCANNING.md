@@ -8,7 +8,7 @@
 
 ## What is Scanning?
 
-When you write code like `fn main() { return 42; }`, the computer sees it as a long string of characters:
+When you write code like `fn main() { return 42 }`, the computer sees it as a long string of characters:
 
 ```
 f n   m a i n ( )   {   r e t u r n   4 2 ;   }
@@ -17,7 +17,7 @@ f n   m a i n ( )   {   r e t u r n   4 2 ;   }
 The scanner's job is to group these characters into **tokens** - the smallest meaningful units of the language:
 
 ```
-[fn] [main] [(] [)] [{] [return] [42] [;] [}]
+[fn] [main] [(] [)] [{] [return] [42] [}]
 ```
 
 Think of it like reading English: you don't read letter-by-letter, you recognize whole words and punctuation.
@@ -354,7 +354,7 @@ The `blk:` labels the block, and `break :blk value` exits the block and uses `va
 Cot supports string interpolation like `"Hello ${name}!"`. The scanner needs to handle this specially:
 
 ```cot
-var msg = "Hello ${name}!";
+var msg = "Hello ${name}!"
 ```
 
 This produces these tokens:
@@ -497,7 +497,7 @@ pub fn binaryPrecedence(tok: Token) Precedence {
 
 ## Complete Example: Scanning Real Code
 
-Let's trace through scanning `fn add(a: i64, b: i64) i64 { return a + b; }`:
+Let's trace through scanning `fn add(a: i64, b: i64) i64 { return a + b }`:
 
 | Position | Character | Action | Token |
 |----------|-----------|--------|-------|
@@ -521,7 +521,7 @@ Final token stream:
 ```
 [kw_fn] [identifier:"add"] [lparen] [identifier:"a"] [colon] [kw_i64] [comma]
 [identifier:"b"] [colon] [kw_i64] [rparen] [kw_i64] [lbrace] [kw_return]
-[identifier:"a"] [plus] [identifier:"b"] [semicolon] [rbrace] [eof]
+[identifier:"a"] [plus] [identifier:"b"] [rbrace] [eof]
 ```
 
 ---

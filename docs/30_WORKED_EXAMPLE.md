@@ -10,9 +10,9 @@ Let's trace this simple program through the entire compiler:
 
 ```cot
 fn main() i64 {
-    var x: i64 = 40;
-    var y: i64 = 2;
-    return x + y;
+    var x: i64 = 40
+    var y: i64 = 2
+    return x + y
 }
 ```
 
@@ -27,7 +27,7 @@ The scanner reads characters and produces tokens:
 ### Input
 
 ```
-fn main() i64 {\n    var x: i64 = 40;\n    var y: i64 = 2;\n    return x + y;\n}
+fn main() i64 {\n    var x: i64 = 40\n    var y: i64 = 2\n    return x + y\n}
 ```
 
 ### Process
@@ -61,19 +61,16 @@ Character: '(' → End identifier "main"
 [identifier: "i64"]  → resolves to kw_i64
 [equal]
 [int_literal: "40"]
-[semicolon]
 [kw_var]
 [identifier: "y"]
 [colon]
 [identifier: "i64"]  → resolves to kw_i64
 [equal]
 [int_literal: "2"]
-[semicolon]
 [kw_return]
 [identifier: "x"]
 [plus]
 [identifier: "y"]
-[semicolon]
 [rbrace]
 [eof]
 ```
@@ -481,7 +478,7 @@ $ echo $?
 ## Summary: The Complete Journey
 
 ```
-Source Code        "var x: i64 = 40; var y: i64 = 2; return x + y;"
+Source Code        "var x: i64 = 40  var y: i64 = 2  return x + y"
     │
     ▼ Scanner
 Tokens             [kw_var][identifier:x][colon][identifier:i64]...

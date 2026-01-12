@@ -70,8 +70,8 @@ var y: i64 = 10;
 
 ```cot
 // Cot (similar but slightly different syntax)
-const x: i64 = 42;
-var y: i64 = 10;
+const x: i64 = 42
+var y: i64 = 10
 ```
 
 ---
@@ -159,16 +159,16 @@ fn process(maybe_value: ?u32) void {
 
 ```cot
 // Cot uses similar syntax
-var maybe_number: ?u32 = 42;
-maybe_number = null;
+var maybe_number: ?u32 = 42
+maybe_number = null
 
 // Capture syntax
 if maybe_number |value| {
-    println(value);
+    println(value)
 }
 
 // Null coalescing
-var val = maybe_number ?? 0;
+var val = maybe_number ?? 0
 ```
 
 ---
@@ -240,23 +240,23 @@ fn parse(input: []const u8) ParseError!u32 {
 // Cot uses Result<T, E> instead of error unions
 fn readNumber() Result<u32, Error> {
     if failed {
-        return .err(Error.InvalidInput);
+        return .err(Error.InvalidInput)
     }
-    return .ok(42);
+    return .ok(42)
 }
 
 // Using the result
-var result = readNumber();
+var result = readNumber()
 switch result {
-    .ok |value| => println(value),
-    .err |e| => println("Error!"),
+    .ok |value| => println(value)
+    .err |e| => println("Error!")
 }
 
 // Propagation with ?
 fn doWork() Result<void, Error> {
-    var num = readNumber()?;  // Returns early on error
-    println(num);
-    return .ok(void{});
+    var num = readNumber()?  // Returns early on error
+    println(num)
+    return .ok(void{})
 }
 ```
 
@@ -336,8 +336,8 @@ Cot will use **automatic reference counting (ARC)**, so you won't need allocator
 
 ```cot
 // Cot - no allocator needed
-var items = new List<u32>();
-items.push(1);
+var items = new List<u32>()
+items.push(1)
 // Memory automatically freed when items goes out of scope
 ```
 
@@ -403,13 +403,13 @@ const greeting = "Hello, world!";  // Same type
 
 ```cot
 // Cot arrays
-const arr: [5]u32 = [1, 2, 3, 4, 5];
+const arr: [5]u32 = [1, 2, 3, 4, 5]
 
 // Cot slices
-var slice: []u32 = arr[0..3];  // Elements 0, 1, 2
+var slice: []u32 = arr[0..3]  // Elements 0, 1, 2
 
 // Cot strings are a distinct type (not just []u8)
-var greeting: string = "Hello, world!";
+var greeting: string = "Hello, world!"
 ```
 
 ---
@@ -482,19 +482,19 @@ const cfg = Config{
 ```cot
 // Very similar syntax
 struct Token {
-    kind: TokenKind,
-    text: string,
-    line: u32,
-    column: u32,
+    kind: TokenKind
+    text: string
+    line: u32
+    column: u32
 }
 
 // Struct literal
 var tok = Token{
-    .kind = .identifier,
-    .text = "foo",
-    .line = 1,
-    .column = 5,
-};
+    .kind = .identifier
+    .text = "foo"
+    .line = 1
+    .column = 5
+}
 ```
 
 ---
@@ -567,27 +567,27 @@ fn printValue(v: Value) void {
 ```cot
 // Cot enums
 enum TokenKind: u8 {
-    eof,
-    identifier,
-    int_literal,
-    kw_fn,
-    kw_return,
+    eof
+    identifier
+    int_literal
+    kw_fn
+    kw_return
 }
 
 // Cot unions
 union Value {
-    integer: i64,
-    float: f64,
-    string: string,
-    boolean: bool,
-    none,
+    integer: i64
+    float: f64
+    string: string
+    boolean: bool
+    none
 }
 
 // Switch with capture
 switch value {
-    .integer |i| => println(i),
-    .float |f| => println(f),
-    .none => println("none"),
+    .integer |i| => println(i)
+    .float |f| => println(f)
+    .none => println("none")
 }
 ```
 
@@ -646,14 +646,14 @@ if (ptr) |p| {
 
 ```cot
 // Cot pointers work similarly
-var x: u32 = 42;
-var ptr: *u32 = &x;
+var x: u32 = 42
+var ptr: *u32 = &x
 
 // Dereference
-var value = ptr.*;
+var value = ptr.*
 
 // Optional pointer
-var maybe_ptr: ?*u32 = null;
+var maybe_ptr: ?*u32 = null
 ```
 
 ---
@@ -734,17 +734,17 @@ const result = switch (value) {
 ```cot
 // Cot for loops
 for item in items {
-    println(item);
+    println(item)
 }
 
 // With index
 for item, i in items {
-    println("${i}: ${item}");
+    println("${i}: ${item}")
 }
 
 // Range
 for i in 0..10 {
-    println(i);
+    println(i)
 }
 ```
 

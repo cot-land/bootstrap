@@ -15,7 +15,7 @@ A compiler is a program that translates code written in one language (like Cot) 
 └─────────────┘                              └─────────────┘
 
 fn main() i64 {              ───▶           01001000 10001001
-    return 42;                               11111000 10110000
+    return 42                                11111000 10110000
 }                                            00101010 11000011
 ```
 
@@ -52,7 +52,7 @@ Let's understand each stage:
 Source Code:                     Tokens:
 
 fn main() i64 {          ───▶    [fn] [main] [(] [)] [i64] [{]
-    return 42;                   [return] [42] [;]
+    return 42                    [return] [42]
 }                                [}]
 ```
 
@@ -64,7 +64,7 @@ The scanner reads your source code character by character and groups them into m
 | Identifiers | `main`, `foo`, `myVariable` |
 | Literals | `42`, `3.14`, `"hello"`, `true` |
 | Operators | `+`, `-`, `*`, `==`, `>=` |
-| Punctuation | `(`, `)`, `{`, `}`, `;`, `:` |
+| Punctuation | `(`, `)`, `{`, `}`, `:`, `,` |
 
 **Key insight:** The scanner doesn't understand what your code *means*. It just breaks it into pieces. `fn main()` and `fn 42()` both produce valid tokens, even though the second makes no sense.
 
@@ -148,11 +148,11 @@ The type checker walks through the AST and:
 
 ```cot
 fn add(a: i64, b: i64) i64 {
-    return a + b;      // ✓ OK: a and b are both i64, result is i64
+    return a + b      // ✓ OK: a and b are both i64, result is i64
 }
 
 fn broken() i64 {
-    return "hello";    // ✗ ERROR: expected i64, got string
+    return "hello"    // ✗ ERROR: expected i64, got string
 }
 ```
 
@@ -236,11 +236,11 @@ Why? It makes optimization much easier:
 **The tricky part:** What about conditionals?
 
 ```cot
-var x: i64;
+var x: i64
 if condition {
-    x = 1;
+    x = 1
 } else {
-    x = 2;
+    x = 2
 }
 // Which x do we use here?
 ```
@@ -336,15 +336,15 @@ Let's trace a simple program through the entire pipeline:
 
 ```cot
 fn main() i64 {
-    return 42;
+    return 42
 }
 ```
 
 ### Stage 1: Scanning
 ```
-"fn main() i64 { return 42; }"
+"fn main() i64 { return 42 }"
     ↓
-[fn] [main] [(] [)] [i64] [{] [return] [42] [;] [}] [EOF]
+[fn] [main] [(] [)] [i64] [{] [return] [42] [}] [EOF]
 ```
 
 ### Stage 2: Parsing

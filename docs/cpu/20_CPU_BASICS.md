@@ -201,7 +201,7 @@ ret                          ; Return (pops address from stack)
 **Example:**
 ```cot
 fn add(a: i64, b: i64, c: i64) i64 {
-    return a + b + c;
+    return a + b + c
 }
 ```
 
@@ -361,13 +361,13 @@ Let's trace this function:
 
 ```cot
 fn sum(n: i64) i64 {
-    var total: i64 = 0;
-    var i: i64 = 1;
+    var total: i64 = 0
+    var i: i64 = 1
     while i <= n {
-        total = total + i;
-        i = i + 1;
+        total = total + i
+        i = i + 1
     }
-    return total;
+    return total
 }
 ```
 

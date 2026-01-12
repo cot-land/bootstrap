@@ -77,9 +77,9 @@ Offset changes when we push/pop or call functions.
 
 ```cot
 fn example(a: i64, b: i64) i64 {
-    var x: i64 = a + 1;
-    var y: i64 = b * 2;
-    return x + y;
+    var x: i64 = a + 1
+    var y: i64 = b * 2
+    return x + y
 }
 ```
 
@@ -268,8 +268,8 @@ Some functions need dynamic stack space:
 
 ```cot
 fn make_buffer(size: i64) []u8 {
-    var buf: [size]u8;  // Variable-length array
-    return buf;
+    var buf: [size]u8  // Variable-length array
+    return buf
 }
 ```
 
@@ -370,9 +370,9 @@ pub fn build(self: *FuncBuilder) !Func {
 ```cot
 fn factorial(n: i64) i64 {
     if n <= 1 {
-        return 1;
+        return 1
     }
-    return n * factorial(n - 1);
+    return n * factorial(n - 1)
 }
 ```
 
