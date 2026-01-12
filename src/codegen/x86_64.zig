@@ -634,6 +634,34 @@ pub fn movzxRegMem8(buf: *CodeBuffer, dst: Reg, base: Reg, offset: i32) !void {
     }
 }
 
+/// MOVSX r64, byte [base+offset] - Load byte with sign extension
+pub fn movsxRegMem8(buf: *CodeBuffer, dst: Reg, base: Reg, offset: i32) !void {
+    // REX.W + 0F BE /r (sign-extend byte to quadword)
+    try buf.emit8(rex(true, dst, base));
+    try buf.emit8(0x0F);
+    try buf.emit8(0xBE); // Sign-extend (vs 0xB6 for zero-extend)
+
+    if (offset == 0 and base != .rbp and base != .r13) {
+        try buf.emit8(ModRM.regDisp(ModRM.indirect, dst, base));
+    } else if (offset >= -128 and offset <= 127) {
+        try buf.emit8(ModRM.regDisp(ModRM.disp8, dst, base));
+    } else {
+        try buf.emit8(ModRM.regDisp(ModRM.disp32, dst, base));
+    }
+
+    if (base == .rsp or base == .r12) {
+        try buf.emit8(0x24);
+    }
+
+    if (offset == 0 and base != .rbp and base != .r13) {
+        // No displacement
+    } else if (offset >= -128 and offset <= 127) {
+        try buf.emit8(@bitCast(@as(i8, @intCast(offset))));
+    } else {
+        try buf.emit32(@bitCast(offset));
+    }
+}
+
 /// MOV byte [base+offset], r8 - Store low byte of register
 pub fn movMem8Reg(buf: *CodeBuffer, base: Reg, offset: i32, src: Reg) !void {
     // REX prefix for extended registers or to access low byte of RSI/RDI/RSP/RBP

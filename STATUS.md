@@ -8,8 +8,8 @@
 
 | Platform | Status | Notes |
 |----------|--------|-------|
-| ARM64 (macOS) | ✅ 71/81 Pass | All tests pass, 10 skipped (no expected value) |
-| x86_64 (Linux) | ✅ 71/81 Pass | All tests pass, 10 skipped (no expected value) |
+| ARM64 (macOS) | ✅ 65/81 Pass | All tests pass, 16 skipped (no expected value) |
+| x86_64 (Linux) | ✅ 65/81 Pass | All tests pass, 16 skipped (no expected value) |
 
 ```bash
 # Fast validation (default - runs comprehensive test only)
@@ -33,10 +33,10 @@ zig build test                    # 135+ embedded tests
 
 | Progress | Count | Status |
 |----------|-------|--------|
-| Bootstrap .cot files done | 6/22 | 27% |
+| Bootstrap .cot files done | 7/22 | 32% |
 | Zig source files | 22 | Reference implementation |
 
-**Completed:** `token_boot.cot`, `source_boot.cot`, `scanner_boot.cot`, `ast_boot.cot`, `types_boot.cot`, `errors_boot.cot`
+**Completed:** `token_boot.cot`, `source_boot.cot`, `scanner_boot.cot`, `ast_boot.cot`, `types_boot.cot`, `errors_boot.cot`, `parser_boot.cot`
 
 ---
 

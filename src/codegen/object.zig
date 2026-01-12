@@ -574,8 +574,8 @@ pub const ObjectFile = struct {
 
         // Build symbol ordering: locals first, then globals
         // This is required by ELF - sh_info points to first global symbol
-        var local_indices: [64]u32 = undefined;
-        var global_indices: [64]u32 = undefined;
+        var local_indices: [256]u32 = undefined;
+        var global_indices: [256]u32 = undefined;
         var num_locals: u32 = 0;
         var num_globals: u32 = 0;
 
@@ -591,7 +591,7 @@ pub const ObjectFile = struct {
         }
 
         // Map from original index to ELF symbol index (1-based, 0 is null)
-        var sym_elf_index: [64]u32 = undefined;
+        var sym_elf_index: [256]u32 = undefined;
         for (local_indices[0..num_locals], 0..) |orig_idx, i| {
             sym_elf_index[orig_idx] = @intCast(i + 1);
         }
@@ -603,11 +603,11 @@ pub const ObjectFile = struct {
         const first_global_idx: u32 = num_locals + 1;
 
         // Build symbol string table (strtab)
-        var strtab: [2048]u8 = undefined;
+        var strtab: [8192]u8 = undefined;
         var strtab_len: u32 = 1; // Start with null byte
         strtab[0] = 0;
 
-        var sym_name_offsets: [64]u32 = undefined;
+        var sym_name_offsets: [256]u32 = undefined;
         for (self.symbols.items, 0..) |sym, i| {
             sym_name_offsets[i] = strtab_len;
             for (sym.name) |c| {

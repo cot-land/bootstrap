@@ -895,7 +895,14 @@ pub const CodeGen = struct {
         const dest = try self.allocReg(value.id);
 
         switch (size) {
-            1 => try x86.movzxRegMem8(self.buf, dest, .rbp, local.offset),
+            1 => {
+                // Use sign-extending load for signed types (i8)
+                if (self.type_reg.isSigned(value.type_idx)) {
+                    try x86.movsxRegMem8(self.buf, dest, .rbp, local.offset);
+                } else {
+                    try x86.movzxRegMem8(self.buf, dest, .rbp, local.offset);
+                }
+            },
             else => try x86.movRegMem(self.buf, dest, .rbp, local.offset),
         }
 
@@ -920,7 +927,10 @@ pub const CodeGen = struct {
 
         // Check source op type for special 16-byte handling
         // These ops leave ptr in rax, len/payload in rdx
-        if (src_value.op == .slice_make or src_value.op == .union_init or src_value.op == .const_slice or src_value.op == .str_concat) {
+        if (src_value.op == .slice_local or src_value.op == .slice_value or
+            src_value.op == .slice_make or src_value.op == .union_init or
+            src_value.op == .const_slice or src_value.op == .str_concat)
+        {
             // Store 16-byte value: ptr/tag at offset, len/payload at offset+8
             try x86.movMemReg(self.buf, .rbp, total_offset, .rax);
             try x86.movMemReg(self.buf, .rbp, total_offset + 8, .rdx);
