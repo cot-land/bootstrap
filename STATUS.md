@@ -1,6 +1,6 @@
 # Cot Implementation Status
 
-**Last Updated:** 2026-01-12
+**Last Updated:** 2026-01-13
 
 > **Claude: Update this file whenever you complete a feature or fix a test.**
 
@@ -33,10 +33,10 @@ zig build test                    # 135+ embedded tests
 
 | Progress | Count | Status |
 |----------|-------|--------|
-| Bootstrap .cot files done | 7/22 | 32% |
+| Bootstrap .cot files done | 8/22 | 36% |
 | Zig source files | 22 | Reference implementation |
 
-**Completed:** `token_boot.cot`, `source_boot.cot`, `scanner_boot.cot`, `ast_boot.cot`, `types_boot.cot`, `errors_boot.cot`, `parser_boot.cot`
+**Completed:** `token_boot.cot`, `source_boot.cot`, `scanner_boot.cot`, `ast_boot.cot`, `types_boot.cot`, `errors_boot.cot`, `parser_boot.cot`, `check_boot.cot`
 
 ---
 
@@ -55,7 +55,7 @@ zig build test                    # 135+ embedded tests
 | `string` | Done | Fat pointer (ptr + len) |
 | `void` | Done | Void type |
 | `?T` (optional) | Done | Optional types |
-| `*T` (pointer) | Partial | Type exists, codegen limited |
+| `*T` (pointer) | Done | Full support: `&x`, `p.*`, `p.*.field` |
 | `[N]T` (array) | Done | Fixed-size arrays |
 | `[]T` (slice) | Done | Fat pointer slices |
 | `type` aliases | Done | `type NodeIndex = u32` |
@@ -183,9 +183,12 @@ Location: `runtime/`
 |----------|---------|
 | `cot_str_concat` | String concatenation |
 | `cot_map_new` | Create map |
-| `cot_map_set` | Map insert |
-| `cot_map_get` | Map lookup |
-| `cot_map_has` | Map contains |
+| `cot_map_set` | Map insert (string keys) |
+| `cot_map_get` | Map lookup (string keys) |
+| `cot_map_has` | Map contains (string keys) |
+| `cot_map_set_int` | Map insert (integer keys) |
+| `cot_map_get_int` | Map lookup (integer keys) |
+| `cot_map_has_int` | Map contains (integer keys) |
 | `cot_map_free` | Free map |
 | `cot_list_push` | List append |
 | `cot_list_get` | List index |

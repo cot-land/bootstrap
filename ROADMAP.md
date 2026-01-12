@@ -1,6 +1,6 @@
 # Cot Self-Hosting Roadmap
 
-**Last Updated:** 2026-01-12
+**Last Updated:** 2026-01-13
 
 > **Claude: Update this file when you start or complete a roadmap item.**
 
@@ -53,7 +53,7 @@ Every Zig source file needs a corresponding bootstrap .cot file that uses only s
 | `src/ast.zig` | `src/bootstrap/ast_boot.cot` | **Done** | AST node types |
 | `src/types.zig` | `src/bootstrap/types_boot.cot` | **Done** | Type registry with 14-variant union |
 | `src/parser.zig` | `src/bootstrap/parser_boot.cot` | **Done** | Parser |
-| `src/check.zig` | `src/bootstrap/check_boot.cot` | TODO | Type checker |
+| `src/check.zig` | `src/bootstrap/check_boot.cot` | **Done** | Type checker (basic tests) |
 | `src/errors.zig` | `src/bootstrap/errors_boot.cot` | **Done** | Error handling |
 | `src/ir.zig` | `src/bootstrap/ir_boot.cot` | TODO | IR definitions |
 | `src/lower.zig` | `src/bootstrap/lower_boot.cot` | TODO | AST → IR lowering |
@@ -71,7 +71,7 @@ Every Zig source file needs a corresponding bootstrap .cot file that uses only s
 | `src/debug.zig` | `src/bootstrap/debug_boot.cot` | TODO | Debug output utilities |
 | `src/type_context.zig` | `src/bootstrap/type_context_boot.cot` | TODO | Type context for checker |
 
-**Progress: 7/22 files complete**
+**Progress: 8/22 files complete**
 
 ---
 
@@ -104,6 +104,9 @@ The bootstrap .cot files must use ONLY these features (already working in Zig co
 - Method calls: `obj.method(args)`
 - Struct literals: `Point{ .x = 1, .y = 2 }`
 - Null coalescing: `x ?? default`
+- Address-of: `&x` (get pointer)
+- Dereference: `p.*` (access through pointer)
+- Pointer field access: `p.*.field`
 
 **Statements:**
 - `var x = value;` / `const x = value;`
@@ -133,8 +136,6 @@ These features exist in wireframe .cot files but are NOT in Zig compiler yet:
 - `if x |val| { }` - optional capture
 - `while iter() |item| { }` - while capture
 - `for item, i in arr { }` - for with index
-- `&x` - address-of operator
-- `p.*` - explicit dereference
 - `!T` / `try` / `catch` - error handling
 - `fn(T) R` - function types as values
 - `import "module"` - module system
@@ -159,7 +160,7 @@ These features exist in wireframe .cot files but are NOT in Zig compiler yet:
 5. ✅ `types_boot.cot` - Type registry (DONE)
 6. ✅ `errors_boot.cot` - Error types (DONE)
 7. ✅ `parser_boot.cot` - Parser (DONE)
-8. `check_boot.cot` - Type checker
+8. ✅ `check_boot.cot` - Type checker (DONE)
 9. `ir_boot.cot` - IR definitions
 10. `lower_boot.cot` - Lowering
 11. `ssa_boot.cot` - SSA conversion
@@ -176,7 +177,7 @@ Only add features if they're absolutely required and can't be worked around:
 |---------|----------|----------------------|
 | For with index | Medium | Use counter variable |
 | Bitwise operators | Medium | Runtime FFI calls |
-| Address-of `&x` | Low | Pass by value, use indices |
+| ~~Address-of `&x`~~ | ~~Low~~ | ✅ **DONE** - Full pointer support added |
 
 ### Phase 3: Self-Hosting Test
 
@@ -235,7 +236,7 @@ After self-hosting, we can gradually migrate from bootstrap files to wireframe f
 
 | Blocker | Impact | Solution |
 |---------|--------|----------|
-| No address-of `&x` | Can't take pointers | Use indices instead |
+| ~~No address-of `&x`~~ | ~~Can't take pointers~~ | ✅ **RESOLVED** - Full pointer support |
 | No error handling | Can't propagate errors | Return error codes |
 | No imports | Single file compilation | File concatenation |
 
