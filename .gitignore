@@ -51,3 +51,4 @@ test_type_alias
 test_bool_or
 test_for_slice
 test_list_methods
+test_comprehensive

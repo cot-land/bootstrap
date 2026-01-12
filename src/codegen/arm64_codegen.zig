@@ -805,7 +805,10 @@ pub const CodeGen = struct {
             try aarch64.movRegImm64(self.buf, len_reg, @intCast(stripped.len));
         } else if (val.op == .load or val.op == .copy or val.op == .arg) {
             // Variable: load ptr and len from stack (string is fat pointer: 8 bytes ptr + 8 bytes len)
-            const local_idx: u32 = @intCast(val.aux_int);
+            // For load ops, local index is in args[0], not aux_int
+            const val_args = val.args();
+            if (val_args.len == 0) return;
+            const local_idx: u32 = @intCast(val_args[0]);
             if (local_idx < self.func.locals.len) {
                 const offset = self.func.locals[local_idx].offset;
                 const sp_offset = convertOffset(offset, self.stack_size);
@@ -850,14 +853,18 @@ pub const CodeGen = struct {
                 reg_idx += 2; // String takes 2 registers
             } else if (arg_val.type_idx == types.TypeRegistry.STRING and (arg_val.op == .load or arg_val.op == .copy or arg_val.op == .arg)) {
                 // String variable: load ptr and len from stack
-                const local_idx: u32 = @intCast(arg_val.aux_int);
-                if (local_idx < self.func.locals.len) {
-                    const offset = self.func.locals[local_idx].offset;
-                    const sp_offset = convertOffset(offset, self.stack_size);
-                    const sp_offset_plus8 = convertOffset(offset + 8, self.stack_size);
-                    try aarch64.ldrRegImm(self.buf, arg_regs[reg_idx], .sp, sp_offset);
-                    if (reg_idx + 1 < arg_regs.len) {
-                        try aarch64.ldrRegImm(self.buf, arg_regs[reg_idx + 1], .sp, sp_offset_plus8);
+                // For load ops, local index is in args[0], not aux_int
+                const arg_val_args = arg_val.args();
+                if (arg_val_args.len > 0) {
+                    const local_idx: u32 = @intCast(arg_val_args[0]);
+                    if (local_idx < self.func.locals.len) {
+                        const offset = self.func.locals[local_idx].offset;
+                        const sp_offset = convertOffset(offset, self.stack_size);
+                        const sp_offset_plus8 = convertOffset(offset + 8, self.stack_size);
+                        try aarch64.ldrRegImm(self.buf, arg_regs[reg_idx], .sp, sp_offset);
+                        if (reg_idx + 1 < arg_regs.len) {
+                            try aarch64.ldrRegImm(self.buf, arg_regs[reg_idx + 1], .sp, sp_offset_plus8);
+                        }
                     }
                 }
                 reg_idx += 2; // String takes 2 registers
@@ -1145,8 +1152,10 @@ pub const CodeGen = struct {
         if (maybe_local_or_ssa < self.func.values.items.len) {
             const union_val = &self.func.values.items[maybe_local_or_ssa];
             if (union_val.op == .load) {
-                // The load's aux_int is the local index
-                const local_idx: usize = @intCast(union_val.aux_int);
+                // The load's local index is in args[0], not aux_int
+                const load_args = union_val.args();
+                if (load_args.len == 0) return;
+                const local_idx: usize = @intCast(load_args[0]);
                 if (local_idx < self.func.locals.len) {
                     const local = self.func.locals[local_idx];
                     const sp_offset = convertOffset(local.offset, self.stack_size);
@@ -1181,8 +1190,10 @@ pub const CodeGen = struct {
         if (maybe_local_or_ssa < self.func.values.items.len) {
             const union_val = &self.func.values.items[maybe_local_or_ssa];
             if (union_val.op == .load) {
-                // The load's aux_int is the local index
-                const local_idx: usize = @intCast(union_val.aux_int);
+                // The load's local index is in args[0], not aux_int
+                const load_args = union_val.args();
+                if (load_args.len == 0) return;
+                const local_idx: usize = @intCast(load_args[0]);
                 if (local_idx < self.func.locals.len) {
                     const local = self.func.locals[local_idx];
                     const payload_offset = convertOffset(local.offset + 8, self.stack_size);
@@ -1484,7 +1495,10 @@ pub const CodeGen = struct {
             try aarch64.loadSymbolAddr(self.buf, .x0, sym_name);
             try aarch64.movRegImm64(self.buf, .x1, @intCast(stripped.len));
         } else if (str1_val.op == .load or str1_val.op == .copy) {
-            const local_idx: u32 = @intCast(str1_val.aux_int);
+            // For load ops, local index is in args[0], not aux_int
+            const str1_args = str1_val.args();
+            if (str1_args.len == 0) return;
+            const local_idx: u32 = @intCast(str1_args[0]);
             if (local_idx < self.func.locals.len) {
                 const offset = self.func.locals[local_idx].offset;
                 const sp_offset = convertOffset(offset, self.stack_size);
@@ -1508,7 +1522,10 @@ pub const CodeGen = struct {
             try aarch64.loadSymbolAddr(self.buf, .x2, sym_name);
             try aarch64.movRegImm64(self.buf, .x3, @intCast(stripped.len));
         } else if (str2_val.op == .load or str2_val.op == .copy) {
-            const local_idx: u32 = @intCast(str2_val.aux_int);
+            // For load ops, local index is in args[0], not aux_int
+            const str2_args = str2_val.args();
+            if (str2_args.len == 0) return;
+            const local_idx: u32 = @intCast(str2_args[0]);
             if (local_idx < self.func.locals.len) {
                 const offset = self.func.locals[local_idx].offset;
                 const sp_offset = convertOffset(offset, self.stack_size);

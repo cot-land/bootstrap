@@ -1424,6 +1424,16 @@ pub const Lowerer = struct {
                                     log.debug("  len(array var) constant folded to {d}", .{a.length});
                                     return try fb.emit(node);
                                 },
+                                .basic => |k| {
+                                    if (k == .string_type) {
+                                        // String is ptr+len, len is at offset 8
+                                        const node = ir.Node.init(.field, TypeRegistry.INT, Span.fromPos(Pos.zero))
+                                            .withArgs(&.{@as(ir.NodeIndex, @intCast(local_idx))})
+                                            .withAux(8); // len is at offset 8
+                                        log.debug("  len(string var) runtime: local={d}, offset=8", .{local_idx});
+                                        return try fb.emit(node);
+                                    }
+                                },
                                 else => {},
                             }
                         }

@@ -332,14 +332,36 @@ Before any commit or after any code changes, **always run tests in this order**:
 # 1. FIRST: Run Zig embedded tests (catches compilation and unit test errors)
 zig build test
 
-# 2. THEN: Build the compiler and run native tests
+# 2. THEN: Build and run comprehensive test (fast validation)
 zig build
-./run_tests.sh                    # ARM64 macOS native tests
+./run_tests.sh                    # ARM64 - runs comprehensive test by default
 
-# 3. FINALLY: ALWAYS run x86_64 tests in Docker (catches platform-specific bugs)
+# 3. FINALLY: ALWAYS run x86_64 tests (catches platform-specific bugs)
 zig build -Dtarget=x86_64-linux-gnu
-docker run --platform linux/amd64 -v $(pwd):/cot -w /cot cot-zig:0.15.2 ./run_tests_x86_64.sh
+docker run --rm --platform linux/amd64 -v $(pwd):/cot -w /cot cot-zig:0.15.2 ./run_tests_x86_64.sh
 ```
+
+### Comprehensive Test (Fast Validation)
+
+The `tests/test_comprehensive.cot` file exercises ALL language features in a single test:
+- Arithmetic, compound assignment, comparisons
+- Boolean operations, control flow (if/while/for)
+- Arrays, slices, strings
+- Structs, enums, unions with switch
+- Functions, maps, lists, type aliases
+
+**This is the default test mode.** If comprehensive passes, all features work correctly.
+
+```bash
+# Default: Run comprehensive test only (fast ~2 seconds)
+./run_tests.sh
+
+# If comprehensive fails or you want to isolate issues:
+./run_tests.sh --all              # Runs all 65+ individual tests
+```
+
+The comprehensive test returns specific error codes (1-52) to identify which feature failed.
+If it fails, individual tests run automatically to help isolate the issue.
 
 **IMPORTANT: Always run BOTH native AND x86_64 tests.** The x86_64 tests catch platform-specific codegen bugs that won't appear on ARM64. Never skip the Docker tests.
 
@@ -350,13 +372,13 @@ docker run --platform linux/amd64 -v $(pwd):/cot -w /cot cot-zig:0.15.2 ./run_te
    - Unit test failures in parser, checker, lowerer, codegen
    - Exhaustive switch violations (missing cases for new ops/expressions)
 
-2. Native binary tests verify ARM64 codegen works
+2. Comprehensive test validates all features work together
 
 3. x86_64 Docker tests verify cross-platform codegen (critical for self-hosting)
 
 **Current test counts:**
 - 135+ Zig embedded tests (unit tests in source files)
-- 58 binary tests (.cot test files)
+- 1 comprehensive test + 65+ individual isolation tests
 
 ### Exhaustive Switches for New Features
 

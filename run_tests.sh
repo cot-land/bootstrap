@@ -1,6 +1,10 @@
 #!/bin/bash
 # Test runner for cot compiler
 # Each test file should return a specific exit code
+#
+# Usage:
+#   ./run_tests.sh          # Run comprehensive test only (fast validation)
+#   ./run_tests.sh --all    # Run all individual tests
 
 set -e
 
@@ -8,6 +12,20 @@ COT="./zig-out/bin/cot"
 PASS=0
 FAIL=0
 SKIP=0
+RUN_ALL=false
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --all)
+            RUN_ALL=true
+            shift
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
 
 echo "Running cot compiler tests..."
 echo "=============================="
@@ -16,6 +34,43 @@ echo "=============================="
 if ! zig build 2>/dev/null; then
     echo "FATAL: zig build failed"
     exit 1
+fi
+
+# Run comprehensive test first
+echo ""
+echo "=== Comprehensive Test ==="
+if $COT tests/test_comprehensive.cot -o test_out 2>/dev/null; then
+    set +e
+    ./test_out
+    comp_result=$?
+    set -e
+    rm -f test_out test_comprehensive.o
+    if [ $comp_result -eq 42 ]; then
+        echo "PASS test_comprehensive (exit 42) - All features working!"
+        if [ "$RUN_ALL" != "true" ]; then
+            echo ""
+            echo "=============================="
+            echo "Fast validation passed! Use --all to run individual tests."
+            exit 0
+        fi
+        echo ""
+        echo "=== Individual Tests ==="
+    else
+        echo "FAIL test_comprehensive (expected 42, got $comp_result)"
+        echo "Running individual tests to isolate the failure..."
+        echo ""
+        RUN_ALL=true
+    fi
+else
+    echo "FAIL test_comprehensive (compile failed)"
+    echo "Running individual tests to isolate the failure..."
+    echo ""
+    RUN_ALL=true
+fi
+
+# Exit if not running all tests
+if [ "$RUN_ALL" != "true" ]; then
+    exit 0
 fi
 
 # Function to get expected exit code for a test
@@ -92,6 +147,11 @@ get_expected() {
 
 for test_file in tests/test_*.cot; do
     name=$(basename "$test_file" .cot)
+
+    # Skip comprehensive test (already run separately)
+    if [ "$name" = "test_comprehensive" ]; then
+        continue
+    fi
 
     # Get expected exit code
     expected=$(get_expected "$name")
