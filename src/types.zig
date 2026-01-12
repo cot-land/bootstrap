@@ -402,14 +402,7 @@ pub const TypeRegistry = struct {
             .optional => |o| self.sizeOf(o.elem) + 8, // value + flag (simplified, rounded)
             .slice => 16, // ptr + len
             .array => |a| self.sizeOf(a.elem) * @as(u32, @intCast(a.length)),
-            .struct_type => |s| blk: {
-                var size: u32 = 0;
-                for (s.fields) |field| {
-                    // Simplified: no padding for now
-                    size += self.sizeOf(field.type_idx);
-                }
-                break :blk size;
-            },
+            .struct_type => |s| s.size, // Use precomputed size with alignment
             .enum_type => |e| self.sizeOf(e.backing_type),
             .union_type => |u| blk: {
                 // Union size = 8-byte aligned tag + max payload size
@@ -429,6 +422,32 @@ pub const TypeRegistry = struct {
             .map_type => 8, // pointer to heap-allocated map
             .list_type => 8, // pointer to heap-allocated list
             else => 8, // Default to 8 bytes for unknown types
+        };
+    }
+
+    /// Get the alignment of a type in bytes.
+    /// Following Go's pattern: alignment = natural alignment for basic types.
+    /// This is the SINGLE SOURCE OF TRUTH for type alignment.
+    pub fn alignmentOf(self: *const TypeRegistry, idx: TypeIndex) u32 {
+        const t = self.get(idx);
+        return switch (t) {
+            .basic => |b| switch (b) {
+                .i8_type, .u8_type, .bool_type => 1,
+                .i16_type, .u16_type => 2,
+                .i32_type, .u32_type, .f32_type => 4,
+                .i64_type, .u64_type, .f64_type => 8,
+                .void_type, .invalid => 1,
+                else => 8, // Default to pointer alignment (untyped types)
+            },
+            .pointer, .func => 8,
+            .slice => 8, // align to ptr
+            .optional => |o| self.alignmentOf(o.elem),
+            .array => |a| self.alignmentOf(a.elem),
+            .struct_type => |s| s.alignment,
+            .enum_type => |e| self.alignmentOf(e.backing_type),
+            .union_type => 8, // unions always 8-byte aligned
+            .map_type, .list_type => 8,
+            else => 8,
         };
     }
 

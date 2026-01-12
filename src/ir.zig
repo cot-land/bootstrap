@@ -21,6 +21,16 @@ const Span = source.Span;
 const Pos = source.Pos;
 
 // ============================================================================
+// Constants
+// ============================================================================
+
+/// Maximum args stored inline in Node.
+/// IR needs more than SSA because function calls can have many args.
+/// SSA uses 3 inline + overflow, but IR is simpler - just use a larger limit.
+/// 8 covers most function calls (ARM64/x86_64 pass 8 args in registers).
+pub const MAX_INLINE_ARGS: u8 = 8;
+
+// ============================================================================
 // Node Index
 // ============================================================================
 
@@ -234,8 +244,8 @@ pub const Node = struct {
     op: Op,
     /// Result type.
     type_idx: TypeIndex,
-    /// Inline storage for operand indices (most nodes have 0-3 args).
-    args_storage: [4]NodeIndex = .{ 0, 0, 0, 0 },
+    /// Inline storage for operand indices (most nodes have 0-7 args).
+    args_storage: [MAX_INLINE_ARGS]NodeIndex = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
     /// Number of valid args in args_storage.
     args_len: u8 = 0,
     /// Auxiliary integer data (local index, field offset, etc.)
@@ -251,7 +261,7 @@ pub const Node = struct {
         return .{
             .op = op,
             .type_idx = type_idx,
-            .args_storage = .{ 0, 0, 0, 0 },
+            .args_storage = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
             .args_len = 0,
             .aux = 0,
             .aux_str = "",
@@ -268,10 +278,10 @@ pub const Node = struct {
     pub fn withArgs(self: Node, arg_slice: []const NodeIndex) Node {
         var n = self;
         for (arg_slice, 0..) |arg, i| {
-            if (i >= 4) break;
+            if (i >= MAX_INLINE_ARGS) break;
             n.args_storage[i] = arg;
         }
-        n.args_len = @intCast(@min(arg_slice.len, 4));
+        n.args_len = @intCast(@min(arg_slice.len, MAX_INLINE_ARGS));
         return n;
     }
 

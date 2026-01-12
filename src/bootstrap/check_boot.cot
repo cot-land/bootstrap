@@ -1,0 +1,490 @@
+// Type checker for cot bootstrap.
+// Simplified version using only currently-supported features.
+//
+// Changes from original check.zig:
+// - Standalone functions instead of methods
+// - No pointer types (*Checker, *Scope)
+// - Uses Map<string, Symbol> for scope symbols
+// - Simplified error handling (no callbacks)
+// - Type indices as int (not TypeIndex type alias)
+
+// =============================================================================
+// Type Indices (from types_boot.cot)
+// =============================================================================
+
+type TypeIndex = int
+const invalid_type: int = @maxInt(i64)
+
+const TYPE_INVALID: TypeIndex = 0
+const TYPE_BOOL: TypeIndex = 1
+const TYPE_I8: TypeIndex = 2
+const TYPE_I16: TypeIndex = 3
+const TYPE_I32: TypeIndex = 4
+const TYPE_I64: TypeIndex = 5
+const TYPE_U8: TypeIndex = 6
+const TYPE_U16: TypeIndex = 7
+const TYPE_U32: TypeIndex = 8
+const TYPE_U64: TypeIndex = 9
+const TYPE_F32: TypeIndex = 10
+const TYPE_F64: TypeIndex = 11
+const TYPE_VOID: TypeIndex = 12
+const TYPE_STRING: TypeIndex = 13
+const TYPE_INT: TypeIndex = 5
+const TYPE_FLOAT: TypeIndex = 11
+
+const TYPE_UNTYPED_INT: TypeIndex = 14
+const TYPE_UNTYPED_FLOAT: TypeIndex = 15
+const TYPE_UNTYPED_BOOL: TypeIndex = 16
+
+// =============================================================================
+// Node Index (from ast_boot.cot)
+// =============================================================================
+
+type NodeIndex = int
+const null_node: NodeIndex = @maxInt(i64)
+
+// =============================================================================
+// Symbol
+// =============================================================================
+
+enum SymbolKind: u8 {
+    variable,
+    constant,
+    function,
+    type_name,
+    parameter,
+}
+
+struct Symbol {
+    name: string,
+    kind: SymbolKind,
+    type_idx: TypeIndex,
+    node: NodeIndex,
+    mutable: bool,
+}
+
+fn symbolInit(name: string, kind: SymbolKind, type_idx: TypeIndex, node: NodeIndex, mutable: bool) Symbol {
+    return Symbol{
+        .name = name,
+        .kind = kind,
+        .type_idx = type_idx,
+        .node = node,
+        .mutable = mutable,
+    }
+}
+
+fn symbolIsValid(sym: Symbol) bool {
+    return len(sym.name) > 0
+}
+
+// =============================================================================
+// Scope
+// =============================================================================
+
+struct Scope {
+    symbols: Map<string, Symbol>,
+    parent_idx: int,
+}
+
+fn scopeInit(parent_idx: int) Scope {
+    return Scope{
+        .symbols = new Map<string, Symbol>(),
+        .parent_idx = parent_idx,
+    }
+}
+
+fn scopeDefine(scope: Scope, sym: Symbol) void {
+    scope.symbols.set(sym.name, sym)
+}
+
+// =============================================================================
+// Method Info
+// =============================================================================
+
+struct MethodInfo {
+    name: string,
+    func_name: string,
+    func_type: TypeIndex,
+    receiver_is_ptr: bool,
+}
+
+// =============================================================================
+// Checker State
+// =============================================================================
+
+struct Checker {
+    scopes: List<Scope>,
+    current_scope_idx: int,
+    expr_types: Map<int, TypeIndex>,
+    method_registry: Map<string, int>,
+    methods: List<MethodInfo>,
+    current_return_type: TypeIndex,
+    in_loop: bool,
+    error_count: int,
+}
+
+fn checkerInit() Checker {
+    var checker: Checker = Checker{
+        .scopes = new List<Scope>(),
+        .current_scope_idx = -1,
+        .expr_types = new Map<int, TypeIndex>(),
+        .method_registry = new Map<string, int>(),
+        .methods = new List<MethodInfo>(),
+        .current_return_type = TYPE_VOID,
+        .in_loop = false,
+        .error_count = 0,
+    }
+
+    var global_scope: Scope = scopeInit(-1)
+    checker.scopes.push(global_scope)
+    checker.current_scope_idx = 0
+
+    return checker
+}
+
+// =============================================================================
+// Scope Management
+// =============================================================================
+
+fn checkerCurrentScope(checker: Checker) Scope {
+    var scopes: List<Scope> = checker.scopes
+    var idx: int = checker.current_scope_idx
+    return scopes.get(idx)
+}
+
+fn checkerPushScope(checker: Checker) void {
+    var new_scope: Scope = scopeInit(checker.current_scope_idx)
+    checker.scopes.push(new_scope)
+    checker.current_scope_idx = len(checker.scopes) - 1
+}
+
+fn checkerPopScope(checker: Checker) void {
+    var scopes: List<Scope> = checker.scopes
+    var idx: int = checker.current_scope_idx
+    var current: Scope = scopes.get(idx)
+    checker.current_scope_idx = current.parent_idx
+}
+
+fn checkerDefine(checker: Checker, sym: Symbol) void {
+    var scope: Scope = checkerCurrentScope(checker)
+    scopeDefine(scope, sym)
+}
+
+fn checkerLookup(checker: Checker, name: string) Symbol {
+    var scopes: List<Scope> = checker.scopes
+    var scope_idx: int = checker.current_scope_idx
+    while scope_idx >= 0 {
+        var scope: Scope = scopes.get(scope_idx)
+        if scope.symbols.has(name) {
+            return scope.symbols.get(name)
+        }
+        scope_idx = scope.parent_idx
+    }
+    return symbolInit("", SymbolKind.variable, invalid_type, null_node, false)
+}
+
+// =============================================================================
+// Expression Type Cache
+// =============================================================================
+
+fn checkerSetExprType(checker: Checker, node_idx: NodeIndex, type_idx: TypeIndex) void {
+    checker.expr_types.set(node_idx, type_idx)
+}
+
+fn checkerGetExprType(checker: Checker, node_idx: NodeIndex) TypeIndex {
+    if checker.expr_types.has(node_idx) {
+        return checker.expr_types.get(node_idx)
+    }
+    return invalid_type
+}
+
+// =============================================================================
+// Method Registry
+// =============================================================================
+
+fn checkerRegisterMethod(checker: Checker, type_name: string, info: MethodInfo) void {
+    var idx: int = len(checker.methods)
+    checker.methods.push(info)
+    checker.method_registry.set(type_name, idx)
+}
+
+fn checkerLookupMethod(checker: Checker, type_name: string, method_name: string) MethodInfo {
+    var methods: List<MethodInfo> = checker.methods
+    var i: int = 0
+    while i < len(methods) {
+        var m: MethodInfo = methods.get(i)
+        if m.name == method_name {
+            return m
+        }
+        i = i + 1
+    }
+    return MethodInfo{
+        .name = "",
+        .func_name = "",
+        .func_type = invalid_type,
+        .receiver_is_ptr = false,
+    }
+}
+
+fn methodInfoIsValid(info: MethodInfo) bool {
+    return len(info.name) > 0
+}
+
+// =============================================================================
+// Error Reporting (simplified)
+// =============================================================================
+
+fn checkerError(checker: Checker, msg: string) void {
+    checker.error_count = checker.error_count + 1
+}
+
+fn checkerHasErrors(checker: Checker) bool {
+    return checker.error_count > 0
+}
+
+// =============================================================================
+// Type Predicates
+// =============================================================================
+
+fn isIntegerType(type_idx: TypeIndex) bool {
+    return type_idx == TYPE_I8 or type_idx == TYPE_I16 or
+           type_idx == TYPE_I32 or type_idx == TYPE_I64 or
+           type_idx == TYPE_U8 or type_idx == TYPE_U16 or
+           type_idx == TYPE_U32 or type_idx == TYPE_U64 or
+           type_idx == TYPE_UNTYPED_INT
+}
+
+fn isSignedType(type_idx: TypeIndex) bool {
+    return type_idx == TYPE_I8 or type_idx == TYPE_I16 or
+           type_idx == TYPE_I32 or type_idx == TYPE_I64
+}
+
+fn isFloatType(type_idx: TypeIndex) bool {
+    return type_idx == TYPE_F32 or type_idx == TYPE_F64 or
+           type_idx == TYPE_UNTYPED_FLOAT
+}
+
+fn isNumericType(type_idx: TypeIndex) bool {
+    return isIntegerType(type_idx) or isFloatType(type_idx)
+}
+
+fn isBoolType(type_idx: TypeIndex) bool {
+    return type_idx == TYPE_BOOL or type_idx == TYPE_UNTYPED_BOOL
+}
+
+fn isUntypedType(type_idx: TypeIndex) bool {
+    return type_idx == TYPE_UNTYPED_INT or
+           type_idx == TYPE_UNTYPED_FLOAT or
+           type_idx == TYPE_UNTYPED_BOOL
+}
+
+// =============================================================================
+// Type Materialization
+// =============================================================================
+
+fn materializeType(type_idx: TypeIndex) TypeIndex {
+    if type_idx == TYPE_UNTYPED_INT {
+        return TYPE_INT
+    }
+    if type_idx == TYPE_UNTYPED_FLOAT {
+        return TYPE_FLOAT
+    }
+    if type_idx == TYPE_UNTYPED_BOOL {
+        return TYPE_BOOL
+    }
+    return type_idx
+}
+
+// =============================================================================
+// Type Assignability
+// =============================================================================
+
+fn isAssignable(from: TypeIndex, to: TypeIndex) bool {
+    if from == invalid_type or to == invalid_type {
+        return true
+    }
+    if from == to {
+        return true
+    }
+    if from == TYPE_UNTYPED_INT and isIntegerType(to) {
+        return true
+    }
+    if from == TYPE_UNTYPED_FLOAT and isFloatType(to) {
+        return true
+    }
+    if from == TYPE_UNTYPED_BOOL and to == TYPE_BOOL {
+        return true
+    }
+    return false
+}
+
+// =============================================================================
+// Type Comparability
+// =============================================================================
+
+fn isComparable(a: TypeIndex, b: TypeIndex) bool {
+    if a == b {
+        return true
+    }
+    if isNumericType(a) and isNumericType(b) {
+        return true
+    }
+    if a == TYPE_STRING and b == TYPE_STRING {
+        return true
+    }
+    return false
+}
+
+// =============================================================================
+// Basic Type Lookup
+// =============================================================================
+
+fn lookupBasicType(name: string) TypeIndex {
+    if name == "bool" { return TYPE_BOOL }
+    if name == "i8" { return TYPE_I8 }
+    if name == "i16" { return TYPE_I16 }
+    if name == "i32" { return TYPE_I32 }
+    if name == "i64" { return TYPE_I64 }
+    if name == "u8" { return TYPE_U8 }
+    if name == "u16" { return TYPE_U16 }
+    if name == "u32" { return TYPE_U32 }
+    if name == "u64" { return TYPE_U64 }
+    if name == "f32" { return TYPE_F32 }
+    if name == "f64" { return TYPE_F64 }
+    if name == "void" { return TYPE_VOID }
+    if name == "int" { return TYPE_INT }
+    if name == "float" { return TYPE_FLOAT }
+    if name == "string" { return TYPE_STRING }
+    return invalid_type
+}
+
+// =============================================================================
+// Type Size Calculation
+// =============================================================================
+
+fn typeSize(type_idx: TypeIndex) int {
+    if type_idx == TYPE_BOOL { return 1 }
+    if type_idx == TYPE_I8 { return 1 }
+    if type_idx == TYPE_U8 { return 1 }
+    if type_idx == TYPE_I16 { return 2 }
+    if type_idx == TYPE_U16 { return 2 }
+    if type_idx == TYPE_I32 { return 4 }
+    if type_idx == TYPE_U32 { return 4 }
+    if type_idx == TYPE_F32 { return 4 }
+    if type_idx == TYPE_I64 { return 8 }
+    if type_idx == TYPE_U64 { return 8 }
+    if type_idx == TYPE_F64 { return 8 }
+    if type_idx == TYPE_STRING { return 16 }
+    return 8
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+fn main() int {
+    // Test 1: Checker initialization
+    var checker: Checker = checkerInit()
+    if checker.current_scope_idx != 0 {
+        return 1
+    }
+
+    // Test 2: Symbol definition and lookup
+    var sym: Symbol = symbolInit("x", SymbolKind.variable, TYPE_INT, 0, true)
+    checkerDefine(checker, sym)
+
+    var found: Symbol = checkerLookup(checker, "x")
+    if not symbolIsValid(found) {
+        return 2
+    }
+    if found.type_idx != TYPE_INT {
+        return 3
+    }
+
+    // Test 3: Nested scope lookup
+    checkerPushScope(checker)
+    var inner_sym: Symbol = symbolInit("y", SymbolKind.variable, TYPE_BOOL, 1, false)
+    checkerDefine(checker, inner_sym)
+
+    var found_y: Symbol = checkerLookup(checker, "y")
+    if not symbolIsValid(found_y) {
+        return 4
+    }
+
+    var found_x: Symbol = checkerLookup(checker, "x")
+    if not symbolIsValid(found_x) {
+        return 5
+    }
+
+    checkerPopScope(checker)
+
+    var found_x2: Symbol = checkerLookup(checker, "x")
+    if not symbolIsValid(found_x2) {
+        return 6
+    }
+
+    var not_found_y: Symbol = checkerLookup(checker, "y")
+    if symbolIsValid(not_found_y) {
+        return 7
+    }
+
+    // Test 4: Type predicates
+    if not isIntegerType(TYPE_I64) {
+        return 8
+    }
+    if not isNumericType(TYPE_F32) {
+        return 9
+    }
+    if not isBoolType(TYPE_BOOL) {
+        return 10
+    }
+
+    // Test 5: Type materialization
+    var mat: TypeIndex = materializeType(TYPE_UNTYPED_INT)
+    if mat != TYPE_INT {
+        return 11
+    }
+
+    // Test 6: Type assignability
+    if not isAssignable(TYPE_UNTYPED_INT, TYPE_I32) {
+        return 12
+    }
+    if isAssignable(TYPE_BOOL, TYPE_INT) {
+        return 13
+    }
+
+    // Test 7: Type comparability
+    if not isComparable(TYPE_I32, TYPE_I64) {
+        return 14
+    }
+    if isComparable(TYPE_BOOL, TYPE_INT) {
+        return 15
+    }
+
+    // Test 8: Basic type lookup
+    var int_idx: TypeIndex = lookupBasicType("int")
+    if int_idx != TYPE_INT {
+        return 16
+    }
+
+    // Test 9: Type size
+    var i64_size: int = typeSize(TYPE_I64)
+    if i64_size != 8 {
+        return 17
+    }
+
+    // Test 10: Expression type cache
+    checkerSetExprType(checker, 100, TYPE_STRING)
+    var cached: TypeIndex = checkerGetExprType(checker, 100)
+    if cached != TYPE_STRING {
+        return 18
+    }
+
+    // Test 11: Error tracking
+    checkerError(checker, "test error")
+    if not checkerHasErrors(checker) {
+        return 19
+    }
+
+    return 42
+}

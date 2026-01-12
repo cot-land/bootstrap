@@ -1,0 +1,24 @@
+// Test simple struct initialization
+
+struct Data {
+    name: string,      // 16 bytes (offset 0)
+    field1: u32,       // 4 bytes (offset 16)
+    field2: u32,       // 4 bytes (offset 20)
+}
+
+fn main() int {
+    var val: Data = Data{
+        .name = "test",
+        .field1 = 111,
+        .field2 = 222,
+    }
+
+    if val.field1 != 111 {
+        return 1
+    }
+    if val.field2 != 222 {
+        return 2
+    }
+
+    return 42
+}

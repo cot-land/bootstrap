@@ -1191,16 +1191,12 @@ fn convertIRNode(func: *ssa.Func, node: *const ir.Node, ir_to_ssa: *std.AutoHash
         },
         else => {
             // All other ops: convert all args to SSA refs
-            var arg_count: u8 = 0;
+            // Use addArg to handle overflow to args_extra properly
             for (node.args()) |ir_arg| {
                 if (ir_to_ssa.get(ir_arg)) |ssa_arg| {
-                    if (arg_count < 3) {
-                        value.args_storage[arg_count] = ssa_arg;
-                        arg_count += 1;
-                    }
+                    try value.addArg(ssa_arg, func.allocator);
                 }
             }
-            value.args_len = arg_count;
         },
     }
 

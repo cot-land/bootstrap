@@ -27,6 +27,15 @@ const Allocator = std.mem.Allocator;
 const log = debug.scoped(.ssa);
 
 // ============================================================================
+// Constants (Go-inspired inline storage limits)
+// ============================================================================
+
+/// Maximum args stored inline in Value (Go uses 3).
+/// Operations with more args overflow to heap-allocated args_extra.
+/// This is the SINGLE SOURCE OF TRUTH for the inline arg limit.
+pub const MAX_INLINE_ARGS: u8 = 3;
+
+// ============================================================================
 // Location - Where a value lives after register allocation
 // ============================================================================
 // Mirrors Go's Location from location.go
@@ -228,11 +237,11 @@ pub const Value = struct {
     type_idx: TypeIndex,
     block: BlockID,
 
-    /// Inline storage for first 3 args (Go pattern - avoids allocation).
-    args_storage: [3]ValueID = .{ null_value, null_value, null_value },
+    /// Inline storage for first MAX_INLINE_ARGS args (Go pattern - avoids allocation).
+    args_storage: [MAX_INLINE_ARGS]ValueID = .{ null_value, null_value, null_value },
     /// Number of args actually used.
     args_len: u8 = 0,
-    /// Overflow args (heap allocated if > 3).
+    /// Overflow args (heap allocated if > MAX_INLINE_ARGS).
     args_extra: []ValueID = &.{},
 
     /// Use count for dead code elimination.
@@ -248,7 +257,7 @@ pub const Value = struct {
 
     /// Get all arguments.
     pub fn args(self: *const Value) []const ValueID {
-        if (self.args_len <= 3) {
+        if (self.args_len <= MAX_INLINE_ARGS) {
             return self.args_storage[0..self.args_len];
         }
         return self.args_extra;
@@ -257,7 +266,7 @@ pub const Value = struct {
     /// Set arguments (uses inline storage when possible).
     pub fn setArgs(self: *Value, new_args: []const ValueID, allocator: Allocator) !void {
         self.args_len = @intCast(new_args.len);
-        if (new_args.len <= 3) {
+        if (new_args.len <= MAX_INLINE_ARGS) {
             for (new_args, 0..) |arg, i| {
                 self.args_storage[i] = arg;
             }
@@ -269,14 +278,14 @@ pub const Value = struct {
     /// Add a single argument.
     pub fn addArg(self: *Value, arg: ValueID, allocator: Allocator) !void {
         const len = self.args_len;
-        if (len < 3) {
+        if (len < MAX_INLINE_ARGS) {
             self.args_storage[len] = arg;
             self.args_len = len + 1;
         } else {
             // Need to grow extra storage
             var new_args = try allocator.alloc(ValueID, len + 1);
-            if (len == 3) {
-                @memcpy(new_args[0..3], &self.args_storage);
+            if (len == MAX_INLINE_ARGS) {
+                @memcpy(new_args[0..MAX_INLINE_ARGS], &self.args_storage);
             } else {
                 @memcpy(new_args[0..len], self.args_extra);
             }

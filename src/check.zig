@@ -1767,6 +1767,13 @@ pub const Checker = struct {
         for (fields) |field| {
             const field_type = try self.resolveTypeExpr(field.type_expr);
             const field_size = self.typeSize(field_type);
+            const field_align = self.typeAlignment(field_type);
+
+            // Align offset to field's natural alignment
+            if (field_align > 0) {
+                offset = (offset + field_align - 1) & ~(field_align - 1);
+            }
+
             try struct_fields.append(self.allocator, .{
                 .name = field.name,
                 .type_idx = field_type,
@@ -1774,6 +1781,9 @@ pub const Checker = struct {
             });
             offset += field_size;
         }
+
+        // Align final size to struct alignment (8 bytes)
+        offset = (offset + 7) & ~@as(u32, 7);
 
         return try self.types.add(.{ .struct_type = .{
             .name = name,
@@ -1872,29 +1882,15 @@ pub const Checker = struct {
     // ========================================================================
 
     /// Get the size of a type in bytes.
+    /// Delegates to TypeRegistry - single source of truth (Go pattern).
     fn typeSize(self: *Checker, idx: TypeIndex) u32 {
-        const t = self.types.get(idx);
-        return switch (t) {
-            .basic => |k| k.size(),
-            .pointer, .func => 8, // pointer size
-            .slice => 16, // ptr (8) + len (8)
-            .optional => |o| self.typeSize(o.elem) + 1, // simplified
-            .array => |a| @intCast(a.length * self.typeSize(a.elem)),
-            .struct_type => |s| s.size,
-            .enum_type => |e| self.typeSize(e.backing_type),
-            .union_type => |ut| blk: {
-                // Union size = tag size + max payload size
-                var max_payload: u32 = 0;
-                for (ut.variants) |v| {
-                    if (v.type_idx != types.invalid_type) {
-                        const payload_size = self.typeSize(v.type_idx);
-                        if (payload_size > max_payload) max_payload = payload_size;
-                    }
-                }
-                break :blk self.typeSize(ut.tag_type) + max_payload;
-            },
-            else => 0,
-        };
+        return self.types.sizeOf(idx);
+    }
+
+    /// Get the alignment of a type in bytes.
+    /// Delegates to TypeRegistry - single source of truth (Go pattern).
+    fn typeAlignment(self: *Checker, idx: TypeIndex) u32 {
+        return self.types.alignmentOf(idx);
     }
 
     /// Materialize an untyped type to a concrete type.

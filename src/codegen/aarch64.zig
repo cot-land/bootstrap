@@ -528,6 +528,38 @@ pub fn strRegImm(buf: *CodeBuffer, rt: Reg, rn: Reg, offset: u12) !void {
     try emit32(buf, loadStoreUnsignedOffset(0b11, false, 0b00, scaled, rn, rt));
 }
 
+/// STR Wd, [Xn, #imm] (32-bit store, unsigned offset, scaled by 4)
+pub fn strwRegImm(buf: *CodeBuffer, rt: Reg, rn: Reg, offset: u12) !void {
+    // ARM64 STR (immediate, unsigned offset): imm12 is scaled by 4 for 32-bit
+    // Caller passes byte offset, we divide by 4 for encoding
+    const scaled: u12 = offset >> 2;
+    try emit32(buf, loadStoreUnsignedOffset(0b10, false, 0b00, scaled, rn, rt));
+}
+
+/// STR Hd, [Xn, #imm] (16-bit store, unsigned offset, scaled by 2)
+pub fn strhRegImm(buf: *CodeBuffer, rt: Reg, rn: Reg, offset: u12) !void {
+    // ARM64 STRH (immediate, unsigned offset): imm12 is scaled by 2 for 16-bit
+    // Caller passes byte offset, we divide by 2 for encoding
+    const scaled: u12 = offset >> 1;
+    try emit32(buf, loadStoreUnsignedOffset(0b01, false, 0b00, scaled, rn, rt));
+}
+
+/// LDR Wd, [Xn, #imm] (32-bit load, unsigned offset, scaled by 4)
+pub fn ldrwRegImm(buf: *CodeBuffer, rt: Reg, rn: Reg, offset: u12) !void {
+    // ARM64 LDR (immediate, unsigned offset): imm12 is scaled by 4 for 32-bit
+    // Caller passes byte offset, we divide by 4 for encoding
+    const scaled: u12 = offset >> 2;
+    try emit32(buf, loadStoreUnsignedOffset(0b10, false, 0b01, scaled, rn, rt));
+}
+
+/// LDR Hd, [Xn, #imm] (16-bit load, unsigned offset, scaled by 2)
+pub fn ldrhRegImm(buf: *CodeBuffer, rt: Reg, rn: Reg, offset: u12) !void {
+    // ARM64 LDRH (immediate, unsigned offset): imm12 is scaled by 2 for 16-bit
+    // Caller passes byte offset, we divide by 2 for encoding
+    const scaled: u12 = offset >> 1;
+    try emit32(buf, loadStoreUnsignedOffset(0b01, false, 0b01, scaled, rn, rt));
+}
+
 /// LDP Xt1, Xt2, [Xn, #imm]! (pre-index)
 pub fn ldpPreIndex(buf: *CodeBuffer, rt: Reg, rt2: Reg, rn: Reg, imm7: i7) !void {
     const uimm7: u7 = @bitCast(imm7);

@@ -1,0 +1,51 @@
+// Test Map with large struct values (> 16 bytes)
+// This matches the check_boot.cot pattern: Map<string, Symbol>.get()
+
+struct LargeValue {
+    name: string,      // 16 bytes
+    field1: u32,       // 4 bytes
+    field2: u32,       // 4 bytes (type_idx equivalent)
+    field3: u32,       // 4 bytes
+    field4: bool,      // 1 byte + padding
+}
+
+fn main() int {
+    var map: Map<string, LargeValue> = new Map<string, LargeValue>()
+
+    // Create and store a value
+    var val: LargeValue = LargeValue{
+        .name = "test",
+        .field1 = 1,
+        .field2 = 42,
+        .field3 = 3,
+        .field4 = true,
+    }
+    map.set("key", val)
+
+    // Retrieve and check
+    if not map.has("key") {
+        return 1
+    }
+
+    var found: LargeValue = map.get("key")
+
+    // Check field2 (equivalent to type_idx check in check_boot.cot)
+    if found.field2 != 42 {
+        return 2
+    }
+
+    // Check other fields
+    if found.field1 != 1 {
+        return 3
+    }
+
+    if found.field3 != 3 {
+        return 4
+    }
+
+    if not found.field4 {
+        return 5
+    }
+
+    return 42
+}

@@ -421,6 +421,89 @@ export fn cot_map_get(handle: ?*MapHandle, key_ptr: [*]const u8, key_len: u64) i
     return std.math.minInt(i64);
 }
 
+/// Set a struct value in the map (for values > 8 bytes)
+/// Allocates heap memory and copies the struct data
+/// value_ptr points to the struct data, value_size is the struct size in bytes
+/// Returns 1 on success, 0 on failure
+export fn cot_map_set_struct(handle: ?*MapHandle, key_ptr: [*]const u8, key_len: u64, value_ptr: [*]const u8, value_size: u64) i64 {
+    const h = handle orelse return 0;
+    const allocator = std.heap.c_allocator;
+
+    // Allocate heap memory for the struct
+    const heap_copy = allocator.alloc(u8, value_size) catch return 0;
+
+    // Copy struct data to heap
+    @memcpy(heap_copy, value_ptr[0..value_size]);
+
+    // Store the pointer as i64 in the map
+    const ptr_as_int: i64 = @bitCast(@intFromPtr(heap_copy.ptr));
+
+    const key = StringKey{ .ptr = key_ptr, .len = key_len };
+
+    debugPrint("set_struct(\"{s}\", ptr={x}, size={d})", .{ key.slice(), @intFromPtr(heap_copy.ptr), value_size });
+
+    // Check if we need to grow
+    if (h.data.available == 0) {
+        if (!grow(h)) {
+            allocator.free(heap_copy);
+            return 0;
+        }
+    }
+
+    // Check if key already exists - if so, free old struct memory
+    const hash = hashString(key.slice());
+    const existing = findSlot(h.data, key, hash);
+    if (existing.found) {
+        const values = getValues(h.data);
+        const old_ptr: usize = @bitCast(values[existing.index]);
+        if (old_ptr != 0) {
+            // Free the old struct allocation
+            const old_slice_ptr: [*]u8 = @ptrFromInt(old_ptr);
+            allocator.free(old_slice_ptr[0..value_size]);
+        }
+    }
+
+    if (setInternal(h.data, key, ptr_as_int)) {
+        debugPrint("  set_struct success", .{});
+        return 1;
+    }
+
+    // Failed to set - free the allocation
+    allocator.free(heap_copy);
+    return 0;
+}
+
+/// Get a struct value from the map (for values > 8 bytes)
+/// Copies the struct data to the destination pointer
+/// Returns 1 if found and copied, 0 if not found
+export fn cot_map_get_struct(handle: ?*MapHandle, key_ptr: [*]const u8, key_len: u64, dest_ptr: [*]u8, value_size: u64) i64 {
+    const h = handle orelse return 0;
+
+    const key = StringKey{ .ptr = key_ptr, .len = key_len };
+    const hash = hashString(key.slice());
+    const result = findSlot(h.data, key, hash);
+
+    if (result.found) {
+        const values = getValues(h.data);
+        const ptr_as_int: i64 = values[result.index];
+        const src_ptr: usize = @bitCast(ptr_as_int);
+
+        if (src_ptr == 0) {
+            debugPrint("get_struct(\"{s}\") = NULL PTR", .{key.slice()});
+            return 0;
+        }
+
+        const src: [*]const u8 = @ptrFromInt(src_ptr);
+        @memcpy(dest_ptr[0..value_size], src[0..value_size]);
+
+        debugPrint("get_struct(\"{s}\") = copied {d} bytes from {x}", .{ key.slice(), value_size, src_ptr });
+        return 1;
+    }
+
+    debugPrint("get_struct(\"{s}\") = NOT FOUND", .{key.slice()});
+    return 0;
+}
+
 /// Check if a key exists in the map
 /// Returns 1 if found, 0 if not
 export fn cot_map_has(handle: ?*MapHandle, key_ptr: [*]const u8, key_len: u64) i64 {

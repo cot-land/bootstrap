@@ -506,6 +506,50 @@ pub const CodeGen = struct {
         }
     }
 
+    /// Store 32-bit word to [sp + offset] handling large offsets
+    fn strwSpOffset(self: *CodeGen, src: aarch64.Reg, offset: u32) !void {
+        if (offset <= 4095) {
+            try aarch64.strwRegImm(self.buf, src, .sp, @intCast(offset));
+        } else {
+            try aarch64.movRegImm64(self.buf, .x16, offset);
+            try aarch64.addRegReg(self.buf, .x16, .sp, .x16);
+            try aarch64.strwRegImm(self.buf, src, .x16, 0);
+        }
+    }
+
+    /// Store 16-bit halfword to [sp + offset] handling large offsets
+    fn strhSpOffset(self: *CodeGen, src: aarch64.Reg, offset: u32) !void {
+        if (offset <= 4095) {
+            try aarch64.strhRegImm(self.buf, src, .sp, @intCast(offset));
+        } else {
+            try aarch64.movRegImm64(self.buf, .x16, offset);
+            try aarch64.addRegReg(self.buf, .x16, .sp, .x16);
+            try aarch64.strhRegImm(self.buf, src, .x16, 0);
+        }
+    }
+
+    /// Load 32-bit word from [sp + offset] handling large offsets
+    fn ldrwSpOffset(self: *CodeGen, dest: aarch64.Reg, offset: u32) !void {
+        if (offset <= 4095) {
+            try aarch64.ldrwRegImm(self.buf, dest, .sp, @intCast(offset));
+        } else {
+            try aarch64.movRegImm64(self.buf, .x16, offset);
+            try aarch64.addRegReg(self.buf, .x16, .sp, .x16);
+            try aarch64.ldrwRegImm(self.buf, dest, .x16, 0);
+        }
+    }
+
+    /// Load 16-bit halfword from [sp + offset] handling large offsets
+    fn ldrhSpOffset(self: *CodeGen, dest: aarch64.Reg, offset: u32) !void {
+        if (offset <= 4095) {
+            try aarch64.ldrhRegImm(self.buf, dest, .sp, @intCast(offset));
+        } else {
+            try aarch64.movRegImm64(self.buf, .x16, offset);
+            try aarch64.addRegReg(self.buf, .x16, .sp, .x16);
+            try aarch64.ldrhRegImm(self.buf, dest, .x16, 0);
+        }
+    }
+
     /// Compute dest = sp + offset, handling large offsets
     fn addSpOffset(self: *CodeGen, dest: aarch64.Reg, offset: u32) !void {
         if (offset <= 4095) {
@@ -995,9 +1039,11 @@ pub const CodeGen = struct {
 
         switch (src_mcv) {
             .register => |reg| {
-                // Value is in a register - store it
+                // Value is in a register - store it with correct width
                 switch (size) {
                     1 => try self.strbSpOffset(reg, sp_offset),
+                    2 => try self.strhSpOffset(reg, sp_offset),
+                    4 => try self.strwSpOffset(reg, sp_offset),
                     else => try self.strSpOffset(reg, sp_offset),
                 }
             },
@@ -1006,6 +1052,8 @@ pub const CodeGen = struct {
                 try aarch64.movRegImm64(self.buf, scratch0, imm);
                 switch (size) {
                     1 => try self.strbSpOffset(scratch0, sp_offset),
+                    2 => try self.strhSpOffset(scratch0, sp_offset),
+                    4 => try self.strwSpOffset(scratch0, sp_offset),
                     else => try self.strSpOffset(scratch0, sp_offset),
                 }
             },
@@ -1022,10 +1070,12 @@ pub const CodeGen = struct {
                         copied += 8;
                     }
                 } else {
-                    // Small value: single load/store
+                    // Small value: single load/store with correct width
                     try self.ldrSpOffset(scratch0, src_stack_offset);
                     switch (size) {
                         1 => try self.strbSpOffset(scratch0, sp_offset),
+                        2 => try self.strhSpOffset(scratch0, sp_offset),
+                        4 => try self.strwSpOffset(scratch0, sp_offset),
                         else => try self.strSpOffset(scratch0, sp_offset),
                     }
                 }
@@ -1035,6 +1085,8 @@ pub const CodeGen = struct {
                 // This is the fallback for ops that don't set MCValue
                 switch (size) {
                     1 => try self.strbSpOffset(.x0, sp_offset),
+                    2 => try self.strhSpOffset(.x0, sp_offset),
+                    4 => try self.strwSpOffset(.x0, sp_offset),
                     else => try self.strSpOffset(.x0, sp_offset),
                 }
             },
@@ -1346,10 +1398,12 @@ pub const CodeGen = struct {
         // Always use x0 for field results (genStore expects this)
         const dest: aarch64.Reg = .x0;
 
-        if (size == 1) {
-            try self.ldrbSpOffset(dest, sp_offset);
-        } else {
-            try self.ldrSpOffset(dest, sp_offset);
+        // Use correct load width based on type size
+        switch (size) {
+            1 => try self.ldrbSpOffset(dest, sp_offset),
+            2 => try self.ldrhSpOffset(dest, sp_offset),
+            4 => try self.ldrwSpOffset(dest, sp_offset),
+            else => try self.ldrSpOffset(dest, sp_offset),
         }
 
         self.reg_manager.markUsed(.x0, value.id);
@@ -2056,10 +2110,15 @@ pub const CodeGen = struct {
     pub fn genMapGet(self: *CodeGen, value: *ssa.Value) !void {
         // map_get: args[0] = handle, args[1] = key
         // Uses MCValue for handle, special handling for string keys
+        // For large struct values (> 8 bytes), uses cot_map_get_struct with destination pointer
         const args = value.args();
         if (args.len < 2) return;
 
         try self.spillCallerSaved();
+
+        // Check if value type is a large struct (> 8 bytes)
+        const value_size = self.type_reg.sizeOf(value.type_idx);
+        const is_large_struct = value_size > 8;
 
         // Load key FIRST to avoid clobbering handle
         // Check if key is a slice (string key)
@@ -2088,11 +2147,32 @@ pub const CodeGen = struct {
         const handle_mcv = self.getValue(args[0]);
         try self.loadToReg(.x0, handle_mcv);
 
-        const func_name = if (self.os == .macos) "_cot_map_get" else "cot_map_get";
-        try aarch64.callSymbol(self.buf, func_name);
+        if (is_large_struct) {
+            // Large struct value: use cot_map_get_struct
+            // Allocate temp stack slot for the result
+            const spill_offset = self.next_spill_offset;
+            self.next_spill_offset +|= @intCast(alignTo(value_size, 8));
 
-        self.reg_manager.markUsed(.x0, value.id);
-        try self.setResult(value.id, .{ .register = .x0 });
+            // x0 = handle (already loaded)
+            // x1/x2 = key ptr/len (already loaded)
+            // x3 = destination pointer (our temp slot)
+            // x4 = value size
+            try self.addSpOffset(.x3, spill_offset);
+            try aarch64.movRegImm64(self.buf, .x4, @intCast(value_size));
+
+            const func_name = if (self.os == .macos) "_cot_map_get_struct" else "cot_map_get_struct";
+            try aarch64.callSymbol(self.buf, func_name);
+
+            // Result is now in the temp slot
+            try self.setResult(value.id, .{ .stack = spill_offset });
+        } else {
+            // Small value: use regular cot_map_get
+            const func_name = if (self.os == .macos) "_cot_map_get" else "cot_map_get";
+            try aarch64.callSymbol(self.buf, func_name);
+
+            self.reg_manager.markUsed(.x0, value.id);
+            try self.setResult(value.id, .{ .register = .x0 });
+        }
     }
 
     fn emitRuntimeCall(self: *CodeGen, name: []const u8) !void {
@@ -2127,46 +2207,107 @@ pub const CodeGen = struct {
         try self.setResult(value.id, .{ .register = .x0 });
     }
 
-    /// Generate code for map_set: args[0]=handle, args[1]=key, args[2]=value
+    /// Generate code for map_set: args[0]=handle, args[1]=key_ptr, args[2]=key_len, args[3]=value
+    /// or args[0]=handle, args[1]=key (slice), args[2]=value (legacy)
     /// Uses MCValue for handle and value, special handling for string keys
+    /// For large struct values (> 8 bytes), uses cot_map_set_struct with value pointer
     pub fn genMapSet(self: *CodeGen, value: *ssa.Value) !void {
         const args = value.args();
         if (args.len < 3) return;
 
         try self.spillCallerSaved();
 
-        // Load key FIRST to avoid clobbering
-        const key_val = &self.func.values.items[args[1]];
-        const key_type = self.type_reg.get(key_val.type_idx);
-        if (key_type == .slice) {
-            // String key: load directly based on op type
-            if (key_val.op == .const_slice) {
-                // Regenerate const_slice into x1/x2
-                const string_idx: usize = @intCast(key_val.aux_int);
-                if (string_idx < self.string_infos.len) {
-                    const info = self.string_infos[string_idx];
-                    try aarch64.loadSymbolAddr(self.buf, .x1, info.symbol_name);
-                    try aarch64.movRegImm64(self.buf, .x2, @intCast(info.len));
+        // Determine which arg is the value and check if it's a large struct
+        const val_arg_idx: usize = if (args.len >= 4 and args[1] != args[2]) 3 else if (args.len >= 4) 3 else 2;
+        const val_value = &self.func.values.items[args[val_arg_idx]];
+        const val_size = self.type_reg.sizeOf(val_value.type_idx);
+        const is_large_struct = val_size > 8;
+
+        // Check if we have 4 args (handle, key_ptr, key_len, value) with distinct ptr/len
+        if (args.len >= 4 and args[1] != args[2]) {
+            // 4 args: key_ptr and key_len are separate
+            if (is_large_struct) {
+                // Large struct: pass value pointer + size instead of value
+                const val_mcv = self.getValue(args[3]);
+                if (val_mcv == .stack) {
+                    // Value is on stack - compute its address
+                    try self.addSpOffset(.x3, val_mcv.stack);
+                } else {
+                    // Value in register (shouldn't happen for large struct, but handle it)
+                    try self.loadToReg(.x3, val_mcv);
+                }
+                try aarch64.movRegImm64(self.buf, .x4, @intCast(val_size));
+            } else {
+                // Load value into x3 FIRST (before key and handle to avoid clobber)
+                const val_mcv = self.getValue(args[3]);
+                try self.loadToReg(.x3, val_mcv);
+            }
+
+            // Load key_len into x2
+            const key_len_mcv = self.getValue(args[2]);
+            try self.loadToReg(.x2, key_len_mcv);
+
+            // Load key_ptr into x1
+            const key_ptr_mcv = self.getValue(args[1]);
+            try self.loadToReg(.x1, key_ptr_mcv);
+
+            // Load map handle into x0 LAST
+            const handle_mcv = self.getValue(args[0]);
+            try self.loadToReg(.x0, handle_mcv);
+        } else {
+            // 3 args or 4 args with same ptr/len (const_slice): key is a single value
+
+            // Load key FIRST to avoid clobbering
+            const key_val = &self.func.values.items[args[1]];
+            const key_type = self.type_reg.get(key_val.type_idx);
+            if (key_type == .slice) {
+                // String key: load directly based on op type
+                if (key_val.op == .const_slice) {
+                    // Regenerate const_slice into x1/x2
+                    const string_idx: usize = @intCast(key_val.aux_int);
+                    if (string_idx < self.string_infos.len) {
+                        const info = self.string_infos[string_idx];
+                        try aarch64.loadSymbolAddr(self.buf, .x1, info.symbol_name);
+                        try aarch64.movRegImm64(self.buf, .x2, @intCast(info.len));
+                    }
+                } else {
+                    // Load slice from stack or other location
+                    try self.loadSliceToRegs(key_val, .x1, .x2);
                 }
             } else {
-                // Load slice from stack or other location
-                try self.loadSliceToRegs(key_val, .x1, .x2);
+                const key_mcv = self.getValue(args[1]);
+                try self.loadToReg(.x1, key_mcv);
             }
-        } else {
-            const key_mcv = self.getValue(args[1]);
-            try self.loadToReg(.x1, key_mcv);
+
+            if (is_large_struct) {
+                // Large struct: pass value pointer + size
+                const val_mcv = self.getValue(args[val_arg_idx]);
+                if (val_mcv == .stack) {
+                    // Value is on stack - compute its address
+                    try self.addSpOffset(.x3, val_mcv.stack);
+                } else {
+                    // Value in register (shouldn't happen for large struct, but handle it)
+                    try self.loadToReg(.x3, val_mcv);
+                }
+                try aarch64.movRegImm64(self.buf, .x4, @intCast(val_size));
+            } else {
+                // Load value into x3 BEFORE handle (x3 won't be clobbered by handle load)
+                const val_mcv = self.getValue(args[val_arg_idx]);
+                try self.loadToReg(.x3, val_mcv);
+            }
+
+            // Load map handle into x0 LAST to avoid clobber
+            const handle_mcv = self.getValue(args[0]);
+            try self.loadToReg(.x0, handle_mcv);
         }
 
-        // Load value into x3 BEFORE handle (x3 won't be clobbered by handle load)
-        const val_mcv = self.getValue(args[2]);
-        try self.loadToReg(.x3, val_mcv);
-
-        // Load map handle into x0 LAST to avoid clobber
-        const handle_mcv = self.getValue(args[0]);
-        try self.loadToReg(.x0, handle_mcv);
-
-        const func_name = if (self.os == .macos) "_cot_map_set" else "cot_map_set";
-        try aarch64.callSymbol(self.buf, func_name);
+        if (is_large_struct) {
+            const func_name = if (self.os == .macos) "_cot_map_set_struct" else "cot_map_set_struct";
+            try aarch64.callSymbol(self.buf, func_name);
+        } else {
+            const func_name = if (self.os == .macos) "_cot_map_set" else "cot_map_set";
+            try aarch64.callSymbol(self.buf, func_name);
+        }
     }
 
     /// Generate code for map_has: args[0]=handle, args[1]=key

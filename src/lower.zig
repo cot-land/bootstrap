@@ -158,6 +158,18 @@ pub const Lowerer = struct {
             if (fn_decl.body) |body_idx| {
                 log.debug("  lowering body block {d}", .{body_idx});
                 _ = try self.lowerBlock(body_idx);
+
+                // Add implicit ret for void functions without explicit return
+                if (return_type == TypeRegistry.VOID) {
+                    // Check if last instruction was already a ret
+                    const nodes = fb.nodes.items;
+                    const needs_ret = nodes.len == 0 or nodes[nodes.len - 1].op != .ret;
+                    if (needs_ret) {
+                        const ret_node = ir.Node.init(.ret, TypeRegistry.VOID, Span.fromPos(Pos.zero));
+                        _ = try fb.emit(ret_node);
+                        log.debug("  added implicit ret for void function", .{});
+                    }
+                }
             } else {
                 log.debug("  no body (forward declaration)", .{});
             }
@@ -649,6 +661,21 @@ pub const Lowerer = struct {
                             } else {
                                 log.debug("  assign: {s}", .{name});
                             }
+                        }
+                    },
+                    .field_access => |fa| {
+                        // Field assignment: e.g., checker.current_scope_idx = 0
+                        const chain_info = self.resolveFieldAccessChain(fa);
+                        if (chain_info.root_local_idx) |local_idx| {
+                            // Lower the value
+                            const value_node = try self.lowerExpr(assign.value);
+
+                            // Emit store at local + field offset
+                            const store = ir.Node.init(.store, chain_info.field_type_idx, Span.fromPos(Pos.zero))
+                                .withArgs(&.{ @intCast(local_idx), value_node })
+                                .withAux(@intCast(chain_info.cumulative_offset));
+                            _ = try fb.emit(store);
+                            log.debug("  field assign: .{s} at offset {d}", .{ fa.field, chain_info.cumulative_offset });
                         }
                     },
                     else => {},
@@ -1548,7 +1575,7 @@ pub const Lowerer = struct {
                         }
                     },
                     .field_access => |fa| {
-                        // len(struct.field) - need to get field type and check if it's a list
+                        // len(struct.field) - need to get field type and check if it's a list or slice
                         // First, get base variable type
                         const base_node = self.tree.getNode(fa.base);
                         if (base_node == .expr and base_node.expr == .identifier) {
@@ -1569,6 +1596,15 @@ pub const Lowerer = struct {
                                                 const node = ir.Node.init(.list_len, TypeRegistry.INT, Span.fromPos(Pos.zero))
                                                     .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{list_node}));
                                                 log.debug("  len(struct.list_field) runtime: field={s}", .{fa.field});
+                                                return try fb.emit(node);
+                                            } else if (field_type == .slice) {
+                                                // For slice fields, the length is at offset field_offset + 8
+                                                // Use field_local with the cumulative offset to len
+                                                const len_offset: u32 = f.offset + 8;
+                                                const node = ir.Node.init(.field_local, TypeRegistry.INT, Span.fromPos(Pos.zero))
+                                                    .withArgs(&.{@as(ir.NodeIndex, @intCast(local_idx))})
+                                                    .withAux(@intCast(len_offset));
+                                                log.debug("  len(struct.slice_field) runtime: local={d}, offset={d}", .{ local_idx, len_offset });
                                                 return try fb.emit(node);
                                             }
                                             break;
@@ -1841,16 +1877,25 @@ pub const Lowerer = struct {
                 return ir.null_node;
             }
 
-            // Lower the key argument
-            const key_node = try self.lowerExpr(call.args[0]);
+            // Use unified helper for string field key emission
+            const key_nodes = try self.emitStringFieldKeyNodes(call.args[0]);
+            var key_ptr_node = key_nodes.ptr_node;
+            var key_len_node = key_nodes.len_node;
+
+            // If not a string field, use normal lowering
+            if (!key_nodes.is_string_field) {
+                const key_node = try self.lowerExpr(call.args[0]);
+                key_ptr_node = key_node;
+                // For const_string, the len will be extracted by codegen
+                key_len_node = key_node;
+            }
+
             // Lower the value argument
             const value_node = try self.lowerExpr(call.args[1]);
 
-            // For string keys, we need to get ptr and len
-            // The key_node is a const_string, so we can use it directly
             // The runtime will receive (handle, key_ptr, key_len, value)
             const node = ir.Node.init(.map_set, TypeRegistry.VOID, Span.fromPos(Pos.zero))
-                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ map_handle, key_node, value_node }));
+                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ map_handle, key_ptr_node, key_len_node, value_node }));
 
             log.debug("  map.set() -> map_set IR op", .{});
             return try fb.emit(node);
@@ -2045,11 +2090,22 @@ pub const Lowerer = struct {
                 return ir.null_node;
             }
 
-            const key_node = try self.lowerExpr(call.args[0]);
+            // Use unified helper for string field key emission
+            const key_nodes = try self.emitStringFieldKeyNodes(call.args[0]);
+            var key_ptr_node = key_nodes.ptr_node;
+            var key_len_node = key_nodes.len_node;
+
+            // If not a string field, use normal lowering
+            if (!key_nodes.is_string_field) {
+                const key_node = try self.lowerExpr(call.args[0]);
+                key_ptr_node = key_node;
+                key_len_node = key_node;
+            }
+
             const value_node = try self.lowerExpr(call.args[1]);
 
             const node = ir.Node.init(.map_set, TypeRegistry.VOID, Span.fromPos(Pos.zero))
-                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ map_handle, key_node, value_node }))
+                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ map_handle, key_ptr_node, key_len_node, value_node }))
                 .withAux(key_type);
 
             log.debug("  map.set() -> map_set IR op (via handle)", .{});
@@ -2394,6 +2450,74 @@ pub const Lowerer = struct {
         field_type_idx: TypeIndex,
         is_ptr_deref: bool,
     };
+
+    /// Result of emitting string field key nodes (ptr and len).
+    /// Used by map.set() to pass string keys correctly.
+    const StringFieldKeyNodes = struct {
+        ptr_node: ir.NodeIndex,
+        len_node: ir.NodeIndex,
+        is_string_field: bool,
+    };
+
+    /// Emit IR nodes for a string field key (ptr and len separately).
+    /// This is the SINGLE place for string field key emission - avoids code duplication.
+    /// Returns .is_string_field = false if the key is not a string field.
+    fn emitStringFieldKeyNodes(self: *Lowerer, key_arg: NodeIndex) Allocator.Error!StringFieldKeyNodes {
+        const fb = self.current_func orelse return .{
+            .ptr_node = ir.null_node,
+            .len_node = ir.null_node,
+            .is_string_field = false,
+        };
+
+        const key_expr = self.tree.getExpr(key_arg);
+        if (key_expr == null or key_expr.? != .field_access) {
+            return .{ .ptr_node = ir.null_node, .len_node = ir.null_node, .is_string_field = false };
+        }
+
+        const fa = key_expr.?.field_access;
+        const chain_info = self.resolveFieldAccessChain(fa);
+        const field_type = self.type_reg.get(chain_info.field_type_idx);
+
+        // Only handle string/slice fields
+        if (field_type != .slice and chain_info.field_type_idx != TypeRegistry.STRING) {
+            return .{ .ptr_node = ir.null_node, .len_node = ir.null_node, .is_string_field = false };
+        }
+
+        const key_local_idx = chain_info.root_local_idx orelse {
+            return .{ .ptr_node = ir.null_node, .len_node = ir.null_node, .is_string_field = false };
+        };
+
+        const local = fb.locals.items[key_local_idx];
+        const root_type = self.type_reg.get(local.type_idx);
+        const is_large_struct_param = local.is_param and
+            root_type == .struct_type and
+            self.type_reg.sizeOf(local.type_idx) > 16;
+
+        var key_ptr_node: ir.NodeIndex = undefined;
+        var key_len_node: ir.NodeIndex = undefined;
+
+        if (is_large_struct_param) {
+            // Use ptr_field for large struct params (passed by pointer)
+            key_ptr_node = try fb.emit(ir.Node.init(.ptr_field, TypeRegistry.INT, Span.fromPos(Pos.zero))
+                .withArgs(&.{@intCast(key_local_idx)})
+                .withAux(@intCast(chain_info.cumulative_offset)));
+            key_len_node = try fb.emit(ir.Node.init(.ptr_field, TypeRegistry.INT, Span.fromPos(Pos.zero))
+                .withArgs(&.{@intCast(key_local_idx)})
+                .withAux(@intCast(chain_info.cumulative_offset + 8)));
+            log.debug("  string field key (large struct param): ptr at offset {d}, len at offset {d}", .{ chain_info.cumulative_offset, chain_info.cumulative_offset + 8 });
+        } else {
+            // Use field_local for regular locals
+            key_ptr_node = try fb.emit(ir.Node.init(.field_local, TypeRegistry.INT, Span.fromPos(Pos.zero))
+                .withArgs(&.{@intCast(key_local_idx)})
+                .withAux(@intCast(chain_info.cumulative_offset)));
+            key_len_node = try fb.emit(ir.Node.init(.field_local, TypeRegistry.INT, Span.fromPos(Pos.zero))
+                .withArgs(&.{@intCast(key_local_idx)})
+                .withAux(@intCast(chain_info.cumulative_offset + 8)));
+            log.debug("  string field key (local): ptr at offset {d}, len at offset {d}", .{ chain_info.cumulative_offset, chain_info.cumulative_offset + 8 });
+        }
+
+        return .{ .ptr_node = key_ptr_node, .len_node = key_len_node, .is_string_field = true };
+    }
 
     fn resolveFieldAccessChain(self: *Lowerer, field: ast.FieldAccess) FieldAccessChainInfo {
         const fb = self.current_func orelse return .{
