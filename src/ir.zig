@@ -347,7 +347,7 @@ pub const Local = struct {
         };
     }
 
-    pub fn initParam(name: []const u8, type_idx: TypeIndex, param_idx: u32) Local {
+    pub fn initParam(name: []const u8, type_idx: TypeIndex, param_idx: u32, size: u32) Local {
         return .{
             .name = name,
             .type_idx = type_idx,
@@ -355,7 +355,7 @@ pub const Local = struct {
             .mutable = false,
             .is_param = true,
             .param_idx = param_idx,
-            .size = 8, // Params are typically 8 bytes
+            .size = size,
             .offset = 0,
         };
     }
@@ -612,11 +612,11 @@ pub const FuncBuilder = struct {
         self.local_map.deinit();
     }
 
-    /// Add a parameter.
-    pub fn addParam(self: *FuncBuilder, name: []const u8, type_idx: TypeIndex) !u32 {
+    /// Add a parameter with explicit size.
+    pub fn addParam(self: *FuncBuilder, name: []const u8, type_idx: TypeIndex, size: u32) !u32 {
         const idx: u32 = @intCast(self.locals.items.len);
         const param_idx: u32 = idx; // params are first
-        try self.locals.append(self.allocator, Local.initParam(name, type_idx, param_idx));
+        try self.locals.append(self.allocator, Local.initParam(name, type_idx, param_idx, size));
         try self.local_map.put(name, idx);
         return idx;
     }
@@ -837,9 +837,9 @@ test "ir func builder" {
 
     var fb = FuncBuilder.init(alloc, "test", TypeRegistry.VOID, TypeRegistry.INT, span);
 
-    // Add parameters
-    const param_a = try fb.addParam("a", TypeRegistry.INT);
-    const param_b = try fb.addParam("b", TypeRegistry.INT);
+    // Add parameters (INT is 8 bytes)
+    const param_a = try fb.addParam("a", TypeRegistry.INT, 8);
+    const param_b = try fb.addParam("b", TypeRegistry.INT, 8);
 
     try std.testing.expectEqual(@as(u32, 0), param_a);
     try std.testing.expectEqual(@as(u32, 1), param_b);
@@ -876,8 +876,8 @@ test "ir builder" {
     // Build a function
     builder.startFunc("add", TypeRegistry.VOID, TypeRegistry.INT, span);
     if (builder.current_func) |*fb| {
-        _ = try fb.addParam("x", TypeRegistry.INT);
-        _ = try fb.addParam("y", TypeRegistry.INT);
+        _ = try fb.addParam("x", TypeRegistry.INT, 8);
+        _ = try fb.addParam("y", TypeRegistry.INT, 8);
     }
     try builder.endFunc();
 

@@ -21,6 +21,7 @@ const ssa = @import("../ssa.zig");
 const types = @import("../types.zig");
 const aarch64 = @import("aarch64.zig");
 const be = @import("backend.zig");
+const liveness = @import("../liveness.zig");
 
 // ============================================================================
 // MCValue - Machine Code Value (where a value lives)
@@ -201,6 +202,10 @@ pub const CodeGen = struct {
     next_spill_offset: u12,
     stack_size: u32,
 
+    // Liveness analysis for smart spill decisions
+    liveness_info: ?liveness.LivenessInfo = null,
+    current_inst: u32 = 0,
+
     pub fn init(
         allocator: Allocator,
         buf: *be.CodeBuffer,
@@ -226,6 +231,20 @@ pub const CodeGen = struct {
 
     pub fn deinit(self: *CodeGen) void {
         self.tracking.deinit();
+        if (self.liveness_info) |*info| {
+            info.deinit();
+        }
+    }
+
+    /// Compute liveness information for smarter spill decisions.
+    /// Call this once before code generation begins.
+    pub fn computeLiveness(self: *CodeGen) !void {
+        self.liveness_info = try liveness.computeLiveness(self.allocator, self.func);
+    }
+
+    /// Advance the instruction counter. Call this for each value generated.
+    pub fn advanceInst(self: *CodeGen) void {
+        self.current_inst += 1;
     }
 
     // ========================================================================
@@ -237,7 +256,7 @@ pub const CodeGen = struct {
             return reg;
         }
 
-        const spill_reg = self.reg_manager.findSpillCandidate() orelse {
+        const spill_reg = self.findBestSpillCandidate() orelse {
             return error.AllRegistersLocked;
         };
 
@@ -247,6 +266,42 @@ pub const CodeGen = struct {
             self.reg_manager.markUsed(spill_reg, vid);
         }
         return spill_reg;
+    }
+
+    /// Find the best register to spill using farthest-next-use heuristic.
+    /// If liveness info is available, picks the register whose value is used
+    /// farthest in the future. Otherwise falls back to first-available.
+    fn findBestSpillCandidate(self: *CodeGen) ?aarch64.Reg {
+        // If we have liveness info, use farthest-next-use heuristic
+        if (self.liveness_info) |lv| {
+            var best_reg: ?aarch64.Reg = null;
+            var best_distance: u32 = 0;
+
+            for (allocatable_regs, 0..) |reg, idx| {
+                // Skip locked or free registers
+                if (self.reg_manager.isLocked(reg) or self.reg_manager.isFree(reg)) continue;
+
+                // Get the value in this register
+                if (self.reg_manager.registers[idx]) |vid| {
+                    const dist = lv.distanceToNextUse(vid, self.current_inst);
+                    // Prefer registers with values that are used farther away
+                    // Also prefer registers with dead values (dist == 0)
+                    if (dist == 0) {
+                        // Value is dead - best candidate!
+                        return reg;
+                    }
+                    if (dist > best_distance) {
+                        best_distance = dist;
+                        best_reg = reg;
+                    }
+                }
+            }
+
+            if (best_reg) |reg| return reg;
+        }
+
+        // Fallback: use RegisterManager's simple first-available
+        return self.reg_manager.findSpillCandidate();
     }
 
     fn spillReg(self: *CodeGen, reg: aarch64.Reg) !void {
@@ -311,6 +366,8 @@ pub const CodeGen = struct {
         try self.tracking.put(value_id, InstTracking.init(result));
     }
 
+    /// Spill caller-saved registers before a function call.
+    /// If liveness info is available, only spills values that are used after this point.
     pub fn spillCallerSaved(self: *CodeGen) !void {
         const caller_saved = [_]aarch64.Reg{
             .x0, .x1, .x2, .x3, .x4, .x5, .x6, .x7,
@@ -318,8 +375,58 @@ pub const CodeGen = struct {
         };
 
         for (caller_saved) |reg| {
-            if (!self.reg_manager.isFree(reg)) {
-                try self.spillReg(reg);
+            if (self.reg_manager.isFree(reg)) continue;
+
+            // Check if we should skip spilling this value
+            if (self.liveness_info) |lv| {
+                if (RegisterManager.indexOf(reg)) |idx| {
+                    if (self.reg_manager.registers[idx]) |vid| {
+                        // If value is not used after this instruction, just free the register
+                        if (!lv.isUsedAfter(vid, self.current_inst)) {
+                            self.reg_manager.markFree(reg);
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Value is live after call - must spill
+            try self.spillReg(reg);
+        }
+    }
+
+    // ========================================================================
+    // Liveness-based register freeing
+    // ========================================================================
+
+    /// Check if an operand dies at this instruction and can be clobbered.
+    /// Returns true if the operand is in a register and dies here.
+    fn operandDiesInReg(self: *CodeGen, value_id: ssa.ValueID, operand_idx: u8, arg_id: ssa.ValueID) bool {
+        if (self.liveness_info) |lv| {
+            if (lv.operandDies(value_id, operand_idx)) {
+                const mcv = self.getValue(arg_id);
+                return mcv == .register;
+            }
+        }
+        return false;
+    }
+
+    /// Free registers holding operands that die at this instruction.
+    /// Call this AFTER the operation completes.
+    fn freeDeadOperands(self: *CodeGen, value: *ssa.Value) void {
+        if (self.liveness_info) |lv| {
+            const args = value.args();
+            for (args, 0..) |arg_id, i| {
+                if (arg_id == ssa.null_value) continue;
+                if (lv.operandDies(value.id, @intCast(i))) {
+                    // This operand dies here - free its register if it has one
+                    if (self.tracking.getPtr(arg_id)) |tracking| {
+                        if (tracking.current.getReg()) |reg| {
+                            self.reg_manager.markFree(reg);
+                        }
+                        tracking.current = .dead;
+                    }
+                }
             }
         }
     }
@@ -341,17 +448,15 @@ pub const CodeGen = struct {
     }
 
     pub fn genAdd(self: *CodeGen, value: *ssa.Value) !void {
-        // Result always in x0 (archive pattern)
         const args = value.args();
         const left_mcv = self.getValue(args[0]);
         const right_mcv = self.getValue(args[1]);
 
-        // If right is in x0, save it to x9 first before we load left into x0
+        // If right is in x0, we MUST save it before loading left into x0,
+        // otherwise loading left will clobber right before we can use it.
         if (right_mcv == .register and right_mcv.register == .x0) {
             try aarch64.movRegReg(self.buf, .x9, .x0);
-            // Load left operand into x0
             try self.loadToReg(.x0, left_mcv);
-            // Add saved right from x9
             try aarch64.addRegReg(self.buf, .x0, .x0, .x9);
         } else {
             // Load left operand into x0
@@ -378,17 +483,19 @@ pub const CodeGen = struct {
             }
         }
 
+        // Free dead operands after the operation
+        self.freeDeadOperands(value);
+
         self.reg_manager.markUsed(.x0, value.id);
         try self.setResult(value.id, .{ .register = .x0 });
     }
 
     pub fn genSub(self: *CodeGen, value: *ssa.Value) !void {
-        // Result always in x0 (archive pattern)
         const args = value.args();
         const left_mcv = self.getValue(args[0]);
         const right_mcv = self.getValue(args[1]);
 
-        // If right is in x0, save it to x9 first before we load left into x0
+        // If right is in x0, we MUST save it before loading left into x0
         if (right_mcv == .register and right_mcv.register == .x0) {
             try aarch64.movRegReg(self.buf, .x9, .x0);
             try self.loadToReg(.x0, left_mcv);
@@ -416,17 +523,17 @@ pub const CodeGen = struct {
             }
         }
 
+        self.freeDeadOperands(value);
         self.reg_manager.markUsed(.x0, value.id);
         try self.setResult(value.id, .{ .register = .x0 });
     }
 
     pub fn genMul(self: *CodeGen, value: *ssa.Value) !void {
-        // Result always in x0 (archive pattern)
         const args = value.args();
         const left_mcv = self.getValue(args[0]);
         const right_mcv = self.getValue(args[1]);
 
-        // If right is in x0, save it to x9 first before we load left into x0
+        // If right is in x0, we MUST save it before loading left into x0
         if (right_mcv == .register and right_mcv.register == .x0) {
             try aarch64.movRegReg(self.buf, .x9, .x0);
             try self.loadToReg(.x0, left_mcv);
@@ -450,17 +557,17 @@ pub const CodeGen = struct {
             }
         }
 
+        self.freeDeadOperands(value);
         self.reg_manager.markUsed(.x0, value.id);
         try self.setResult(value.id, .{ .register = .x0 });
     }
 
     pub fn genDiv(self: *CodeGen, value: *ssa.Value) !void {
-        // Result always in x0 (archive pattern)
         const args = value.args();
         const left_mcv = self.getValue(args[0]);
         const right_mcv = self.getValue(args[1]);
 
-        // If right is in x0, save it to x9 first before we load left into x0
+        // If right is in x0, we MUST save it before loading left into x0
         if (right_mcv == .register and right_mcv.register == .x0) {
             try aarch64.movRegReg(self.buf, .x9, .x0);
             try self.loadToReg(.x0, left_mcv);
@@ -472,6 +579,7 @@ pub const CodeGen = struct {
         // ARM64 SDIV: x0 = x0 / x9
         try aarch64.sdivRegReg(self.buf, .x0, .x0, .x9);
 
+        self.freeDeadOperands(value);
         self.reg_manager.markUsed(.x0, value.id);
         try self.setResult(value.id, .{ .register = .x0 });
     }
@@ -486,13 +594,11 @@ pub const CodeGen = struct {
         try self.loadToReg(scratch0, right_mcv);
 
         // ARM64 modulo: a % b = a - (a / b) * b
-        // scratch1 = dest / scratch0
         try aarch64.sdivRegReg(self.buf, scratch1, dest, scratch0);
-        // scratch1 = scratch1 * scratch0
         try aarch64.mulRegReg(self.buf, scratch1, scratch1, scratch0);
-        // dest = dest - scratch1
         try aarch64.subRegReg(self.buf, dest, dest, scratch1);
 
+        self.freeDeadOperands(value);
         try self.setResult(value.id, .{ .register = dest });
     }
 
@@ -502,8 +608,8 @@ pub const CodeGen = struct {
 
         const dest = try self.allocReg(value.id);
         try self.loadToReg(dest, src_mcv);
-        // NEG is SUB from zero: dest = 0 - dest
         try aarch64.negReg(self.buf, dest, dest);
+        self.freeDeadOperands(value);
 
         try self.setResult(value.id, .{ .register = dest });
     }
@@ -621,6 +727,19 @@ pub const CodeGen = struct {
 
     pub fn genComparison(self: *CodeGen, value: *ssa.Value) !void {
         const args = value.args();
+
+        // Check if this is a string comparison
+        const left_val = &self.func.values.items[args[0]];
+        const right_val = &self.func.values.items[args[1]];
+        const is_string_cmp = left_val.type_idx == types.TypeRegistry.STRING or
+            right_val.type_idx == types.TypeRegistry.STRING or
+            left_val.op == .const_string or right_val.op == .const_string;
+
+        if (is_string_cmp and (value.op == .eq or value.op == .ne)) {
+            try self.genStringComparison(value, args, left_val, right_val);
+            return;
+        }
+
         const left_mcv = self.getValue(args[0]);
         const right_mcv = self.getValue(args[1]);
 
@@ -644,7 +763,62 @@ pub const CodeGen = struct {
         };
         try aarch64.cset(self.buf, dest, cond);
 
+        self.freeDeadOperands(value);
         try self.setResult(value.id, .{ .register = dest });
+    }
+
+    /// Generate string comparison: call cot_str_eq(ptr1, len1, ptr2, len2)
+    fn genStringComparison(self: *CodeGen, value: *ssa.Value, args: []const ssa.ValueID, left_val: *ssa.Value, right_val: *ssa.Value) !void {
+        try self.spillCallerSaved();
+
+        // Load first string into x0 (ptr) and x1 (len)
+        try self.loadStringOperand(left_val, args[0], .x0, .x1);
+
+        // Load second string into x2 (ptr) and x3 (len)
+        try self.loadStringOperand(right_val, args[1], .x2, .x3);
+
+        // Call cot_str_eq
+        try aarch64.callSymbol(self.buf, "_cot_str_eq");
+
+        // Result in x0: 1 if equal, 0 if not equal
+        // For != comparison, invert the result
+        if (value.op == .ne) {
+            try aarch64.movRegImm64(self.buf, scratch1, 1);
+            try aarch64.eorRegReg(self.buf, .x0, .x0, scratch1);
+        }
+
+        self.reg_manager.markUsed(.x0, value.id);
+        try self.setResult(value.id, .{ .register = .x0 });
+    }
+
+    /// Load a string operand's ptr and len into destination registers
+    fn loadStringOperand(self: *CodeGen, val: *ssa.Value, val_id: ssa.ValueID, ptr_reg: aarch64.Reg, len_reg: aarch64.Reg) !void {
+        if (val.op == .const_string) {
+            // String literal: load symbol address and immediate length
+            const str_content = val.aux_str;
+            const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
+                str_content[1 .. str_content.len - 1]
+            else
+                str_content;
+            const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
+            try aarch64.loadSymbolAddr(self.buf, ptr_reg, sym_name);
+            try aarch64.movRegImm64(self.buf, len_reg, @intCast(stripped.len));
+        } else if (val.op == .load or val.op == .copy or val.op == .arg) {
+            // Variable: load ptr and len from stack (string is fat pointer: 8 bytes ptr + 8 bytes len)
+            const local_idx: u32 = @intCast(val.aux_int);
+            if (local_idx < self.func.locals.len) {
+                const offset = self.func.locals[local_idx].offset;
+                const sp_offset = convertOffset(offset, self.stack_size);
+                const sp_offset_plus8 = convertOffset(offset + 8, self.stack_size);
+                try aarch64.ldrRegImm(self.buf, ptr_reg, .sp, sp_offset); // ptr
+                try aarch64.ldrRegImm(self.buf, len_reg, .sp, sp_offset_plus8); // len
+            }
+        } else {
+            // Fallback: use MCValue (just loads ptr, len would be wrong)
+            const mcv = self.getValue(val_id);
+            try self.loadToReg(ptr_reg, mcv);
+            try aarch64.movRegImm64(self.buf, len_reg, 0); // Unknown len
+        }
     }
 
     pub fn genCall(self: *CodeGen, value: *ssa.Value) !void {
@@ -654,10 +828,45 @@ pub const CodeGen = struct {
         const arg_regs = [_]aarch64.Reg{ .x0, .x1, .x2, .x3, .x4, .x5, .x6, .x7 };
         const args = value.args();
 
-        for (args, 0..) |arg_id, i| {
-            if (i >= arg_regs.len) break;
-            const arg_mcv = self.getValue(arg_id);
-            try self.loadToReg(arg_regs[i], arg_mcv);
+        var reg_idx: usize = 0;
+        for (args) |arg_id| {
+            if (reg_idx >= arg_regs.len) break;
+
+            const arg_val = &self.func.values.items[arg_id];
+
+            // Check if this is a string argument (needs ptr + len = 2 registers)
+            if (arg_val.op == .const_string) {
+                // String literal: load symbol address and immediate length
+                const str_content = arg_val.aux_str;
+                const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
+                    str_content[1 .. str_content.len - 1]
+                else
+                    str_content;
+                const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
+                try aarch64.loadSymbolAddr(self.buf, arg_regs[reg_idx], sym_name);
+                if (reg_idx + 1 < arg_regs.len) {
+                    try aarch64.movRegImm64(self.buf, arg_regs[reg_idx + 1], @intCast(stripped.len));
+                }
+                reg_idx += 2; // String takes 2 registers
+            } else if (arg_val.type_idx == types.TypeRegistry.STRING and (arg_val.op == .load or arg_val.op == .copy or arg_val.op == .arg)) {
+                // String variable: load ptr and len from stack
+                const local_idx: u32 = @intCast(arg_val.aux_int);
+                if (local_idx < self.func.locals.len) {
+                    const offset = self.func.locals[local_idx].offset;
+                    const sp_offset = convertOffset(offset, self.stack_size);
+                    const sp_offset_plus8 = convertOffset(offset + 8, self.stack_size);
+                    try aarch64.ldrRegImm(self.buf, arg_regs[reg_idx], .sp, sp_offset);
+                    if (reg_idx + 1 < arg_regs.len) {
+                        try aarch64.ldrRegImm(self.buf, arg_regs[reg_idx + 1], .sp, sp_offset_plus8);
+                    }
+                }
+                reg_idx += 2; // String takes 2 registers
+            } else {
+                // Regular argument
+                const arg_mcv = self.getValue(arg_id);
+                try self.loadToReg(arg_regs[reg_idx], arg_mcv);
+                reg_idx += 1;
+            }
         }
 
         // BL symbol
@@ -724,27 +933,31 @@ pub const CodeGen = struct {
 
     pub fn genAnd(self: *CodeGen, value: *ssa.Value) !void {
         const args = value.args();
+
+        const dest = try self.allocReg(value.id);
         const left_mcv = self.getValue(args[0]);
         const right_mcv = self.getValue(args[1]);
 
-        const dest = try self.allocReg(value.id);
         try self.loadToReg(dest, left_mcv);
         try self.loadToReg(scratch1, right_mcv);
         try aarch64.andRegReg(self.buf, dest, dest, scratch1);
 
+        self.freeDeadOperands(value);
         try self.setResult(value.id, .{ .register = dest });
     }
 
     pub fn genOr(self: *CodeGen, value: *ssa.Value) !void {
         const args = value.args();
+
+        const dest = try self.allocReg(value.id);
         const left_mcv = self.getValue(args[0]);
         const right_mcv = self.getValue(args[1]);
 
-        const dest = try self.allocReg(value.id);
         try self.loadToReg(dest, left_mcv);
         try self.loadToReg(scratch1, right_mcv);
         try aarch64.orrRegReg(self.buf, dest, dest, scratch1);
 
+        self.freeDeadOperands(value);
         try self.setResult(value.id, .{ .register = dest });
     }
 
@@ -753,11 +966,11 @@ pub const CodeGen = struct {
         const args = value.args();
         if (args.len < 3) return;
 
+        // Allocate dest FIRST, then get MCValues (allocReg may spill operand regs)
+        const dest = try self.allocReg(value.id);
         const cond_mcv = self.getValue(args[0]);
         const true_mcv = self.getValue(args[1]);
         const false_mcv = self.getValue(args[2]);
-
-        const dest = try self.allocReg(value.id);
 
         // Load condition and check if non-zero
         try self.loadToReg(scratch0, cond_mcv);
@@ -769,6 +982,7 @@ pub const CodeGen = struct {
         // CSEL dest, dest, scratch1, NE (if cond != 0, keep true_val, else use false_val)
         try aarch64.csel(self.buf, dest, dest, scratch1, .ne);
 
+        self.freeDeadOperands(value);
         try self.setResult(value.id, .{ .register = dest });
     }
 
@@ -1453,13 +1667,31 @@ pub const CodeGen = struct {
         try aarch64.movFromSp(self.buf, .fp);
 
         // Spill parameters to local slots
+        // String parameters use 2 registers (ptr + len), others use 1
         const param_regs = [_]aarch64.Reg{ .x0, .x1, .x2, .x3, .x4, .x5, .x6, .x7 };
-        const num_params = @min(self.func.param_count, @as(u32, @intCast(param_regs.len)));
+        const num_params = self.func.param_count;
 
-        for (0..num_params) |i| {
-            if (i < self.func.locals.len) {
-                const sp_offset = convertOffset(self.func.locals[i].offset, self.stack_size);
-                try aarch64.strRegImm(self.buf, param_regs[i], .sp, sp_offset);
+        var reg_idx: usize = 0;
+        for (0..num_params) |param_idx| {
+            if (param_idx >= self.func.locals.len or reg_idx >= param_regs.len) break;
+
+            const local = self.func.locals[param_idx];
+            const sp_offset = convertOffset(local.offset, self.stack_size);
+
+            // Check if this parameter is a string (needs 2 registers: ptr + len)
+            if (local.type_idx == types.TypeRegistry.STRING) {
+                // Store ptr
+                try aarch64.strRegImm(self.buf, param_regs[reg_idx], .sp, sp_offset);
+                reg_idx += 1;
+                // Store len
+                if (reg_idx < param_regs.len) {
+                    const sp_offset_len = convertOffset(local.offset + 8, self.stack_size);
+                    try aarch64.strRegImm(self.buf, param_regs[reg_idx], .sp, sp_offset_len);
+                    reg_idx += 1;
+                }
+            } else {
+                try aarch64.strRegImm(self.buf, param_regs[reg_idx], .sp, sp_offset);
+                reg_idx += 1;
             }
         }
     }

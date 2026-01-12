@@ -549,6 +549,9 @@ pub const Driver = struct {
         );
         defer cg.deinit();
 
+        // Compute liveness for smart spill decisions
+        try cg.computeLiveness();
+
         // Generate prologue
         try cg.genPrologue();
 
@@ -569,6 +572,7 @@ pub const Driver = struct {
             for (block.values.items) |vid| {
                 const value = &func.values.items[vid];
                 try cg.genValue(value);
+                cg.advanceInst(); // Track instruction progress for liveness
             }
 
             // Generate block terminator
@@ -661,6 +665,9 @@ pub const Driver = struct {
         );
         defer cg.deinit();
 
+        // Compute liveness for smart spill decisions
+        try cg.computeLiveness();
+
         // Generate prologue
         try cg.genPrologue();
 
@@ -681,6 +688,7 @@ pub const Driver = struct {
             for (block.values.items) |vid| {
                 const value = &func.values.items[vid];
                 try cg.genValue(value);
+                cg.advanceInst(); // Track instruction progress for liveness
             }
 
             // Generate block terminator

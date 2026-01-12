@@ -1,0 +1,45 @@
+// Test string variable vs literal comparison
+// Tests that string parameters can be compared with literals
+
+fn check(s: string) bool {
+    if s == "hello" {
+        return true
+    }
+    return false
+}
+
+fn checkNot(s: string) bool {
+    if s != "world" {
+        return true
+    }
+    return false
+}
+
+fn main() int {
+    // Test equality: variable == literal
+    if check("hello") {
+        // good
+    } else {
+        return 1
+    }
+
+    // Test equality: variable != literal (should be false for "hello" != "hello")
+    if check("world") {
+        return 2  // "world" != "hello" should return false
+    }
+
+    // Test not-equal: variable != literal
+    if checkNot("hello") {
+        // "hello" != "world" is true
+    } else {
+        return 3
+    }
+
+    // Test not-equal: same value should return false
+    if checkNot("world") {
+        return 4  // "world" != "world" should return false
+    }
+
+    return 42
+}
+// Expected: 42

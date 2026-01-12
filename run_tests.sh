@@ -38,6 +38,7 @@ get_expected() {
         test_streq) echo 42 ;;
         test_streq_false) echo 42 ;;
         test_strne) echo 42 ;;
+        test_str_var_cmp) echo 42 ;;
         test_struct) echo 10 ;;
         test_struct2) echo 20 ;;
         test_array) echo 10 ;;
@@ -74,6 +75,7 @@ get_expected() {
         test_interpolation) echo 42 ;;
         test_interp_var) echo 42 ;;
         test_type_alias) echo 42 ;;
+        test_u8_local) echo 1 ;;
         test_compound_add) echo 42 ;;
         test_compound_sub) echo 42 ;;
         test_compound_mul) echo 42 ;;

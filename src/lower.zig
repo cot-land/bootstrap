@@ -15,6 +15,7 @@ const source = @import("source.zig");
 const errors = @import("errors.zig");
 const debug = @import("debug.zig");
 const check = @import("check.zig");
+const type_context = @import("type_context.zig");
 
 const Allocator = std.mem.Allocator;
 const Ast = ast.Ast;
@@ -39,6 +40,7 @@ pub const Lowerer = struct {
     err: *ErrorReporter,
     builder: ir.Builder,
     checker: *const check.Checker,
+    type_ctx: type_context.TypeContext,
 
     // Current function context (like Go's Curfn)
     current_func: ?*ir.FuncBuilder = null,
@@ -60,6 +62,7 @@ pub const Lowerer = struct {
             .err = err,
             .builder = ir.Builder.init(allocator, type_reg),
             .checker = chk,
+            .type_ctx = type_context.TypeContext.init(tree, type_reg),
         };
     }
 
@@ -122,8 +125,9 @@ pub const Lowerer = struct {
             // Add parameters - resolve type expressions to TypeIndex
             for (fn_decl.params) |param| {
                 const param_type = self.resolveTypeExprNode(param.type_expr);
-                _ = try fb.addParam(param.name, param_type);
-                log.debug("  param: {s} type_idx={d}", .{ param.name, param_type });
+                const param_size = self.type_reg.sizeOf(param_type);
+                _ = try fb.addParam(param.name, param_type, param_size);
+                log.debug("  param: {s} type_idx={d} size={d}", .{ param.name, param_type, param_size });
             }
 
             // Lower function body
@@ -142,22 +146,31 @@ pub const Lowerer = struct {
     }
 
     fn lowerVarDecl(self: *Lowerer, var_decl: ast.VarDecl, is_global: bool) !void {
+        // Get type: explicit annotation takes precedence, otherwise infer from initializer
+        var type_idx: TypeIndex = TypeRegistry.VOID;
+        if (var_decl.type_expr) |type_node_idx| {
+            // Use explicit type annotation - resolve the AST node to a TypeIndex
+            type_idx = self.type_ctx.resolveTypeExprNode(type_node_idx);
+        } else if (var_decl.value) |value_idx| {
+            // Infer type from initializer expression
+            type_idx = self.inferTypeFromExpr(value_idx);
+        }
+
         if (is_global) {
             // Global variable (var declarations are mutable)
             const span = Span.fromPos(Pos.zero);
             const global = ir.Global.init(
                 var_decl.name,
-                var_decl.type_expr orelse TypeRegistry.VOID,
-                false,  // not const (mutable)
+                type_idx,
+                false, // not const (mutable)
                 span,
             );
             try self.builder.addGlobal(global);
             log.debug("global var: {s}", .{var_decl.name});
         } else if (self.current_func) |fb| {
             // Local variable
-            const type_idx = var_decl.type_expr orelse TypeRegistry.VOID;
             const size = self.type_reg.sizeOf(type_idx);
-            const local_idx = try fb.addLocalWithSize(var_decl.name, type_idx, true, size);  // var = mutable
+            const local_idx = try fb.addLocalWithSize(var_decl.name, type_idx, true, size); // var = mutable
 
             // If there's an initializer, emit store
             if (var_decl.value) |value_idx| {
@@ -203,7 +216,7 @@ pub const Lowerer = struct {
                 try self.lowerStructInitInline(value_node.expr.struct_init, local_idx);
             } else if (value_node == .expr and value_node.expr == .array_literal) {
                 // Handle array literal inline - store each element
-                try self.lowerArrayLiteralInline(value_node.expr.array_literal, local_idx);
+                try self.lowerArrayLiteralInline(value_node.expr.array_literal, local_idx, type_idx);
             } else {
                 // Regular expression - lower and store
                 const value_ir_node = try self.lowerExpr(value_idx);
@@ -255,11 +268,12 @@ pub const Lowerer = struct {
     }
 
     /// Lower array literal directly to element stores
-    fn lowerArrayLiteralInline(self: *Lowerer, al: ast.ArrayLiteral, local_idx: usize) !void {
+    fn lowerArrayLiteralInline(self: *Lowerer, al: ast.ArrayLiteral, local_idx: usize, array_type_idx: TypeIndex) !void {
         const fb = self.current_func orelse return;
 
-        // Each element is stored at offset = index * 8 (64-bit integers)
-        const elem_size: u32 = 8;
+        // Get element type and size from array type
+        const elem_type = self.type_ctx.getElementType(array_type_idx) orelse TypeRegistry.INT;
+        const elem_size: u32 = self.type_reg.sizeOf(elem_type);
 
         for (al.elements, 0..) |elem_idx, i| {
             // Lower the element value
@@ -269,21 +283,31 @@ pub const Lowerer = struct {
             const offset: u32 = @intCast(i * elem_size);
 
             // Emit store: store value at local[offset]
-            const store = ir.Node.init(.store, TypeRegistry.INT, Span.fromPos(Pos.zero))
+            const store = ir.Node.init(.store, elem_type, Span.fromPos(Pos.zero))
                 .withArgs(&.{ @intCast(local_idx), value_node })
                 .withAux(@intCast(offset));
             _ = try fb.emit(store);
 
-            log.debug("  array element store: [{d}] at offset {d}", .{ i, offset });
+            log.debug("  array element store: [{d}] at offset {d}, elem_type={d}", .{ i, offset, elem_type });
         }
     }
 
     fn lowerConstDecl(self: *Lowerer, const_decl: ast.ConstDecl) !void {
+        // Get type: explicit annotation takes precedence, otherwise infer from value
+        var type_idx: TypeIndex = TypeRegistry.VOID;
+        if (const_decl.type_expr) |type_node_idx| {
+            // Use explicit type annotation - resolve the AST node to a TypeIndex
+            type_idx = self.type_ctx.resolveTypeExprNode(type_node_idx);
+        } else {
+            // Infer type from initializer expression (const always has value)
+            type_idx = self.inferTypeFromExpr(const_decl.value);
+        }
+
         // Constants are similar to immutable globals
         const span = Span.fromPos(Pos.zero);
         const global = ir.Global.init(
             const_decl.name,
-            const_decl.type_expr orelse TypeRegistry.VOID,
+            type_idx,
             true, // is_const
             span,
         );
@@ -293,14 +317,15 @@ pub const Lowerer = struct {
 
     fn lowerStructDecl(self: *Lowerer, struct_decl: ast.StructDecl) !void {
         // Struct fields are already stored in the TypeRegistry.
-        // Just register the struct def with its name.
+        // Look up the actual struct type from the registry.
+        const struct_type_idx = self.type_reg.lookupByName(struct_decl.name) orelse TypeRegistry.VOID;
         const struct_def = ir.StructDef{
             .name = struct_decl.name,
-            .type_idx = TypeRegistry.VOID,  // Struct type index from type checker
+            .type_idx = struct_type_idx,
             .span = struct_decl.span,
         };
         try self.builder.addStruct(struct_def);
-        log.debug("struct: {s}", .{struct_decl.name});
+        log.debug("struct: {s} type_idx={d}", .{ struct_decl.name, struct_type_idx });
     }
 
     // ========================================================================
@@ -984,18 +1009,23 @@ pub const Lowerer = struct {
                 const type_expr = type_node.expr.type_expr;
                 log.debug("  lowerNewExpr: type_expr.kind = {s}", .{@tagName(type_expr.kind)});
                 switch (type_expr.kind) {
-                    .map => {
+                    .map => |m| {
                         // new Map<K, V>() -> emit map_new
-                        // Returns a pointer/handle to the map
-                        const node = ir.Node.init(.map_new, TypeRegistry.INT, ne.span);
-                        log.debug("  map_new", .{});
+                        // Resolve the actual Map<K,V> type
+                        const key_type = self.type_ctx.resolveTypeExprNode(m.key);
+                        const val_type = self.type_ctx.resolveTypeExprNode(m.value);
+                        const map_type = self.type_reg.makeMap(key_type, val_type) catch TypeRegistry.INT;
+                        const node = ir.Node.init(.map_new, map_type, ne.span);
+                        log.debug("  map_new: Map<{d},{d}> = type {d}", .{ key_type, val_type, map_type });
                         return try fb.emit(node);
                     },
-                    .list => {
+                    .list => |elem_idx| {
                         // new List<T>() -> emit list_new
-                        // Returns a pointer/handle to the list
-                        const node = ir.Node.init(.list_new, TypeRegistry.INT, ne.span);
-                        log.debug("  list_new", .{});
+                        // Resolve the actual List<T> type
+                        const elem_type = self.type_ctx.resolveTypeExprNode(elem_idx);
+                        const list_type = self.type_reg.makeList(elem_type) catch TypeRegistry.INT;
+                        const node = ir.Node.init(.list_new, list_type, ne.span);
+                        log.debug("  list_new: List<{d}> = type {d}", .{ elem_type, list_type });
                         return try fb.emit(node);
                     },
                     else => {},
@@ -1234,10 +1264,10 @@ pub const Lowerer = struct {
                             const local_type = self.type_reg.get(local.type_idx);
                             if (local_type == .map_type) {
                                 log.debug("  map method call: {s}.{s}", .{ var_name, fa.field });
-                                return self.lowerMapMethodCall(call, fa.field, @intCast(local_idx));
+                                return self.lowerMapMethodCall(call, fa.field, @intCast(local_idx), local.type_idx);
                             } else if (local_type == .list_type) {
                                 log.debug("  list method call: {s}.{s}", .{ var_name, fa.field });
-                                return self.lowerListMethodCall(call, fa.field, @intCast(local_idx));
+                                return self.lowerListMethodCall(call, fa.field, @intCast(local_idx), local.type_idx);
                             } else if (local_type == .struct_type) {
                                 // Check if this is a method call on a struct
                                 const struct_name = local_type.struct_type.name;
@@ -1316,11 +1346,14 @@ pub const Lowerer = struct {
             try args.append(self.allocator, arg_node);
         }
 
-        const node = ir.Node.init(.call, TypeRegistry.VOID, Span.fromPos(Pos.zero))
+        // Look up the function's return type from the AST (fixes u8 return type bug)
+        const return_type = self.type_ctx.getFuncReturnType(func_name) orelse TypeRegistry.VOID;
+
+        const node = ir.Node.init(.call, return_type, Span.fromPos(Pos.zero))
             .withArgs(try self.allocator.dupe(ir.NodeIndex, args.items))
             .withAuxStr(func_name);
 
-        log.debug("  call: {s}", .{func_name});
+        log.debug("  call: {s} return_type={d}", .{ func_name, return_type });
         return try fb.emit(node);
     }
 
@@ -1641,11 +1674,15 @@ pub const Lowerer = struct {
         call: ast.Call,
         method_name: []const u8,
         local_idx: u32,
+        map_type_idx: TypeIndex,
     ) Allocator.Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
 
-        // Load the map handle
-        const map_handle = try fb.emitLocalLoad(local_idx, TypeRegistry.INT, Span.fromPos(Pos.zero));
+        // Load the map handle (use actual map type)
+        const map_handle = try fb.emitLocalLoad(local_idx, map_type_idx, Span.fromPos(Pos.zero));
+
+        // Get the map's value type for get() operations
+        const value_type = self.type_ctx.getMapValueType(map_type_idx) orelse TypeRegistry.INT;
 
         if (std.mem.eql(u8, method_name, "set")) {
             // map.set(key, value) -> map_set(handle, key_ptr, key_len, value)
@@ -1676,10 +1713,11 @@ pub const Lowerer = struct {
 
             const key_node = try self.lowerExpr(call.args[0]);
 
-            const node = ir.Node.init(.map_get, TypeRegistry.INT, Span.fromPos(Pos.zero))
+            // Use the map's value type for the result
+            const node = ir.Node.init(.map_get, value_type, Span.fromPos(Pos.zero))
                 .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ map_handle, key_node }));
 
-            log.debug("  map.get() -> map_get IR op", .{});
+            log.debug("  map.get() -> map_get IR op, value_type={d}", .{value_type});
             return try fb.emit(node);
         } else if (std.mem.eql(u8, method_name, "has")) {
             // map.has(key) -> map_has(handle, key_ptr, key_len)
@@ -1719,11 +1757,15 @@ pub const Lowerer = struct {
         call: ast.Call,
         method_name: []const u8,
         local_idx: u32,
+        list_type_idx: TypeIndex,
     ) Allocator.Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
 
-        // Load the list handle
-        const list_handle = try fb.emitLocalLoad(local_idx, TypeRegistry.INT, Span.fromPos(Pos.zero));
+        // Load the list handle (use actual list type)
+        const list_handle = try fb.emitLocalLoad(local_idx, list_type_idx, Span.fromPos(Pos.zero));
+
+        // Get the list's element type for get() operations
+        const elem_type = self.type_ctx.getListElementType(list_type_idx) orelse TypeRegistry.INT;
 
         if (std.mem.eql(u8, method_name, "push")) {
             // list.push(value) -> list_push(handle, value)
@@ -1748,10 +1790,11 @@ pub const Lowerer = struct {
 
             const index_node = try self.lowerExpr(call.args[0]);
 
-            const node = ir.Node.init(.list_get, TypeRegistry.INT, Span.fromPos(Pos.zero))
+            // Use the list's element type for the result
+            const node = ir.Node.init(.list_get, elem_type, Span.fromPos(Pos.zero))
                 .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ list_handle, index_node }));
 
-            log.debug("  list.get() -> list_get IR op", .{});
+            log.debug("  list.get() -> list_get IR op, elem_type={d}", .{elem_type});
             return try fb.emit(node);
         } else if (std.mem.eql(u8, method_name, "len")) {
             // list.len() -> list_len(handle)
@@ -1778,17 +1821,20 @@ pub const Lowerer = struct {
         var args = std.ArrayList(ir.NodeIndex){ .items = &.{}, .capacity = 0 };
         defer args.deinit(self.allocator);
 
+        // Get the local's type for creating pointer type
+        const local = fb.locals.items[local_idx];
+        const ptr_type = self.type_ctx.makePointerTo(local.type_idx);
+
         // First argument is the receiver (self)
         if (method.receiver_is_ptr and !is_ptr) {
             // Method wants *T but we have T - emit addr_local
-            const addr_node = ir.Node.init(.addr_local, TypeRegistry.VOID, Span.fromPos(Pos.zero))
+            const addr_node = ir.Node.init(.addr_local, ptr_type, Span.fromPos(Pos.zero))
                 .withArgs(&.{@intCast(local_idx)});
             const receiver = try fb.emit(addr_node);
             try args.append(self.allocator, receiver);
-            log.debug("  method receiver: &local[{d}]", .{local_idx});
+            log.debug("  method receiver: &local[{d}], ptr_type={d}", .{ local_idx, ptr_type });
         } else if (!method.receiver_is_ptr and is_ptr) {
             // Method wants T but we have *T - emit load from local (dereference)
-            const local = fb.locals.items[local_idx];
             const load_node = ir.Node.init(.local, local.type_idx, Span.fromPos(Pos.zero))
                 .withArgs(&.{@intCast(local_idx)});
             const receiver = try fb.emit(load_node);
@@ -1796,11 +1842,11 @@ pub const Lowerer = struct {
             log.debug("  method receiver: *local[{d}]", .{local_idx});
         } else {
             // Types match - pass address for both cases (pointer for ptr method, address for value method)
-            const addr_node = ir.Node.init(.addr_local, TypeRegistry.VOID, Span.fromPos(Pos.zero))
+            const addr_node = ir.Node.init(.addr_local, ptr_type, Span.fromPos(Pos.zero))
                 .withArgs(&.{@intCast(local_idx)});
             const receiver = try fb.emit(addr_node);
             try args.append(self.allocator, receiver);
-            log.debug("  method receiver: &local[{d}]", .{local_idx});
+            log.debug("  method receiver: &local[{d}], ptr_type={d}", .{ local_idx, ptr_type });
         }
 
         // Lower the remaining arguments
@@ -1810,11 +1856,14 @@ pub const Lowerer = struct {
         }
 
         // Emit the call to the method function
-        const node = ir.Node.init(.call, TypeRegistry.VOID, Span.fromPos(Pos.zero))
+        // Look up the method's return type from the AST
+        const return_type = self.type_ctx.getFuncReturnType(method.func_name) orelse TypeRegistry.VOID;
+
+        const node = ir.Node.init(.call, return_type, Span.fromPos(Pos.zero))
             .withArgs(try self.allocator.dupe(ir.NodeIndex, args.items))
             .withAuxStr(method.func_name);
 
-        log.debug("  method call: {s}({d} args)", .{ method.func_name, args.items.len });
+        log.debug("  method call: {s}({d} args) return_type={d}", .{ method.func_name, args.items.len, return_type });
         return try fb.emit(node);
     }
 
@@ -1897,7 +1946,11 @@ pub const Lowerer = struct {
         const base = try self.lowerExpr(index.base);
         const idx = try self.lowerExpr(index.index);
 
-        const node = ir.Node.init(.index, TypeRegistry.VOID, Span.fromPos(Pos.zero))
+        // Get the element type from the base expression's type
+        const base_type_idx = self.inferTypeFromExpr(index.base);
+        const elem_type = self.type_ctx.getElementType(base_type_idx) orelse TypeRegistry.VOID;
+
+        const node = ir.Node.init(.index, elem_type, Span.fromPos(Pos.zero))
             .withArgs(&.{ base, idx });
 
         return try fb.emit(node);
@@ -2128,7 +2181,10 @@ pub const Lowerer = struct {
         const then_val = try self.lowerExpr(if_expr.then_branch);
         const else_val = if (if_expr.else_branch) |e| try self.lowerExpr(e) else ir.null_node;
 
-        const node = ir.Node.init(.select, TypeRegistry.VOID, Span.fromPos(Pos.zero))
+        // Get the result type from the then branch
+        const result_type = self.inferTypeFromExpr(if_expr.then_branch);
+
+        const node = ir.Node.init(.select, result_type, Span.fromPos(Pos.zero))
             .withArgs(&.{ cond, then_val, else_val });
 
         return try fb.emit(node);
@@ -2139,6 +2195,17 @@ pub const Lowerer = struct {
     /// select(x == 1, a, select(x == 2, b, c))
     fn lowerSwitchExpr(self: *Lowerer, switch_expr: ast.SwitchExpr) Allocator.Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
+
+        // Infer result type from first case body or else body
+        const result_type = blk: {
+            if (switch_expr.cases.len > 0) {
+                break :blk self.inferTypeFromExpr(switch_expr.cases[0].body);
+            } else if (switch_expr.else_body) |else_idx| {
+                break :blk self.inferTypeFromExpr(else_idx);
+            } else {
+                break :blk TypeRegistry.VOID;
+            }
+        };
 
         // Evaluate subject once
         const subject = try self.lowerExpr(switch_expr.subject);
@@ -2299,7 +2366,7 @@ pub const Lowerer = struct {
                 if (result == ir.null_node) {
                     result = case_body;
                 } else {
-                    const select = ir.Node.init(.select, TypeRegistry.VOID, Span.fromPos(Pos.zero))
+                    const select = ir.Node.init(.select, result_type, Span.fromPos(Pos.zero))
                         .withArgs(&.{ cond, case_body, result });
                     result = try fb.emit(select);
                 }
@@ -2355,6 +2422,12 @@ pub const Lowerer = struct {
     /// Infer the type of an AST expression node.
     /// Used for type inference in variable declarations like `var i = 1`.
     fn inferTypeFromExpr(self: *Lowerer, node_idx: NodeIndex) TypeIndex {
+        // First, try to use the checker's cached expression types (most reliable)
+        if (self.checker.expr_types.get(node_idx)) |cached_type| {
+            return cached_type;
+        }
+
+        // Fall back to manual inference for cases not in the cache
         const node = self.tree.getNode(node_idx);
 
         switch (node) {

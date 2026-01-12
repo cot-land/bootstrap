@@ -627,12 +627,12 @@ pub const Func = struct {
     }
 
     /// Number of values.
-    pub fn numValues(self: *Func) u32 {
+    pub fn numValues(self: *const Func) u32 {
         return self.vid.num();
     }
 
     /// Number of blocks.
-    pub fn numBlocks(self: *Func) u32 {
+    pub fn numBlocks(self: *const Func) u32 {
         return self.bid.num();
     }
 };

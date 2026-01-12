@@ -1,0 +1,17 @@
+// Test u8 local variable storage and retrieval
+enum Token: u8 {
+    invalid,
+    kw_fn = 42,
+}
+
+fn getToken() Token {
+    return Token.kw_fn
+}
+
+fn main() int {
+    const t: Token = getToken()
+    if t == Token.kw_fn {
+        return 1
+    }
+    return 0
+}

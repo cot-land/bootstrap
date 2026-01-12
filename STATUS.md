@@ -8,8 +8,8 @@
 
 | Platform | Passed | Failed | Skipped |
 |----------|--------|--------|---------|
-| ARM64 (macOS) | 63 | 0 | 10 |
-| x86_64 (Linux) | 58 | 5 | 10 |
+| ARM64 (macOS) | 65 | 0 | 10 |
+| x86_64 (Linux) | 60 | 5 | 10 |
 
 ```bash
 # Run tests
@@ -127,7 +127,7 @@ zig build test                    # Zig unit tests (149 tests)
 |---------|--------|-------|
 | Literals | Done | `"hello"` |
 | Length | Done | `len(s)` |
-| Equality | Done | `s1 == s2` |
+| Equality | Done | `s1 == s2` (variable vs literal, variable vs variable) |
 | Indexing | Done | `s[i]` returns byte |
 | Slicing | Done | `s[i:j]` |
 | Interpolation | Done | `"Hello {name}!"` |

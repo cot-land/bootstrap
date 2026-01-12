@@ -76,3 +76,27 @@ test "cot_str_concat empty strings" {
     try std.testing.expectEqual(@as(usize, 4), r2.len);
     try std.testing.expectEqualStrings("test", p2[0..r2.len]);
 }
+
+/// Compare two strings for equality.
+/// Returns 1 if equal, 0 if not equal.
+///
+/// Calling convention:
+///   x86_64: rdi=ptr1, rsi=len1, rdx=ptr2, rcx=len2
+///   aarch64: x0=ptr1, x1=len1, x2=ptr2, x3=len2
+export fn cot_str_eq(ptr1: [*]const u8, len1: usize, ptr2: [*]const u8, len2: usize) callconv(.c) i64 {
+    // Quick length check
+    if (len1 != len2) return 0;
+
+    // Empty strings are equal
+    if (len1 == 0) return 1;
+
+    // Compare bytes
+    return if (std.mem.eql(u8, ptr1[0..len1], ptr2[0..len2])) 1 else 0;
+}
+
+test "cot_str_eq basic" {
+    try std.testing.expectEqual(@as(i64, 1), cot_str_eq("hello", 5, "hello", 5));
+    try std.testing.expectEqual(@as(i64, 0), cot_str_eq("hello", 5, "world", 5));
+    try std.testing.expectEqual(@as(i64, 0), cot_str_eq("hello", 5, "hell", 4));
+    try std.testing.expectEqual(@as(i64, 1), cot_str_eq("", 0, "", 0));
+}
