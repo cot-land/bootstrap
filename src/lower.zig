@@ -670,13 +670,40 @@ pub const Lowerer = struct {
                             // Lower the value
                             const value_node = try self.lowerExpr(assign.value);
 
-                            // Emit store at local + field offset
-                            const store = ir.Node.init(.store, chain_info.field_type_idx, Span.fromPos(Pos.zero))
-                                .withArgs(&.{ @intCast(local_idx), value_node })
-                                .withAux(@intCast(chain_info.cumulative_offset));
-                            _ = try fb.emit(store);
-                            log.debug("  field assign: .{s} at offset {d}", .{ fa.field, chain_info.cumulative_offset });
+                            if (chain_info.is_ptr_deref) {
+                                // Store through pointer field: c.*.value = x
+                                const store = ir.Node.init(.ptr_field_store, chain_info.field_type_idx, Span.fromPos(Pos.zero))
+                                    .withArgs(&.{ @intCast(local_idx), value_node })
+                                    .withAux(@intCast(chain_info.cumulative_offset));
+                                _ = try fb.emit(store);
+                                log.debug("  ptr field assign: .{s} at offset {d}", .{ fa.field, chain_info.cumulative_offset });
+                            } else {
+                                // Emit store at local + field offset
+                                const store = ir.Node.init(.store, chain_info.field_type_idx, Span.fromPos(Pos.zero))
+                                    .withArgs(&.{ @intCast(local_idx), value_node })
+                                    .withAux(@intCast(chain_info.cumulative_offset));
+                                _ = try fb.emit(store);
+                                log.debug("  field assign: .{s} at offset {d}", .{ fa.field, chain_info.cumulative_offset });
+                            }
                         }
+                    },
+                    .deref => |d| {
+                        // Pointer dereference assignment: p.* = value
+                        // Lower the pointer expression
+                        const ptr_node = try self.lowerExpr(d.operand);
+
+                        // Lower the value expression
+                        const value_node = try self.lowerExpr(assign.value);
+
+                        // Get the pointed-to type
+                        const ptr_type = self.checker.expr_types.get(d.operand) orelse TypeRegistry.INVALID;
+                        const elem_type = self.type_reg.pointerElem(ptr_type);
+
+                        // Emit ptr_store
+                        const store = ir.Node.init(.ptr_store, elem_type, Span.fromPos(Pos.zero))
+                            .withArgs(&.{ ptr_node, value_node });
+                        _ = try fb.emit(store);
+                        log.debug("  deref assign: store through pointer", .{});
                     },
                     else => {},
                 }
@@ -1046,6 +1073,8 @@ pub const Lowerer = struct {
             .new_expr => |ne| self.lowerNewExpr(ne),
             .string_interp => |si| self.lowerStringInterp(si),
             .optional_unwrap => |ou| self.lowerOptionalUnwrap(ou),
+            .addr_of => |ao| self.lowerAddrOf(ao),
+            .deref => |d| self.lowerDeref(d),
             .block => ir.null_node, // Block expressions not yet implemented
             .type_expr => ir.null_node, // Type expressions don't produce runtime values
             .bad_expr => ir.null_node, // Skip invalid expressions
@@ -1186,6 +1215,108 @@ pub const Lowerer = struct {
     fn lowerOptionalUnwrap(self: *Lowerer, ou: ast.OptionalUnwrap) Allocator.Error!ir.NodeIndex {
         // Simply evaluate the operand - null checks are TODO
         return self.lowerExpr(ou.operand);
+    }
+
+    /// Lower address-of expression: &expr
+    /// Returns an IR node that computes the address of the operand.
+    fn lowerAddrOf(self: *Lowerer, ao: ast.AddrOf) Allocator.Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+
+        // Get the AST node for the operand
+        const operand_ast = self.tree.getNode(ao.operand);
+        const operand_expr = operand_ast.expr;
+
+        // Get the result type (pointer to operand's type)
+        const operand_type = self.checker.expr_types.get(ao.operand) orelse TypeRegistry.INVALID;
+        const ptr_type = self.type_reg.makePointer(operand_type) catch return ir.null_node;
+
+        // Determine what kind of address we're taking
+        switch (operand_expr) {
+            .identifier => |ident| {
+                // Taking address of a local variable
+                if (fb.lookupLocal(ident.name)) |local_idx| {
+                    const node = ir.Node.init(.addr_local, ptr_type, ao.span)
+                        .withAux(@as(i64, @intCast(local_idx)));
+                    return try fb.emit(node);
+                }
+                // Not a local - shouldn't happen for now
+                return ir.null_node;
+            },
+            .field_access => |fa| {
+                // Taking address of a struct field: &s.field
+                // First get the address of the base, then add field offset
+                const base_type = self.checker.expr_types.get(fa.base) orelse TypeRegistry.INVALID;
+                const t = self.type_reg.get(base_type);
+                if (t == .struct_type) {
+                    for (t.struct_type.fields) |field| {
+                        if (std.mem.eql(u8, field.name, fa.field)) {
+                            // Get address of base struct
+                            const base_addr = try self.lowerAddrOfExpr(fa.base);
+                            // Emit addr_field to add offset
+                            const node = ir.Node.init(.addr_field, ptr_type, ao.span)
+                                .withAux(@as(i64, @intCast(field.offset)))
+                                .withArgs(&[_]ir.NodeIndex{base_addr});
+                            return try fb.emit(node);
+                        }
+                    }
+                }
+                return ir.null_node;
+            },
+            .index => |idx| {
+                // Taking address of array element: &arr[i]
+                const base_addr = try self.lowerAddrOfExpr(idx.base);
+                const index_val = try self.lowerExpr(idx.index);
+                const node = ir.Node.init(.addr_index, ptr_type, ao.span)
+                    .withArgs(&[_]ir.NodeIndex{ base_addr, index_val });
+                return try fb.emit(node);
+            },
+            else => {
+                // Can't take address of arbitrary expressions
+                return ir.null_node;
+            },
+        }
+    }
+
+    /// Helper to get address of an expression (for nested address-of operations)
+    fn lowerAddrOfExpr(self: *Lowerer, expr_idx: ast.NodeIndex) Allocator.Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+        const expr_ast = self.tree.getNode(expr_idx);
+        const expr = expr_ast.expr;
+
+        switch (expr) {
+            .identifier => |ident| {
+                if (fb.lookupLocal(ident.name)) |local_idx| {
+                    const operand_type = self.checker.expr_types.get(expr_idx) orelse TypeRegistry.INVALID;
+                    const ptr_type = self.type_reg.makePointer(operand_type) catch return ir.null_node;
+                    const node = ir.Node.init(.addr_local, ptr_type, ident.span)
+                        .withAux(@as(i64, @intCast(local_idx)));
+                    return try fb.emit(node);
+                }
+                return ir.null_node;
+            },
+            else => {
+                // For other expressions, evaluate and assume it's already an address
+                return self.lowerExpr(expr_idx);
+            },
+        }
+    }
+
+    /// Lower dereference expression: expr.*
+    /// Loads the value pointed to by the pointer expression.
+    fn lowerDeref(self: *Lowerer, d: ast.Deref) Allocator.Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+
+        // Lower the pointer expression to get the address
+        const ptr_val = try self.lowerExpr(d.operand);
+
+        // Get the result type (pointed-to type)
+        const ptr_type = self.checker.expr_types.get(d.operand) orelse TypeRegistry.INVALID;
+        const elem_type = self.type_reg.pointerElem(ptr_type);
+
+        // Emit a ptr_load operation (load through pointer)
+        const node = ir.Node.init(.ptr_load, elem_type, d.span)
+            .withArgs(&[_]ir.NodeIndex{ptr_val});
+        return try fb.emit(node);
     }
 
     fn lowerLiteral(self: *Lowerer, lit: ast.Literal) Allocator.Error!ir.NodeIndex {
@@ -1612,6 +1743,37 @@ pub const Lowerer = struct {
                                     }
                                 }
                             }
+                        } else if (base_node == .expr and base_node.expr == .deref) {
+                            // len(ptr.*.field) - field access through pointer dereference
+                            const d = base_node.expr.deref;
+                            const deref_base = self.tree.getNode(d.operand);
+                            if (deref_base == .expr and deref_base.expr == .identifier) {
+                                const ident = deref_base.expr.identifier;
+                                if (fb.lookupLocal(ident.name)) |local_idx| {
+                                    const local = fb.locals.items[local_idx];
+                                    const ptr_type = self.type_reg.get(local.type_idx);
+                                    if (ptr_type == .pointer) {
+                                        const elem_type = self.type_reg.get(ptr_type.pointer.elem);
+                                        if (elem_type == .struct_type) {
+                                            const st = elem_type.struct_type;
+                                            for (st.fields) |f| {
+                                                if (std.mem.eql(u8, f.name, fa.field)) {
+                                                    const field_type = self.type_reg.get(f.type_idx);
+                                                    if (field_type == .list_type) {
+                                                        // Lower the field access to get the list handle
+                                                        const list_node = try self.lowerFieldAccess(fa);
+                                                        const node = ir.Node.init(.list_len, TypeRegistry.INT, Span.fromPos(Pos.zero))
+                                                            .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{list_node}));
+                                                        log.debug("  len(ptr.*.list_field) runtime: field={s}", .{fa.field});
+                                                        return try fb.emit(node);
+                                                    }
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     },
                     else => {},
@@ -1867,7 +2029,8 @@ pub const Lowerer = struct {
         // Load the map handle (use actual map type)
         const map_handle = try fb.emitLocalLoad(local_idx, map_type_idx, Span.fromPos(Pos.zero));
 
-        // Get the map's value type for get() operations
+        // Get the map's key and value types
+        const key_type = self.type_ctx.getMapKeyType(map_type_idx) orelse TypeRegistry.STRING;
         const value_type = self.type_ctx.getMapValueType(map_type_idx) orelse TypeRegistry.INT;
 
         if (std.mem.eql(u8, method_name, "set")) {
@@ -1894,8 +2057,10 @@ pub const Lowerer = struct {
             const value_node = try self.lowerExpr(call.args[1]);
 
             // The runtime will receive (handle, key_ptr, key_len, value)
+            // aux contains the key type for codegen to select the right runtime function
             const node = ir.Node.init(.map_set, TypeRegistry.VOID, Span.fromPos(Pos.zero))
-                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ map_handle, key_ptr_node, key_len_node, value_node }));
+                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ map_handle, key_ptr_node, key_len_node, value_node }))
+                .withAux(key_type);
 
             log.debug("  map.set() -> map_set IR op", .{});
             return try fb.emit(node);
@@ -1908,9 +2073,10 @@ pub const Lowerer = struct {
 
             const key_node = try self.lowerExpr(call.args[0]);
 
-            // Use the map's value type for the result
+            // Use the map's value type for the result, aux contains key type
             const node = ir.Node.init(.map_get, value_type, Span.fromPos(Pos.zero))
-                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ map_handle, key_node }));
+                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ map_handle, key_node }))
+                .withAux(key_type);
 
             log.debug("  map.get() -> map_get IR op, value_type={d}", .{value_type});
             return try fb.emit(node);
@@ -1923,8 +2089,10 @@ pub const Lowerer = struct {
 
             const key_node = try self.lowerExpr(call.args[0]);
 
+            // aux contains key type for integer key support
             const node = ir.Node.init(.map_has, TypeRegistry.BOOL, Span.fromPos(Pos.zero))
-                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ map_handle, key_node }));
+                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ map_handle, key_node }))
+                .withAux(key_type);
 
             log.debug("  map.has() -> map_has IR op", .{});
             return try fb.emit(node);
@@ -2556,6 +2724,11 @@ pub const Lowerer = struct {
                         field_names[field_count] = fa.field;
                         field_count += 1;
                         current_base = fa.base;
+                    },
+                    .deref => |d| {
+                        // Dereferencing a pointer - mark it and continue to find the base
+                        is_ptr_deref = true;
+                        current_base = d.operand;
                     },
                     else => break,
                 }

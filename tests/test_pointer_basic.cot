@@ -1,0 +1,21 @@
+// Test basic pointer operations
+
+fn main() int {
+    var x: int = 10
+    var p: *int = &x
+
+    // Read through pointer
+    if p.* != 10 {
+        return 1
+    }
+
+    // Write through pointer
+    p.* = 42
+
+    // Verify write persisted to original variable
+    if x != 42 {
+        return 2
+    }
+
+    return 42
+}

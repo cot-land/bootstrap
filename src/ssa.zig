@@ -141,6 +141,10 @@ pub const Op = enum(u8) {
     store,
     addr,
     alloc,
+    /// Load through pointer. args[0] = pointer SSA value
+    ptr_load,
+    /// Store through pointer. args[0] = pointer SSA value, args[1] = value to store
+    ptr_store,
 
     // Struct/array field access
     /// Get struct field from local variable. args[0] = local index (raw), aux_int = field offset
@@ -149,6 +153,8 @@ pub const Op = enum(u8) {
     field_value,
     // Load field through pointer: args[0] = local index holding ptr, aux_int = field offset
     ptr_field,
+    // Store field through pointer: args[0] = local index holding ptr, args[1] = value, aux_int = field offset
+    ptr_field_store,
 
     // Array/slice indexing
     /// Index into local array/slice. args[0] = local index (raw), args[1] = index (SSA ref)

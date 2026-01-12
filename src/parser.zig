@@ -685,6 +685,21 @@ pub const Parser = struct {
     fn parseUnaryExpr(self: *Parser) ParseError!?NodeIndex {
         const start = self.pos();
 
+        // Address-of: &expr
+        if (self.tok.tok == .ampersand) {
+            self.advance();
+            const operand = try self.parseUnaryExpr() orelse return null;
+            const operand_span = self.ast.getNode(operand).span();
+            return try self.ast.addNode(.{
+                .expr = .{
+                    .addr_of = .{
+                        .operand = operand,
+                        .span = Span.init(start, operand_span.end),
+                    },
+                },
+            });
+        }
+
         // Unary operators: -, !, not
         if (self.tok.tok == .minus or self.tok.tok == .bang or self.tok.tok == .kw_not) {
             const op = self.tok.tok;
@@ -717,6 +732,18 @@ pub const Parser = struct {
                 expr = try self.ast.addNode(.{
                     .expr = .{
                         .optional_unwrap = .{
+                            .operand = expr,
+                            .span = Span.init(expr_span.start, end),
+                        },
+                    },
+                });
+            } else if (self.match(.dot_star)) {
+                // Dereference: expr.*
+                const expr_span = self.ast.getNode(expr).span();
+                const end = self.tok.span.start;
+                expr = try self.ast.addNode(.{
+                    .expr = .{
+                        .deref = .{
                             .operand = expr,
                             .span = Span.init(expr_span.start, end),
                         },

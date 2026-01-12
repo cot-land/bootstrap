@@ -551,6 +551,30 @@ pub const TypeRegistry = struct {
         };
     }
 
+    /// Check if a type is a pointer (*T).
+    pub fn isPointer(self: *const TypeRegistry, idx: TypeIndex) bool {
+        const t = self.get(idx);
+        return t == .pointer;
+    }
+
+    /// Check if a type is an integer type.
+    pub fn isIntType(self: *const TypeRegistry, idx: TypeIndex) bool {
+        const t = self.get(idx);
+        return switch (t) {
+            .basic => |b| b.isInteger(),
+            else => false,
+        };
+    }
+
+    /// Get the element type of a pointer. Returns invalid_type if not a pointer.
+    pub fn pointerElem(self: *const TypeRegistry, idx: TypeIndex) TypeIndex {
+        const t = self.get(idx);
+        return switch (t) {
+            .pointer => |p| p.elem,
+            else => invalid_type,
+        };
+    }
+
     /// Check if two types are equal.
     pub fn equal(self: *const TypeRegistry, a: TypeIndex, b: TypeIndex) bool {
         if (a == b) return true;
@@ -804,4 +828,30 @@ test "isAssignable untyped to typed" {
     // untyped_int should NOT be assignable to float or bool
     try std.testing.expect(!reg.isAssignable(untyped_int_idx, TypeRegistry.F64));
     try std.testing.expect(!reg.isAssignable(untyped_int_idx, TypeRegistry.BOOL));
+}
+
+test "pointer type helpers" {
+    var reg = try TypeRegistry.init(std.testing.allocator);
+    defer reg.deinit();
+
+    // Create *int
+    const ptr_int = try reg.makePointer(TypeRegistry.INT);
+
+    // isPointer should return true for pointer types
+    try std.testing.expect(reg.isPointer(ptr_int));
+
+    // isPointer should return false for non-pointer types
+    try std.testing.expect(!reg.isPointer(TypeRegistry.INT));
+    try std.testing.expect(!reg.isPointer(TypeRegistry.STRING));
+
+    // pointerElem should return the element type
+    try std.testing.expectEqual(TypeRegistry.INT, reg.pointerElem(ptr_int));
+
+    // pointerElem should return invalid_type for non-pointers
+    try std.testing.expectEqual(invalid_type, reg.pointerElem(TypeRegistry.INT));
+
+    // Nested pointer: **int
+    const ptr_ptr_int = try reg.makePointer(ptr_int);
+    try std.testing.expect(reg.isPointer(ptr_ptr_int));
+    try std.testing.expectEqual(ptr_int, reg.pointerElem(ptr_ptr_int));
 }

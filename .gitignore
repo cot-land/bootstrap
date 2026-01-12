@@ -75,3 +75,6 @@ check_boot
 test_map_large_struct
 test_map_struct_debug
 test_struct_init_simple
+test_pointer
+test_pointer_param
+test_pointer_basic

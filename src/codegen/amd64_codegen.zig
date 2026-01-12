@@ -1279,6 +1279,66 @@ pub const CodeGen = struct {
         try self.setResult(value.id, .{ .register = dest });
     }
 
+    /// Generate code for ptr_load: load through a pointer
+    /// args[0] = pointer SSA value
+    pub fn genPtrLoad(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+        if (args.len == 0) return;
+
+        // Get the pointer value
+        const ptr_mcv = self.getValue(args[0]);
+
+        // Load pointer into a register
+        const ptr_reg = try self.allocReg(0xFFFF);
+        try self.loadToReg(ptr_reg, ptr_mcv);
+
+        // Load through the pointer
+        const dest = try self.allocReg(value.id);
+        const size = self.type_reg.sizeOf(value.type_idx);
+
+        switch (size) {
+            1 => {
+                if (self.type_reg.isSigned(value.type_idx)) {
+                    try x86.movsxRegMem8(self.buf, dest, ptr_reg, 0);
+                } else {
+                    try x86.movzxRegMem8(self.buf, dest, ptr_reg, 0);
+                }
+            },
+            // For 16-bit and 32-bit, just use 64-bit load (upper bits cleared)
+            else => try x86.movRegMem(self.buf, dest, ptr_reg, 0),
+        }
+
+        try self.setResult(value.id, .{ .register = dest });
+    }
+
+    /// Generate code for ptr_store: store through a pointer
+    /// args[0] = pointer SSA value, args[1] = value to store
+    pub fn genPtrStore(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+        if (args.len < 2) return;
+
+        // Get the pointer value
+        const ptr_mcv = self.getValue(args[0]);
+        const val_mcv = self.getValue(args[1]);
+
+        // Load pointer into a register
+        const ptr_reg = try self.allocReg(0xFFFF);
+        try self.loadToReg(ptr_reg, ptr_mcv);
+
+        // Load value into a register
+        const val_reg = try self.allocReg(0xFFFE);
+        try self.loadToReg(val_reg, val_mcv);
+
+        // Store through the pointer
+        const size = self.type_reg.sizeOf(value.type_idx);
+
+        switch (size) {
+            1 => try x86.movMem8Reg(self.buf, ptr_reg, 0, val_reg),
+            // For 16-bit and 32-bit, use 64-bit store
+            else => try x86.movMemReg(self.buf, ptr_reg, 0, val_reg),
+        }
+    }
+
     /// Generate code for slice_make: create (ptr, len) pair
     pub fn genSliceMake(self: *CodeGen, value: *ssa.Value) !void {
         const args = value.args();
@@ -1828,6 +1888,33 @@ pub const CodeGen = struct {
         try self.setResult(value.id, .{ .register = dest });
     }
 
+    pub fn genPtrFieldStore(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+        if (args.len < 2) return;
+
+        const local_idx = args[0];
+        if (local_idx >= self.func.locals.len) return;
+
+        const local = self.func.locals[@intCast(local_idx)];
+        const field_offset: i32 = @intCast(value.aux_int);
+
+        // Load pointer from local
+        try x86.movRegMem(self.buf, scratch0, .rbp, local.offset);
+
+        // Load the value to store
+        const val_mcv = self.getValue(args[1]);
+        try self.loadToReg(scratch1, val_mcv);
+
+        // Store value at ptr + field_offset
+        const size = self.type_reg.sizeOf(value.type_idx);
+        if (size == 1) {
+            try x86.movMem8Reg(self.buf, scratch0, field_offset, scratch1);
+        } else {
+            // Use 64-bit store for sizes >= 2
+            try x86.movMemReg(self.buf, scratch0, field_offset, scratch1);
+        }
+    }
+
     /// Generate code for a function call
     pub fn genCall(self: *CodeGen, value: *ssa.Value) !void {
         // Spill caller-saved registers
@@ -1917,6 +2004,8 @@ pub const CodeGen = struct {
             .select => try self.genSelect(value),
             .index_local, .index_value, .index => try self.genIndex(value),
             .addr => try self.genAddr(value),
+            .ptr_load => try self.genPtrLoad(value),
+            .ptr_store => try self.genPtrStore(value),
             .slice_local, .slice_value, .slice_make => try self.genSliceMake(value),
             .slice_index => try self.genSliceIndex(value),
             .union_tag => try self.genUnionTag(value),
@@ -1932,6 +2021,7 @@ pub const CodeGen = struct {
             .const_float => {}, // TODO: implement (floating point not yet supported)
             .alloc => try self.genAlloc(value),
             .ptr_field => try self.genPtrField(value),
+            .ptr_field_store => try self.genPtrFieldStore(value),
             .map_new => try self.genMapNew(value),
             .map_set => try self.genMapSet(value),
             .map_has => try self.genMapHas(value),

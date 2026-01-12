@@ -152,17 +152,17 @@ fn checkerCurrentScope(checker: Checker) Scope {
     return scopes.get(idx)
 }
 
-fn checkerPushScope(checker: Checker) void {
-    var new_scope: Scope = scopeInit(checker.current_scope_idx)
-    checker.scopes.push(new_scope)
-    checker.current_scope_idx = len(checker.scopes) - 1
+fn checkerPushScope(checker: *Checker) void {
+    var new_scope: Scope = scopeInit(checker.*.current_scope_idx)
+    checker.*.scopes.push(new_scope)
+    checker.*.current_scope_idx = len(checker.*.scopes) - 1
 }
 
-fn checkerPopScope(checker: Checker) void {
-    var scopes: List<Scope> = checker.scopes
-    var idx: int = checker.current_scope_idx
+fn checkerPopScope(checker: *Checker) void {
+    var scopes: List<Scope> = checker.*.scopes
+    var idx: int = checker.*.current_scope_idx
     var current: Scope = scopes.get(idx)
-    checker.current_scope_idx = current.parent_idx
+    checker.*.current_scope_idx = current.parent_idx
 }
 
 fn checkerDefine(checker: Checker, sym: Symbol) void {
@@ -234,8 +234,8 @@ fn methodInfoIsValid(info: MethodInfo) bool {
 // Error Reporting (simplified)
 // =============================================================================
 
-fn checkerError(checker: Checker, msg: string) void {
-    checker.error_count = checker.error_count + 1
+fn checkerError(checker: *Checker, msg: string) void {
+    checker.*.error_count = checker.*.error_count + 1
 }
 
 fn checkerHasErrors(checker: Checker) bool {
@@ -402,7 +402,7 @@ fn main() int {
     }
 
     // Test 3: Nested scope lookup
-    checkerPushScope(checker)
+    checkerPushScope(&checker)
     var inner_sym: Symbol = symbolInit("y", SymbolKind.variable, TYPE_BOOL, 1, false)
     checkerDefine(checker, inner_sym)
 
@@ -416,7 +416,7 @@ fn main() int {
         return 5
     }
 
-    checkerPopScope(checker)
+    checkerPopScope(&checker)
 
     var found_x2: Symbol = checkerLookup(checker, "x")
     if not symbolIsValid(found_x2) {
@@ -481,7 +481,7 @@ fn main() int {
     }
 
     // Test 11: Error tracking
-    checkerError(checker, "test error")
+    checkerError(&checker, "test error")
     if not checkerHasErrors(checker) {
         return 19
     }

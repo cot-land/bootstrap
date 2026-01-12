@@ -124,6 +124,10 @@ pub const Op = enum(u8) {
     load,
     /// Store to address. args[0] = addr, args[1] = value
     store,
+    /// Load through pointer. args[0] = pointer value (IR node)
+    ptr_load,
+    /// Store through pointer. args[0] = pointer value (IR node), args[1] = value to store
+    ptr_store,
     /// Get address of local. aux = local index
     addr_local,
     /// Get field address. aux = field offset, args[0] = struct addr
@@ -132,6 +136,8 @@ pub const Op = enum(u8) {
     addr_index,
     /// Load field through pointer. args[0] = local holding ptr, aux = field offset
     ptr_field,
+    /// Store field through pointer. args[0] = local holding ptr, args[1] = value to store, aux = field offset
+    ptr_field_store,
 
     // ========== Struct/Array/Union ==========
     /// Get struct field from local variable. aux = field offset, args[0] = local index

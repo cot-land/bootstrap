@@ -536,6 +536,138 @@ export fn cot_map_free(handle: ?*MapHandle) void {
 }
 
 // ============================================================================
+// Integer-Keyed Map Functions
+// ============================================================================
+
+/// Hash function for integer keys
+fn hashInt(key: i64) u64 {
+    // Use FNV-1a on the bytes of the integer
+    var hash: u64 = 0xcbf29ce484222325;
+    const bytes: [8]u8 = @bitCast(key);
+    for (bytes) |byte| {
+        hash ^= byte;
+        hash *%= 0x100000001b3;
+    }
+    return hash;
+}
+
+/// Find slot for integer key
+fn findSlotInt(header: *DataHeader, key: i64, hash: u64) struct { index: u32, found: bool } {
+    const cap = header.capacity;
+    const fp = Metadata.fingerprint7(hash);
+    var idx: u32 = @truncate(hash & (cap - 1));
+    const metadata = getMetadata(header);
+    const keys = getKeys(header);
+
+    var first_tombstone: ?u32 = null;
+
+    while (true) {
+        const meta: Metadata = @bitCast(metadata[idx]);
+
+        if (meta.isFree()) {
+            // Empty slot - key not found
+            const insert_idx = first_tombstone orelse idx;
+            return .{ .index = insert_idx, .found = false };
+        }
+
+        if (meta.isTombstone()) {
+            if (first_tombstone == null) first_tombstone = idx;
+        } else if (meta.fingerprint == fp) {
+            // Check for actual key match (integer stored in ptr field)
+            const stored_key: i64 = @bitCast(@intFromPtr(keys[idx].ptr));
+            if (stored_key == key) {
+                return .{ .index = idx, .found = true };
+            }
+        }
+
+        idx = (idx + 1) & (cap - 1);
+    }
+}
+
+/// Set internal for integer keys
+fn setInternalInt(header: *DataHeader, key: i64, value: i64) bool {
+    const hash = hashInt(key);
+    const result = findSlotInt(header, key, hash);
+    const metadata = getMetadata(header);
+    const keys = getKeys(header);
+    const values = getValues(header);
+
+    if (!result.found) {
+        // New entry
+        const meta: Metadata = @bitCast(metadata[result.index]);
+        if (meta.isTombstone()) {
+            // Reusing tombstone
+        } else {
+            // Fresh slot
+            header.available -= 1;
+        }
+        header.size += 1;
+        metadata[result.index] = @bitCast(Metadata{
+            .fingerprint = Metadata.fingerprint7(hash),
+            .used = 1,
+        });
+        // Store integer key in the ptr field
+        keys[result.index] = StringKey{ .ptr = @ptrFromInt(@as(usize, @bitCast(key))), .len = 0 };
+    }
+
+    values[result.index] = value;
+    return true;
+}
+
+/// Set a value with an integer key
+/// Returns 1 on success, 0 on failure
+export fn cot_map_set_int(handle: ?*MapHandle, key: i64, value: i64) i64 {
+    const h = handle orelse return 0;
+
+    debugPrint("set_int({d}, {d}) - size={d}, available={d}", .{
+        key,
+        value,
+        h.data.size,
+        h.data.available,
+    });
+
+    // Check if we need to grow
+    if (h.data.available == 0) {
+        if (!grow(h)) return 0;
+    }
+
+    if (setInternalInt(h.data, key, value)) {
+        debugPrint("  set_int success, new size={d}", .{h.data.size});
+        return 1;
+    }
+    return 0;
+}
+
+/// Get a value with an integer key
+/// Returns the value if found, or MIN_INT if not found
+export fn cot_map_get_int(handle: ?*MapHandle, key: i64) i64 {
+    const h = handle orelse return std.math.minInt(i64);
+
+    const hash = hashInt(key);
+    const result = findSlotInt(h.data, key, hash);
+
+    if (result.found) {
+        const values = getValues(h.data);
+        debugPrint("get_int({d}) = {d}", .{ key, values[result.index] });
+        return values[result.index];
+    }
+
+    debugPrint("get_int({d}) = NOT FOUND", .{key});
+    return std.math.minInt(i64);
+}
+
+/// Check if an integer key exists in the map
+/// Returns 1 if found, 0 if not
+export fn cot_map_has_int(handle: ?*MapHandle, key: i64) i64 {
+    const h = handle orelse return 0;
+
+    const hash = hashInt(key);
+    const result = findSlotInt(h.data, key, hash);
+
+    return if (result.found) 1 else 0;
+}
+
+// ============================================================================
 // Debug Functions
 // ============================================================================
 

@@ -557,6 +557,8 @@ pub const Checker = struct {
             .new_expr => |ne| try self.checkNewExpr(ne),
             .string_interp => |si| try self.checkStringInterp(si),
             .optional_unwrap => |ou| try self.checkOptionalUnwrap(ou),
+            .addr_of => |ao| try self.checkAddrOf(ao),
+            .deref => |d| try self.checkDeref(d),
             .type_expr => invalid_type, // Types are not values
             .bad_expr => invalid_type,
         };
@@ -605,6 +607,32 @@ pub const Checker = struct {
         // For now, allow unwrap on any type (for flexibility during bootstrap)
         // In a stricter type system, we'd error here
         return operand_type;
+    }
+
+    /// Check address-of expression: &expr
+    /// Result type is *T where T is the operand's type.
+    fn checkAddrOf(self: *Checker, ao: ast.AddrOf) CheckError!TypeIndex {
+        const operand_type = try self.checkExpr(ao.operand);
+
+        // TODO: verify operand is an lvalue (variable, field, index)
+        // For now, we allow taking address of any expression
+
+        // Create pointer type *T
+        return try self.types.makePointer(operand_type);
+    }
+
+    /// Check dereference expression: expr.*
+    /// Operand must be a pointer type. Result is the pointed-to type.
+    fn checkDeref(self: *Checker, d: ast.Deref) CheckError!TypeIndex {
+        const operand_type = try self.checkExpr(d.operand);
+
+        // Operand must be a pointer type
+        if (self.types.isPointer(operand_type)) {
+            return self.types.pointerElem(operand_type);
+        }
+
+        self.err.errorWithCode(d.span.start, .E303, "cannot dereference non-pointer type");
+        return invalid_type;
     }
 
     /// Check identifier expression.
@@ -1567,7 +1595,7 @@ pub const Checker = struct {
                     }
                 }
             },
-            .index, .field_access => {}, // These are valid lvalues
+            .index, .field_access, .deref => {}, // These are valid lvalues
             else => {
                 self.err.errorWithCode(as_stmt.span.start, .E303, "invalid assignment target");
                 return;
@@ -2202,6 +2230,8 @@ test "AST expr coverage - exhaustive" {
         .type_expr,
         .string_interp,
         .optional_unwrap,
+        .addr_of,
+        .deref,
         .bad_expr,
     };
 
@@ -2225,6 +2255,8 @@ test "AST expr coverage - exhaustive" {
             .type_expr,
             .string_interp,
             .optional_unwrap,
+            .addr_of,
+            .deref,
             .bad_expr,
             => true,
         };

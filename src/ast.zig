@@ -175,6 +175,10 @@ pub const Expr = union(enum) {
     optional_unwrap: OptionalUnwrap,
     // Type expressions
     type_expr: TypeExpr,
+    // Address-of: &expr
+    addr_of: AddrOf,
+    // Dereference: expr.*
+    deref: Deref,
     // For error recovery
     bad_expr: BadExpr,
 
@@ -198,6 +202,8 @@ pub const Expr = union(enum) {
             .string_interp => |e| e.span,
             .optional_unwrap => |e| e.span,
             .type_expr => |e| e.span,
+            .addr_of => |e| e.span,
+            .deref => |e| e.span,
             .bad_expr => |e| e.span,
         };
     }
@@ -350,6 +356,18 @@ pub const NewExpr = struct {
 
 /// Optional unwrap: expr.? - unwraps optional, panics if null
 pub const OptionalUnwrap = struct {
+    operand: NodeIndex,
+    span: Span,
+};
+
+/// Address-of expression: &expr
+pub const AddrOf = struct {
+    operand: NodeIndex,
+    span: Span,
+};
+
+/// Dereference expression: expr.*
+pub const Deref = struct {
     operand: NodeIndex,
     span: Span,
 };

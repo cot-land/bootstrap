@@ -1705,6 +1705,68 @@ pub const CodeGen = struct {
         try self.setResult(value.id, .{ .register = dest });
     }
 
+    /// Generate code for ptr_load: load through a pointer
+    /// args[0] = pointer SSA value
+    pub fn genPtrLoad(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+        if (args.len == 0) return;
+
+        // Get the pointer value
+        const ptr_mcv = self.getValue(args[0]);
+
+        // Load pointer into a register
+        const ptr_reg = try self.allocReg(0xFFFF);
+        try self.loadToReg(ptr_reg, ptr_mcv);
+
+        // Load through the pointer
+        const dest = try self.allocReg(value.id);
+        const size = self.type_reg.sizeOf(value.type_idx);
+
+        switch (size) {
+            1 => {
+                if (self.type_reg.isSigned(value.type_idx)) {
+                    try aarch64.ldrsbRegImm(self.buf, dest, ptr_reg, 0);
+                } else {
+                    try aarch64.ldrbRegImm(self.buf, dest, ptr_reg, 0);
+                }
+            },
+            2 => try aarch64.ldrhRegImm(self.buf, dest, ptr_reg, 0),
+            4 => try aarch64.ldrwRegImm(self.buf, dest, ptr_reg, 0),
+            else => try aarch64.ldrRegImm(self.buf, dest, ptr_reg, 0),
+        }
+
+        try self.setResult(value.id, .{ .register = dest });
+    }
+
+    /// Generate code for ptr_store: store through a pointer
+    /// args[0] = pointer SSA value, args[1] = value to store
+    pub fn genPtrStore(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+        if (args.len < 2) return;
+
+        // Get the pointer value
+        const ptr_mcv = self.getValue(args[0]);
+        const val_mcv = self.getValue(args[1]);
+
+        // Load pointer into a register
+        const ptr_reg = try self.allocReg(0xFFFF);
+        try self.loadToReg(ptr_reg, ptr_mcv);
+
+        // Load value into a register
+        const val_reg = try self.allocReg(0xFFFE);
+        try self.loadToReg(val_reg, val_mcv);
+
+        // Store through the pointer
+        const size = self.type_reg.sizeOf(value.type_idx);
+
+        switch (size) {
+            1 => try aarch64.strbRegImm(self.buf, val_reg, ptr_reg, 0),
+            2 => try aarch64.strhRegImm(self.buf, val_reg, ptr_reg, 0),
+            4 => try aarch64.strwRegImm(self.buf, val_reg, ptr_reg, 0),
+            else => try aarch64.strRegImm(self.buf, val_reg, ptr_reg, 0),
+        }
+    }
+
     /// Generate slice from local array/slice.
     /// args[0] = local index (raw), args[1] = start, args[2] = end. aux_int = elem_size
     pub fn genSliceLocal(self: *CodeGen, value: *ssa.Value) !void {
@@ -2116,6 +2178,23 @@ pub const CodeGen = struct {
 
         try self.spillCallerSaved();
 
+        // Check if this is an integer-keyed map (aux_int contains key type)
+        const key_type_idx: types.TypeIndex = @intCast(@as(u32, @bitCast(@as(i32, @intCast(value.aux_int)))));
+        if (self.type_reg.isIntType(key_type_idx)) {
+            // Integer-keyed map: load key into x1, handle into x0
+            const key_mcv = self.getValue(args[1]);
+            try self.loadToReg(.x1, key_mcv);
+
+            const handle_mcv = self.getValue(args[0]);
+            try self.loadToReg(.x0, handle_mcv);
+
+            const func_name = if (self.os == .macos) "_cot_map_get_int" else "cot_map_get_int";
+            try aarch64.callSymbol(self.buf, func_name);
+            self.reg_manager.markUsed(.x0, value.id);
+            try self.setResult(value.id, .{ .register = .x0 });
+            return;
+        }
+
         // Check if value type is a large struct (> 8 bytes)
         const value_size = self.type_reg.sizeOf(value.type_idx);
         const is_large_struct = value_size > 8;
@@ -2217,6 +2296,30 @@ pub const CodeGen = struct {
 
         try self.spillCallerSaved();
 
+        // Check if this is an integer-keyed map (aux_int contains key type)
+        const key_type_idx: types.TypeIndex = @intCast(@as(u32, @bitCast(@as(i32, @intCast(value.aux_int)))));
+        if (self.type_reg.isIntType(key_type_idx)) {
+            // Integer-keyed map: args = [handle, key, key_again, value]
+            // The key is passed twice for uniformity but we only need it once for int keys
+            const val_arg_idx: usize = if (args.len >= 4) 3 else 2;
+
+            // Load value into x2
+            const val_mcv = self.getValue(args[val_arg_idx]);
+            try self.loadToReg(.x2, val_mcv);
+
+            // Load key into x1
+            const key_mcv = self.getValue(args[1]);
+            try self.loadToReg(.x1, key_mcv);
+
+            // Load handle into x0
+            const handle_mcv = self.getValue(args[0]);
+            try self.loadToReg(.x0, handle_mcv);
+
+            const func_name = if (self.os == .macos) "_cot_map_set_int" else "cot_map_set_int";
+            try aarch64.callSymbol(self.buf, func_name);
+            return;
+        }
+
         // Determine which arg is the value and check if it's a large struct
         const val_arg_idx: usize = if (args.len >= 4 and args[1] != args[2]) 3 else if (args.len >= 4) 3 else 2;
         const val_value = &self.func.values.items[args[val_arg_idx]];
@@ -2316,6 +2419,23 @@ pub const CodeGen = struct {
         if (args.len < 2) return;
 
         try self.spillCallerSaved();
+
+        // Check if this is an integer-keyed map (aux_int contains key type)
+        const key_type_idx: types.TypeIndex = @intCast(@as(u32, @bitCast(@as(i32, @intCast(value.aux_int)))));
+        if (self.type_reg.isIntType(key_type_idx)) {
+            // Integer-keyed map
+            const key_mcv = self.getValue(args[1]);
+            try self.loadToReg(.x1, key_mcv);
+
+            const handle_mcv = self.getValue(args[0]);
+            try self.loadToReg(.x0, handle_mcv);
+
+            const func_name = if (self.os == .macos) "_cot_map_has_int" else "cot_map_has_int";
+            try aarch64.callSymbol(self.buf, func_name);
+            self.reg_manager.markUsed(.x0, value.id);
+            try self.setResult(value.id, .{ .register = .x0 });
+            return;
+        }
 
         // Load key FIRST to avoid clobbering handle
         const key_val = &self.func.values.items[args[1]];
@@ -2579,6 +2699,37 @@ pub const CodeGen = struct {
         }
     }
 
+    pub fn genPtrFieldStore(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+        if (args.len < 2) return;
+
+        const local_idx = args[0];
+        if (local_idx >= self.func.locals.len) return;
+
+        const local = self.func.locals[@intCast(local_idx)];
+        const field_offset: u12 = @intCast(@as(u32, @intCast(value.aux_int)));
+
+        // Load the pointer from local
+        const sp_offset = convertOffset(local.offset, self.stack_size);
+        try self.ldrSpOffset(scratch0, sp_offset); // scratch0 = pointer value
+
+        // Load the value to store
+        const val_mcv = self.getValue(args[1]);
+        try self.loadToReg(scratch1, val_mcv); // scratch1 = value to store
+
+        // Store value at pointer + field offset
+        const size = self.type_reg.sizeOf(value.type_idx);
+        if (size == 1) {
+            try aarch64.strbRegImm(self.buf, scratch1, scratch0, field_offset);
+        } else if (size == 2) {
+            try aarch64.strhRegImm(self.buf, scratch1, scratch0, field_offset);
+        } else if (size == 4) {
+            try aarch64.strwRegImm(self.buf, scratch1, scratch0, field_offset);
+        } else {
+            try aarch64.strRegImm(self.buf, scratch1, scratch0, field_offset);
+        }
+    }
+
     pub fn genReturn(self: *CodeGen, block: *ssa.Block) !void {
         const ret_class = classifyType(self.type_reg, self.func.return_type);
 
@@ -2733,6 +2884,8 @@ pub const CodeGen = struct {
             .index_local, .index => try self.genIndexLocal(value),
             .index_value => try self.genIndexValue(value),
             .addr => try self.genAddr(value),
+            .ptr_load => try self.genPtrLoad(value),
+            .ptr_store => try self.genPtrStore(value),
             .slice_local, .slice_make => try self.genSliceLocal(value),
             .slice_value => try self.genSliceValue(value),
             .slice_index => try self.genSliceIndex(value),
@@ -2748,6 +2901,7 @@ pub const CodeGen = struct {
             .const_float => {}, // TODO: implement (floating point not yet supported)
             .alloc => try self.genAlloc(value),
             .ptr_field => try self.genPtrField(value),
+            .ptr_field_store => try self.genPtrFieldStore(value),
             .map_new => try self.genMapNew(value),
             .map_set => try self.genMapSet(value),
             .map_has => try self.genMapHas(value),

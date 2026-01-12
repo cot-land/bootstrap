@@ -1003,9 +1003,12 @@ fn convertIRNode(func: *ssa.Func, node: *const ir.Node, ir_to_ssa: *std.AutoHash
         .local => .load, // Load local variable (aux = local index)
         .load => .load,
         .store => .store,
+        .ptr_load => .ptr_load, // Load through pointer
+        .ptr_store => .ptr_store, // Store through pointer
         .addr_local => .addr,
         .addr_field => .field, // Field address becomes field op in SSA
         .ptr_field => .ptr_field,
+        .ptr_field_store => .ptr_field_store,
 
         // Function
         .call => .call,
@@ -1066,8 +1069,8 @@ fn convertIRNode(func: *ssa.Func, node: *const ir.Node, ir_to_ssa: *std.AutoHash
 
     // Convert arguments based on op type
     switch (node.op) {
-        .local => {
-            // local: aux = local index (stored as arg[0] for codegen)
+        .local, .addr_local => {
+            // local/addr_local: aux = local index (stored as arg[0] for codegen)
             value.args_storage[0] = @intCast(node.aux); // local index from aux
             value.args_len = 1;
         },
@@ -1092,6 +1095,30 @@ fn convertIRNode(func: *ssa.Func, node: *const ir.Node, ir_to_ssa: *std.AutoHash
                 }
             }
         },
+        .ptr_load => {
+            // ptr_load: args[0] = pointer value (SSA ref)
+            if (node.args_len > 0) {
+                if (ir_to_ssa.get(node.args()[0])) |ssa_ptr| {
+                    value.args_storage[0] = ssa_ptr;
+                    value.args_len = 1;
+                }
+            }
+        },
+        .ptr_store => {
+            // ptr_store: args[0] = pointer value (SSA ref), args[1] = value to store (SSA ref)
+            if (node.args_len > 0) {
+                if (ir_to_ssa.get(node.args()[0])) |ssa_ptr| {
+                    value.args_storage[0] = ssa_ptr;
+                    value.args_len = 1;
+                }
+            }
+            if (node.args_len > 1) {
+                if (ir_to_ssa.get(node.args()[1])) |ssa_val| {
+                    value.args_storage[1] = ssa_val;
+                    value.args_len = 2;
+                }
+            }
+        },
         .field_local, .field, .ptr_field, .addr_field => {
             // field_local/ptr_field/addr_field: args[0] is always local index (raw)
             if (node.args_len > 0) {
@@ -1108,6 +1135,20 @@ fn convertIRNode(func: *ssa.Func, node: *const ir.Node, ir_to_ssa: *std.AutoHash
                     value.args_len = 1;
                 }
             }
+            // aux_int already copied above (contains field offset)
+        },
+        .ptr_field_store => {
+            // ptr_field_store: args[0] = local index (raw), args[1] = value (SSA)
+            // aux = field offset
+            if (node.args_len > 0) {
+                value.args_storage[0] = node.args()[0]; // local index, raw
+            }
+            if (node.args_len > 1) {
+                if (ir_to_ssa.get(node.args()[1])) |ssa_val| {
+                    value.args_storage[1] = ssa_val;
+                }
+            }
+            value.args_len = 2;
             // aux_int already copied above (contains field offset)
         },
         .slice_local, .slice => {

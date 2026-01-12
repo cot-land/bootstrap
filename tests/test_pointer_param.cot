@@ -1,0 +1,39 @@
+// Test pointer parameters - the key use case for check_boot.cot
+
+struct Counter {
+    value: int,
+    increment: int,
+}
+
+fn incrementCounter(c: *Counter) void {
+    c.*.value = c.*.value + c.*.increment
+}
+
+fn main() int {
+    var counter: Counter = Counter{
+        .value = 10,
+        .increment = 5,
+    }
+
+    // Initial value check
+    if counter.value != 10 {
+        return 1
+    }
+
+    // Call function with pointer parameter
+    incrementCounter(&counter)
+
+    // Verify mutation persisted
+    if counter.value != 15 {
+        return 2
+    }
+
+    // Call again
+    incrementCounter(&counter)
+
+    if counter.value != 20 {
+        return 3
+    }
+
+    return 42
+}
