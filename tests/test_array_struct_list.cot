@@ -1,0 +1,35 @@
+// Test array + struct + list combination
+struct Point {
+    x: int,
+    y: int,
+}
+
+fn make_point(x: int, y: int) Point {
+    return Point{ .x = x, .y = y }
+}
+
+fn main() i64 {
+    // Arrays
+    var arr = [10, 20, 30, 40, 50]
+    if arr[0] != 10 { return 1 }
+
+    var sum: i64 = 0
+    for item in arr {
+        sum = sum + item
+    }
+    if sum != 150 { return 2 }
+
+    // Create struct from function (16 bytes - double_reg)
+    var p = make_point(5, 6)
+    if p.x != 5 { return 3 }
+
+    // List
+    var list = new List<i64>()
+    list.push(1)
+    list.push(2)
+    list.push(3)
+    if list.get(0) != 1 { return 4 }
+    if list.get(2) != 3 { return 5 }
+
+    return 42
+}

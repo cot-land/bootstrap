@@ -116,6 +116,19 @@ pub const Shift = enum(u2) {
     ror = 0b11, // Rotate right (reserved for some ops)
 };
 
+/// Extend types for extended register instructions.
+/// In the extended register format, register 31 is SP (not XZR).
+pub const Extend = enum(u3) {
+    uxtb = 0b000, // Unsigned extend byte
+    uxth = 0b001, // Unsigned extend halfword
+    uxtw = 0b010, // Unsigned extend word (32-bit zero-extend)
+    uxtx = 0b011, // Unsigned extend doubleword (64-bit, no extend = LSL)
+    sxtb = 0b100, // Signed extend byte
+    sxth = 0b101, // Signed extend halfword
+    sxtw = 0b110, // Signed extend word
+    sxtx = 0b111, // Signed extend doubleword
+};
+
 /// Condition codes for conditional branches.
 pub const Cond = enum(u4) {
     eq = 0b0000, // Equal (Z=1)
@@ -161,6 +174,31 @@ fn dataProcessingShifted(sf: bool, opc: u2, s: bool, rm: Reg, shift: Shift, imm6
     inst |= @as(u32, @intFromEnum(shift)) << 22;
     inst |= @as(u32, rm.id()) << 16;
     inst |= @as(u32, imm6) << 10;
+    inst |= @as(u32, rn.id()) << 5;
+    inst |= @as(u32, rd.id());
+    return inst;
+}
+
+/// Build data processing (extended register) instruction for add/sub.
+/// Format: sf|op|S|01011|opt|1|Rm|option|imm3|Rn|Rd
+/// - sf: 1 for 64-bit, 0 for 32-bit
+/// - op: 0 for ADD, 1 for SUB
+/// - S: 1 to set flags
+/// - opt: 00 for extended register
+/// - option: extend type (UXTX = no extend for 64-bit)
+/// - imm3: left shift amount (0-4)
+/// NOTE: In this format, register 31 is SP (not XZR)!
+fn dataProcessingExtended(sf: bool, op: u1, s: bool, rm: Reg, extend: Extend, imm3: u3, rn: Reg, rd: Reg) u32 {
+    var inst: u32 = 0;
+    if (sf) inst |= 1 << 31; // 64-bit
+    inst |= @as(u32, op) << 30; // op: 0=ADD, 1=SUB
+    if (s) inst |= 1 << 29; // S: set flags
+    inst |= 0b01011 << 24; // Fixed pattern
+    inst |= 0b00 << 22; // opt=00 for extended register
+    inst |= 1 << 21; // Marks extended register format
+    inst |= @as(u32, rm.id()) << 16;
+    inst |= @as(u32, @intFromEnum(extend)) << 13;
+    inst |= @as(u32, imm3) << 10;
     inst |= @as(u32, rn.id()) << 5;
     inst |= @as(u32, rd.id());
     return inst;
@@ -283,9 +321,17 @@ fn branchCond(cond: Cond, imm19: i19) u32 {
 // Arithmetic Instructions
 // ============================================================================
 
-/// ADD Xd, Xn, Xm
+/// ADD Xd, Xn, Xm - Auto-detects SP and uses correct encoding
+/// When any operand is SP, uses extended register form (reg 31 = SP)
+/// Otherwise uses shifted register form (reg 31 = XZR)
 pub fn addRegReg(buf: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg) !void {
-    try emit32(buf, dataProcessingShifted(true, 0b00, false, rm, .lsl, 0, rn, rd));
+    if (rd == .sp or rn == .sp or rm == .sp) {
+        // Extended register form: ADD <Xd|SP>, <Xn|SP>, Xm, UXTX #0
+        try emit32(buf, dataProcessingExtended(true, 0, false, rm, .uxtx, 0, rn, rd));
+    } else {
+        // Shifted register form: ADD Xd, Xn, Xm, LSL #0
+        try emit32(buf, dataProcessingShifted(true, 0b00, false, rm, .lsl, 0, rn, rd));
+    }
 }
 
 /// ADD Xd, Xn, #imm12
@@ -293,9 +339,17 @@ pub fn addRegImm12(buf: *CodeBuffer, rd: Reg, rn: Reg, imm12: u12) !void {
     try emit32(buf, dataProcessingImm(true, 0, false, false, imm12, rn, rd));
 }
 
-/// SUB Xd, Xn, Xm
+/// SUB Xd, Xn, Xm - Auto-detects SP and uses correct encoding
+/// When any operand is SP, uses extended register form (reg 31 = SP)
+/// Otherwise uses shifted register form (reg 31 = XZR)
 pub fn subRegReg(buf: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg) !void {
-    try emit32(buf, dataProcessingShifted(true, 0b10, false, rm, .lsl, 0, rn, rd));
+    if (rd == .sp or rn == .sp or rm == .sp) {
+        // Extended register form: SUB <Xd|SP>, <Xn|SP>, Xm, UXTX #0
+        try emit32(buf, dataProcessingExtended(true, 1, false, rm, .uxtx, 0, rn, rd));
+    } else {
+        // Shifted register form: SUB Xd, Xn, Xm, LSL #0
+        try emit32(buf, dataProcessingShifted(true, 0b10, false, rm, .lsl, 0, rn, rd));
+    }
 }
 
 /// SUB Xd, Xn, #imm12

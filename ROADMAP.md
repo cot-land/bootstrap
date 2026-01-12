@@ -55,7 +55,7 @@ Every Zig source file needs a corresponding bootstrap .cot file that uses only s
 | `src/parser.zig` | `src/bootstrap/parser_boot.cot` | **Done** | Parser |
 | `src/check.zig` | `src/bootstrap/check_boot.cot` | **Done** | Type checker (basic tests) |
 | `src/errors.zig` | `src/bootstrap/errors_boot.cot` | **Done** | Error handling |
-| `src/ir.zig` | `src/bootstrap/ir_boot.cot` | TODO | IR definitions |
+| `src/ir.zig` | `src/bootstrap/ir_boot.cot` | **Done** | IR definitions (x86_64 large struct TODO) |
 | `src/lower.zig` | `src/bootstrap/lower_boot.cot` | TODO | AST → IR lowering |
 | `src/ssa.zig` | `src/bootstrap/ssa_boot.cot` | TODO | SSA conversion |
 | `src/liveness.zig` | `src/bootstrap/liveness_boot.cot` | TODO | Liveness analysis |
@@ -71,7 +71,7 @@ Every Zig source file needs a corresponding bootstrap .cot file that uses only s
 | `src/debug.zig` | `src/bootstrap/debug_boot.cot` | TODO | Debug output utilities |
 | `src/type_context.zig` | `src/bootstrap/type_context_boot.cot` | TODO | Type context for checker |
 
-**Progress: 8/22 files complete**
+**Progress: 9/22 files complete**
 
 ---
 
@@ -161,7 +161,7 @@ These features exist in wireframe .cot files but are NOT in Zig compiler yet:
 6. ✅ `errors_boot.cot` - Error types (DONE)
 7. ✅ `parser_boot.cot` - Parser (DONE)
 8. ✅ `check_boot.cot` - Type checker (DONE)
-9. `ir_boot.cot` - IR definitions
+9. ✅ `ir_boot.cot` - IR definitions (DONE)
 10. `lower_boot.cot` - Lowering
 11. `ssa_boot.cot` - SSA conversion
 12. `liveness_boot.cot` - Liveness analysis

@@ -78,3 +78,12 @@ test_struct_init_simple
 test_pointer
 test_pointer_param
 test_pointer_basic
+ir_boot
+taf
+test_all
+test_asl
+test_sl
+test_sm
+test_struct2
+test_sul
+test_sum

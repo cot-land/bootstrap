@@ -1,0 +1,35 @@
+// Test struct + union + map combination
+struct Point {
+    x: int,
+    y: int,
+}
+
+fn make_point(x: int, y: int) Point {
+    return Point{ .x = x, .y = y }
+}
+
+union Result {
+    ok: int,
+    err: int,
+}
+
+fn main() i64 {
+    // Create struct from function (16 bytes - double_reg)
+    var p = make_point(5, 6)
+    if p.x != 5 { return 1 }
+
+    // Union
+    var result = Result.ok(42)
+    var val = switch result {
+        .ok |v| => v,
+        .err |e| => e,
+    }
+    if val != 42 { return 2 }
+
+    // Create map
+    var m = new Map<string, i64>()
+    m.set("key", 100)
+    if m.get("key") != 100 { return 3 }
+
+    return 42
+}

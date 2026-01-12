@@ -21,6 +21,42 @@ const object = @import("object.zig");
 const liveness = @import("../liveness.zig");
 
 // ============================================================================
+// ABI Classification (x86_64 SysV)
+// ============================================================================
+
+/// Classification for x86_64 SysV ABI calling convention
+pub const ABIClass = enum {
+    /// Fits in 1 register (≤8 bytes)
+    single_reg,
+    /// Fits in 2 registers (9-16 bytes) - rax + rdx
+    double_reg,
+    /// Passed via hidden pointer (>16 bytes)
+    by_pointer,
+    /// Slice type - always 2 registers (ptr + len)
+    slice,
+};
+
+/// Classify a type for x86_64 SysV ABI
+pub fn classifyType(type_reg: *const types.TypeRegistry, type_idx: types.TypeIndex) ABIClass {
+    const t = type_reg.get(type_idx);
+    const size = type_reg.sizeOf(type_idx);
+
+    // Slices are special - always passed as ptr+len in 2 registers
+    if (t == .slice) {
+        return .slice;
+    }
+
+    // Size-based classification (x86_64 SysV ABI)
+    if (size > 16) {
+        return .by_pointer;
+    } else if (size > 8) {
+        return .double_reg;
+    } else {
+        return .single_reg;
+    }
+}
+
+// ============================================================================
 // MCValue - Machine Code Value (where a value lives)
 // ============================================================================
 
@@ -247,6 +283,13 @@ pub const CodeGen = struct {
     liveness_info: ?liveness.LivenessInfo = null,
     current_inst: u32 = 0,
 
+    /// For sret (struct return): offset where hidden return pointer is saved
+    /// Only valid when has_sret is true
+    sret_offset: i32 = 0,
+
+    /// Whether this function uses sret convention (return type > 16 bytes)
+    has_sret: bool = false,
+
     pub fn init(
         allocator: Allocator,
         buf: *be.CodeBuffer,
@@ -255,6 +298,25 @@ pub const CodeGen = struct {
         os: be.OS,
         string_infos: []const be.StringInfo,
     ) CodeGen {
+        // Check if function uses sret (return type > 16 bytes)
+        // Following Go/Zig pattern: sret uses hidden pointer in first param register
+        const has_sret = classifyType(type_reg, func.return_type) == .by_pointer;
+
+        // Calculate offsets based on whether sret is used
+        // Layout: [locals | sret slot (if needed) | spill slots]
+        // All offsets are negative from rbp
+        const base_offset = -@as(i32, @intCast(func.frame_size));
+
+        // sret slot is just below locals (8 bytes for pointer)
+        const sret_slot: i32 = if (has_sret) base_offset - 8 else 0;
+
+        // Spill slots start below sret slot (if present) or below locals
+        const spill_start: i32 = if (has_sret) sret_slot - 8 else base_offset - 8;
+
+        // Stack size: locals + sret slot (if any) + estimated spill space
+        const sret_space: u32 = if (has_sret) 8 else 0;
+        const stack_size = func.frame_size + sret_space + @as(u32, @intCast(func.values.items.len)) * 8;
+
         return .{
             .allocator = allocator,
             .buf = buf,
@@ -264,10 +326,10 @@ pub const CodeGen = struct {
             .tracking = std.AutoHashMap(ssa.ValueID, InstTracking).init(allocator),
             .reg_manager = .{},
             .string_infos = string_infos,
-            // Spill slots start below locals.
-            // Estimate max spill slots: each SSA value might need one in worst case.
-            .next_spill_offset = -@as(i32, @intCast(func.frame_size)) - 8,
-            .stack_size = func.frame_size + @as(u32, @intCast(func.values.items.len)) * 8
+            .next_spill_offset = spill_start,
+            .stack_size = stack_size,
+            .has_sret = has_sret,
+            .sret_offset = sret_slot,
         };
     }
 
@@ -940,7 +1002,6 @@ pub const CodeGen = struct {
         // Standard value store
         const src_mcv = self.getValue(src_id);
         const size = self.type_reg.sizeOf(src_value.type_idx);
-
         // For ops that leave result in rax (call, field, slice_index, etc.)
         // NOTE: .index is NOT in this list because genIndex uses allocReg (not rax)
         const uses_rax = switch (src_value.op) {
@@ -1669,7 +1730,10 @@ pub const CodeGen = struct {
         }
 
         // Load value into rcx (4th arg for string key case)
-        const val_mcv = self.getValue(args[2]);
+        // For string keys: args = [handle, key_ptr, key_len, value]
+        // For int keys: args = [handle, key, key, value] (key repeated for uniformity)
+        const val_arg_idx: usize = if (args.len >= 4) 3 else 2;
+        const val_mcv = self.getValue(args[val_arg_idx]);
         try self.loadToReg(.rcx, val_mcv);
 
         // Load handle LAST to avoid clobber
@@ -1752,10 +1816,21 @@ pub const CodeGen = struct {
         try self.emitRuntimeCall("cot_map_free");
     }
 
-    /// Generate code for list_new: call cot_list_new() runtime function
+    /// Generate code for list_new: call cot_list_new(elem_size) runtime function
     pub fn genListNew(self: *CodeGen, value: *ssa.Value) !void {
         try self.spillCallerSaved();
+
+        // Get element size from list type
+        var elem_size: i64 = 8; // default to 8 bytes
+        const list_type = self.type_reg.get(value.type_idx);
+        if (list_type == .list_type) {
+            elem_size = @intCast(self.type_reg.sizeOf(list_type.list_type.elem));
+        }
+
+        // Pass elem_size in rdi (first argument)
+        try x86.movRegImm64(self.buf, .rdi, elem_size);
         try self.emitRuntimeCall("cot_list_new");
+
         // rax now has list handle
         self.reg_manager.markUsed(.rax, value.id);
         try self.setResult(value.id, .{ .register = .rax });
@@ -1915,16 +1990,43 @@ pub const CodeGen = struct {
         }
     }
 
-    /// Generate code for a function call
+    /// Generate code for a function call (x86_64 SysV ABI)
+    ///
+    /// Return handling follows Go/Zig patterns:
+    /// - ≤8 bytes: returned in rax (single_reg)
+    /// - 9-16 bytes: returned in rax+rdx (double_reg) - handled by genStore
+    /// - >16 bytes: hidden pointer in rdi, callee writes to it (by_pointer/sret)
     pub fn genCall(self: *CodeGen, value: *ssa.Value) !void {
         // Spill caller-saved registers
         try self.spillCallerSaved();
+
+        // Classify return type using x86_64 SysV ABI rules
+        const ret_class = classifyType(self.type_reg, value.type_idx);
 
         // x86_64 SysV ABI: rdi, rsi, rdx, rcx, r8, r9 for arguments
         const arg_regs = [_]x86.Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
         const args = value.args();
 
+        // For sret (>16 byte returns), we need to:
+        // 1. Allocate stack space for the result
+        // 2. Pass pointer to that space in rdi (hidden first parameter)
+        // 3. Shift all actual arguments right by 1 register
+        var result_offset: i32 = 0;
         var reg_idx: usize = 0;
+
+        if (ret_class == .by_pointer) {
+            // Allocate stack space for large struct result
+            // Use a fixed location relative to frame size to avoid dynamic allocation issues
+            const ret_size = self.type_reg.sizeOf(value.type_idx);
+            result_offset = self.next_spill_offset;
+            self.next_spill_offset -= @intCast(alignTo(ret_size, 8));
+            // Load effective address of result space into rdi (hidden pointer)
+            try x86.leaRegMem(self.buf, .rdi, .rbp, result_offset);
+            // All other arguments shift right by 1
+            reg_idx = 1;
+        }
+
+        // Load arguments into registers
         for (args) |arg_id| {
             if (reg_idx >= arg_regs.len) break;
 
@@ -1951,17 +2053,83 @@ pub const CodeGen = struct {
             value.aux_str;
         try x86.callSymbol(self.buf, sym_name);
 
-        // Result is in rax - mark it used
-        self.reg_manager.markUsed(.rax, value.id);
-        try self.setResult(value.id, .{ .register = .rax });
+        // Handle result based on ABI class
+        switch (ret_class) {
+            .by_pointer => {
+                // sret: result was written to stack space via hidden pointer
+                // rax contains the pointer (same as what we passed)
+                try self.setResult(value.id, .{ .stack = result_offset });
+            },
+            .double_reg, .slice => {
+                // 16-byte struct or slice returned in rax+rdx
+                // Mark rax as containing the result - genStore handles the full 16-byte copy
+                self.reg_manager.markUsed(.rax, value.id);
+                try self.setResult(value.id, .{ .register = .rax });
+            },
+            .single_reg => {
+                // Small return in rax
+                self.reg_manager.markUsed(.rax, value.id);
+                try self.setResult(value.id, .{ .register = .rax });
+            },
+        }
     }
 
-    /// Generate code for return
+    /// Generate code for return (x86_64 SysV ABI)
+    ///
+    /// Return handling based on Go/Zig patterns:
+    /// - ≤8 bytes: return in rax (single_reg)
+    /// - 9-16 bytes: return in rax+rdx (double_reg)
+    /// - >16 bytes: copy to hidden pointer location, return pointer in rax (by_pointer/sret)
     pub fn genReturn(self: *CodeGen, block: *ssa.Block) !void {
-        // Load return value into rax
         if (block.control != ssa.null_value) {
+            const ret_val = &self.func.values.items[block.control];
+            const ret_class = classifyType(self.type_reg, ret_val.type_idx);
             const ret_mcv = self.getValue(block.control);
-            try self.loadToReg(.rax, ret_mcv);
+
+            switch (ret_class) {
+                .by_pointer => {
+                    // sret: copy struct to hidden pointer location, return pointer in rax
+                    // Hidden pointer was saved to sret_offset in genPrologue
+                    if (ret_mcv == .stack) {
+                        const ret_size = self.type_reg.sizeOf(ret_val.type_idx);
+                        // Load the hidden pointer
+                        try x86.movRegMem(self.buf, .rdi, .rbp, self.sret_offset);
+
+                        // Copy ret_size bytes from source to destination (8-byte chunks)
+                        var offset: i32 = 0;
+                        while (offset < @as(i32, @intCast(ret_size))) : (offset += 8) {
+                            try x86.movRegMem(self.buf, .rax, .rbp, ret_mcv.stack + offset);
+                            try x86.movMemReg(self.buf, .rdi, offset, .rax);
+                        }
+
+                        // Return the pointer in rax (x86_64 SysV requires this)
+                        try x86.movRegMem(self.buf, .rax, .rbp, self.sret_offset);
+                    } else {
+                        try self.loadToReg(.rax, ret_mcv);
+                    }
+                },
+                .double_reg => {
+                    // 16-byte struct: return in rax+rdx
+                    if (ret_mcv == .stack) {
+                        try x86.movRegMem(self.buf, .rax, .rbp, ret_mcv.stack);
+                        try x86.movRegMem(self.buf, .rdx, .rbp, ret_mcv.stack + 8);
+                    } else {
+                        try self.loadToReg(.rax, ret_mcv);
+                    }
+                },
+                .slice => {
+                    // Slice: ptr in rax, len in rdx
+                    if (ret_mcv == .stack) {
+                        try x86.movRegMem(self.buf, .rax, .rbp, ret_mcv.stack);
+                        try x86.movRegMem(self.buf, .rdx, .rbp, ret_mcv.stack + 8);
+                    } else {
+                        try self.loadToReg(.rax, ret_mcv);
+                    }
+                },
+                .single_reg => {
+                    try self.loadToReg(.rax, ret_mcv);
+                },
+            }
         }
 
         // Epilogue
@@ -2052,6 +2220,10 @@ pub const CodeGen = struct {
     }
 
     /// Generate prologue for a function
+    ///
+    /// Following x86_64 SysV ABI (Go/Zig pattern):
+    /// - For sret (>16 byte return): hidden pointer arrives in RDI, save it to sret_offset
+    /// - All other params shift right by 1 when sret is used
     pub fn genPrologue(self: *CodeGen) !void {
         // push rbp
         try x86.pushReg(self.buf, .rbp);
@@ -2064,14 +2236,21 @@ pub const CodeGen = struct {
             try x86.subRegImm32(self.buf, .rsp, @intCast(stack_size));
         }
 
-        // Spill parameters to local slots
-        // Simplified calling convention:
-        // - Scalars (int, bool, enum, ptr): 1 register
-        // - Slices (strings): 2 registers (ptr + len)
+        // x86_64 SysV ABI: rdi, rsi, rdx, rcx, r8, r9 for arguments
         const param_regs = [_]x86.Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
         const num_params = self.func.param_count;
 
         var reg_idx: usize = 0;
+
+        // Handle sret (struct return via hidden pointer)
+        // The hidden pointer comes in RDI, save it to sret_offset
+        // All actual parameters shift right by 1 register
+        if (self.has_sret) {
+            try x86.movMemReg(self.buf, .rbp, self.sret_offset, .rdi);
+            reg_idx = 1; // Skip RDI for actual parameters
+        }
+
+        // Spill parameters to local slots
         for (0..num_params) |param_idx| {
             if (param_idx >= self.func.locals.len or reg_idx >= param_regs.len) break;
 
@@ -2092,7 +2271,12 @@ pub const CodeGen = struct {
                     reg_idx += 1;
                 }
             } else {
-                try x86.movMemReg(self.buf, .rbp, local_offset, param_regs[reg_idx]);
+                // Use appropriate-sized store based on parameter type
+                const param_size = self.type_reg.sizeOf(local.type_idx);
+                switch (param_size) {
+                    1 => try x86.movMem8Reg(self.buf, .rbp, local_offset, param_regs[reg_idx]),
+                    else => try x86.movMemReg(self.buf, .rbp, local_offset, param_regs[reg_idx]),
+                }
                 reg_idx += 1;
             }
         }

@@ -461,15 +461,17 @@ pub const CodeGen = struct {
     }
 
     /// Store to [sp + offset] handling large offsets
-    /// For offsets > 4095, uses scratch register x16
+    /// For offsets > 4095, uses scratch register (x16 or x17 to avoid clobbering src)
     fn strSpOffset(self: *CodeGen, src: aarch64.Reg, offset: u32) !void {
         if (offset <= 4095) {
             try aarch64.strRegImm(self.buf, src, .sp, @intCast(offset));
         } else {
-            // Large offset: add x16, sp, #offset then str src, [x16]
-            try aarch64.movRegImm64(self.buf, .x16, offset);
-            try aarch64.addRegReg(self.buf, .x16, .sp, .x16);
-            try aarch64.strRegImm(self.buf, src, .x16, 0);
+            // Large offset: calculate address then store
+            // Use x17 if src is x16 to avoid clobbering the value
+            const scratch: aarch64.Reg = if (src == .x16) .x17 else .x16;
+            try aarch64.movRegImm64(self.buf, scratch, offset);
+            try aarch64.addRegReg(self.buf, scratch, .sp, scratch);
+            try aarch64.strRegImm(self.buf, src, scratch, 0);
         }
     }
 
@@ -500,9 +502,10 @@ pub const CodeGen = struct {
         if (offset <= 4095) {
             try aarch64.strbRegImm(self.buf, src, .sp, @intCast(offset));
         } else {
-            try aarch64.movRegImm64(self.buf, .x16, offset);
-            try aarch64.addRegReg(self.buf, .x16, .sp, .x16);
-            try aarch64.strbRegImm(self.buf, src, .x16, 0);
+            const scratch: aarch64.Reg = if (src == .x16) .x17 else .x16;
+            try aarch64.movRegImm64(self.buf, scratch, offset);
+            try aarch64.addRegReg(self.buf, scratch, .sp, scratch);
+            try aarch64.strbRegImm(self.buf, src, scratch, 0);
         }
     }
 
@@ -511,9 +514,10 @@ pub const CodeGen = struct {
         if (offset <= 4095) {
             try aarch64.strwRegImm(self.buf, src, .sp, @intCast(offset));
         } else {
-            try aarch64.movRegImm64(self.buf, .x16, offset);
-            try aarch64.addRegReg(self.buf, .x16, .sp, .x16);
-            try aarch64.strwRegImm(self.buf, src, .x16, 0);
+            const scratch: aarch64.Reg = if (src == .x16) .x17 else .x16;
+            try aarch64.movRegImm64(self.buf, scratch, offset);
+            try aarch64.addRegReg(self.buf, scratch, .sp, scratch);
+            try aarch64.strwRegImm(self.buf, src, scratch, 0);
         }
     }
 
@@ -522,9 +526,10 @@ pub const CodeGen = struct {
         if (offset <= 4095) {
             try aarch64.strhRegImm(self.buf, src, .sp, @intCast(offset));
         } else {
-            try aarch64.movRegImm64(self.buf, .x16, offset);
-            try aarch64.addRegReg(self.buf, .x16, .sp, .x16);
-            try aarch64.strhRegImm(self.buf, src, .x16, 0);
+            const scratch: aarch64.Reg = if (src == .x16) .x17 else .x16;
+            try aarch64.movRegImm64(self.buf, scratch, offset);
+            try aarch64.addRegReg(self.buf, scratch, .sp, scratch);
+            try aarch64.strhRegImm(self.buf, src, scratch, 0);
         }
     }
 
@@ -2942,6 +2947,7 @@ pub const CodeGen = struct {
             try aarch64.stpSignedOffset(self.buf, .fp, .lr, .sp, 0);
         } else {
             // Large frame: load size to scratch register, sub, stp
+            // subRegReg auto-detects SP and uses extended register format
             try aarch64.movRegImm64(self.buf, .x16, @intCast(self.stack_size));
             try aarch64.subRegReg(self.buf, .sp, .sp, .x16);
             try aarch64.stpSignedOffset(self.buf, .fp, .lr, .sp, 0);

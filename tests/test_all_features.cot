@@ -1,0 +1,178 @@
+// Test all features like comprehensive - bisect version
+// Expected: 42
+struct Point {
+    x: int,
+    y: int,
+}
+
+fn make_point(x: int, y: int) Point {
+    return Point{ .x = x, .y = y }
+}
+
+fn add(a: i64, b: i64) i64 {
+    return a + b
+}
+
+fn get_ten() i64 {
+    return 10
+}
+
+union Result {
+    ok: int,
+    err: int,
+}
+
+enum Color: i64 {
+    red = 1,
+    green = 2,
+    blue = 3,
+}
+
+type Int = i64
+
+fn main() i64 {
+    // Arithmetic
+    var x = 10
+    var y = 5
+    if x + y != 15 { return 1 }
+    if x - y != 5 { return 2 }
+    if x * y != 50 { return 3 }
+    if x / y != 2 { return 4 }
+
+    // Compound assignment
+    var z = 10
+    z += 5
+    if z != 15 { return 5 }
+    z -= 3
+    if z != 12 { return 6 }
+
+    // Comparisons
+    if x < y { return 7 }
+    if x <= y { return 8 }
+
+    // Boolean operations
+    if x == 10 and y == 5 {
+        // pass
+    } else {
+        return 9
+    }
+    if x == 10 or y == 10 {
+        // pass
+    } else {
+        return 10
+    }
+
+    // If statements
+    if x == 10 {
+        // pass
+    } else {
+        return 11
+    }
+
+    // Nested if
+    if x > 5 {
+        if y < 10 {
+            // pass
+        } else {
+            return 12
+        }
+    } else {
+        return 13
+    }
+
+    // While loop
+    var counter = 0
+    while counter < 5 {
+        counter += 1
+    }
+    if counter != 5 { return 14 }
+
+    // Arrays
+    var arr = [10, 20, 30, 40, 50]
+    if arr[0] != 10 { return 15 }
+    if arr[4] != 50 { return 16 }
+    if len(arr) != 5 { return 17 }
+
+    var idx = 2
+    if arr[idx] != 30 { return 18 }
+
+    // For loop
+    var sum: i64 = 0
+    for item in arr {
+        sum = sum + item
+    }
+    if sum != 150 { return 19 }
+
+    // Slices
+    var slice = arr[1:4]
+    if len(slice) != 3 { return 20 }
+    if slice[0] != 20 { return 21 }
+    if slice[2] != 40 { return 22 }
+
+    // Strings
+    var s = "hello"
+    if len(s) != 5 { return 23 }
+    if s[0] != 104 { return 24 }
+    if s != "hello" { return 25 }
+    if s == "world" { return 26 }
+    var sub = s[0:3]
+    if len(sub) != 3 { return 27 }
+
+    // Struct
+    var p = Point{ .x = 3, .y = 4 }
+    if p.x != 3 { return 28 }
+    if p.y != 4 { return 29 }
+
+    var p2 = make_point(5, 6)
+    if p2.x != 5 { return 30 }
+
+    // Enum
+    var c = Color.green
+    var color_val = @intFromEnum(c)
+    if color_val != 2 { return 31 }
+
+    // Union
+    var result = Result.ok(42)
+    var val = switch result {
+        .ok |v| => v,
+        .err |e| => e,
+    }
+    if val != 42 { return 32 }
+
+    // Function calls
+    if add(3, 4) != 7 { return 33 }
+    if get_ten() != 10 { return 34 }
+
+    // Multiple function calls
+    var multi = get_ten() + get_ten() + get_ten()
+    if multi != 30 { return 35 }
+
+    // Switch
+    var sw = 2
+    var sw_result = switch sw {
+        1 => 10,
+        2 => 42,
+        3 => 30,
+        else => 0,
+    }
+    if sw_result != 42 { return 36 }
+
+    // Type alias
+    const aliased: Int = 99
+    if aliased != 99 { return 37 }
+
+    // Map
+    var m = new Map<string, i64>()
+    m.set("key", 100)
+    if m.get("key") != 100 { return 38 }
+
+    // List
+    var list = new List<i64>()
+    list.push(1)
+    list.push(2)
+    list.push(3)
+    if list.get(0) != 1 { return 39 }
+    if list.get(2) != 3 { return 40 }
+
+    return 42
+}
