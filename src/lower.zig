@@ -887,12 +887,68 @@ pub const Lowerer = struct {
         };
     }
 
-    /// Lower string interpolation - not supported, use []u8 slices instead
+    /// Lower string interpolation: "text ${expr} more"
+    /// Converts to a chain of str_concat calls: str_concat(str_concat("text ", expr), " more")
     fn lowerStringInterp(self: *Lowerer, si: ast.StringInterp) Allocator.Error!ir.NodeIndex {
-        _ = self;
-        _ = si;
-        // String interpolation is not supported - should be caught by type checker
-        return ir.null_node;
+        const fb = self.current_func orelse return ir.null_node;
+        const slice_type = self.type_reg.makeSlice(TypeRegistry.U8) catch TypeRegistry.VOID;
+
+        var result: ir.NodeIndex = ir.null_node;
+
+        for (si.segments) |segment| {
+            const segment_node: ir.NodeIndex = switch (segment) {
+                .text => |text| blk: {
+                    // Process text segment:
+                    // - First segment may start with " and end with ${
+                    // - Middle segments may start with } and end with ${
+                    // - Last segment may start with } and end with "
+                    var str = text;
+
+                    // Strip leading quote
+                    if (str.len > 0 and str[0] == '"') {
+                        str = str[1..];
+                    }
+                    // Strip leading } (continuation after expression)
+                    if (str.len > 0 and str[0] == '}') {
+                        str = str[1..];
+                    }
+                    // Strip trailing ${
+                    if (str.len >= 2 and std.mem.endsWith(u8, str, "${")) {
+                        str = str[0 .. str.len - 2];
+                    }
+                    // Strip trailing quote
+                    if (str.len > 0 and str[str.len - 1] == '"') {
+                        str = str[0 .. str.len - 1];
+                    }
+
+                    // Skip empty text segments
+                    if (str.len == 0) break :blk ir.null_node;
+
+                    // Add to string table and emit const_slice
+                    const string_idx = try self.addStringLiteral(str);
+                    break :blk try fb.emitConstSlice(string_idx, slice_type, si.span);
+                },
+                .expr => |expr_idx| try self.lowerExpr(expr_idx),
+            };
+
+            // Skip null nodes (empty segments)
+            if (segment_node == ir.null_node) continue;
+
+            // Chain with str_concat
+            if (result == ir.null_node) {
+                result = segment_node;
+            } else {
+                result = try fb.emitBinary(.str_concat, result, segment_node, slice_type, si.span);
+            }
+        }
+
+        // If no valid segments, return empty string
+        if (result == ir.null_node) {
+            const string_idx = try self.addStringLiteral("");
+            result = try fb.emitConstSlice(string_idx, slice_type, si.span);
+        }
+
+        return result;
     }
 
     fn lowerNewExpr(self: *Lowerer, ne: ast.NewExpr) Allocator.Error!ir.NodeIndex {

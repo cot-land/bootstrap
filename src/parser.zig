@@ -1484,11 +1484,11 @@ pub const Parser = struct {
 
         const condition = try self.parseExpr() orelse return null;
 
-        if (!self.check(.lbrace)) {
-            self.err.errorWithCode(self.pos(), .E204, "expected '{' after if condition");
-            return null;
-        }
-        const then_branch = try self.parseBlockStmt() orelse return null;
+        // Parse then branch - either a block or a single statement
+        const then_branch = if (self.check(.lbrace))
+            try self.parseBlockStmt() orelse return null
+        else
+            try self.parseStmt() orelse return null;
 
         var else_branch: ?NodeIndex = null;
         if (self.match(.kw_else)) {
@@ -1497,8 +1497,8 @@ pub const Parser = struct {
             } else if (self.check(.lbrace)) {
                 else_branch = try self.parseBlockStmt();
             } else {
-                self.syntaxError("expected '{' or 'if' after 'else'");
-                return null;
+                // Single statement else
+                else_branch = try self.parseStmt();
             }
         }
 

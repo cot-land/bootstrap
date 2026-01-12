@@ -702,7 +702,7 @@ pub const CodeGen = struct {
 
         // Check source op type for special 16-byte handling
         // These ops leave ptr in x0, len/payload in x1
-        if (src_value.op == .slice_make or src_value.op == .union_init or src_value.op == .const_slice) {
+        if (src_value.op == .slice_make or src_value.op == .union_init or src_value.op == .const_slice or src_value.op == .str_concat) {
             // Store 16-byte value: ptr/tag at offset, len/payload at offset+8
             try aarch64.strRegImm(self.buf, .x0, .sp, sp_offset);
             const sp_offset_plus8 = convertOffset(total_offset + 8, self.stack_size);
@@ -864,6 +864,18 @@ pub const CodeGen = struct {
                 try aarch64.movRegImm64(self.buf, len_reg, 0);
             }
             return;
+        }
+
+        // Check if it's a str_concat result (stored on stack)
+        if (val.op == .str_concat) {
+            // Result was saved to stack after the call
+            const mcv = self.getValue(val.id);
+            if (mcv == .stack) {
+                const offset = mcv.stack;
+                try aarch64.ldrRegImm(self.buf, ptr_reg, .sp, @intCast(offset));
+                try aarch64.ldrRegImm(self.buf, len_reg, .sp, @intCast(offset + 8));
+                return;
+            }
         }
 
         // Check if it's a load from a local (slice stored on stack)
@@ -1589,6 +1601,39 @@ pub const CodeGen = struct {
         try aarch64.callSymbol(self.buf, "_cot_list_free");
     }
 
+    /// Generate code for str_concat: args[0]=left string, args[1]=right string
+    /// Calls cot_str_concat(ptr1, len1, ptr2, len2) -> returns (ptr, len) in x0, x1
+    pub fn genStrConcat(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+        if (args.len < 2) return;
+
+        // Spill caller-saved registers
+        try self.spillCallerSaved();
+
+        // Load left string (ptr, len) to x0, x1
+        const left_val = &self.func.values.items[args[0]];
+        try self.loadSliceToRegs(left_val, .x0, .x1);
+
+        // Load right string (ptr, len) to x2, x3
+        const right_val = &self.func.values.items[args[1]];
+        try self.loadSliceToRegs(right_val, .x2, .x3);
+
+        // Call cot_str_concat(ptr1, len1, ptr2, len2)
+        const func_name = if (self.os == .macos) "_cot_str_concat" else "cot_str_concat";
+        try self.buf.addRelocation(.pc_rel_32, func_name, 0);
+        try aarch64.bl(self.buf, 0);
+
+        // Result is in x0 (ptr), x1 (len) - it's a slice
+        // Save to a temp slot so other ops don't clobber it
+        const temp_offset = self.next_spill_offset;
+        self.next_spill_offset +|= 16; // 16 bytes for ptr+len
+        try aarch64.strRegImm(self.buf, .x0, .sp, temp_offset);
+        try aarch64.strRegImm(self.buf, .x1, .sp, temp_offset + 8);
+
+        // Track result as stack location
+        try self.setResult(value.id, .{ .stack = temp_offset });
+    }
+
     /// Generate code for alloc: allocate space on stack (returns address)
     /// aux_int = size to allocate, or uses local slot
     pub fn genAlloc(self: *CodeGen, value: *ssa.Value) !void {
@@ -1744,6 +1789,7 @@ pub const CodeGen = struct {
             .list_push => try self.genListPush(value),
             .list_len => try self.genListLen(value),
             .list_free => try self.genListFree(value),
+            .str_concat => try self.genStrConcat(value),
             .arg => try self.genArg(value),
             .retain, .release, .@"unreachable" => {}, // TODO: implement
         }

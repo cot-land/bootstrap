@@ -569,11 +569,26 @@ pub const Checker = struct {
     }
 
     /// Check string interpolation: "text ${expr} more"
-    /// NOTE: String interpolation is not yet supported - use []u8 slices instead
+    /// Type checks all embedded expressions (must be strings for now)
+    /// Returns string type ([]u8 slice)
     fn checkStringInterp(self: *Checker, si: ast.StringInterp) CheckError!TypeIndex {
-        _ = si;
-        self.err.errorWithCode(Pos{ .offset = 0 }, .E303, "string interpolation not supported - use []u8 slices");
-        return invalid_type;
+        // Type check each expression segment
+        for (si.segments) |segment| {
+            switch (segment) {
+                .text => {}, // Text segments are always ok
+                .expr => |expr_idx| {
+                    const expr_type = try self.checkExpr(expr_idx);
+                    const t = self.types.get(expr_type);
+                    // For now, require expressions to be string type
+                    // TODO: Add to_string conversions for other types
+                    if (t != .slice) {
+                        self.err.errorWithCode(si.span.start, .E303, "string interpolation expression must be string type");
+                    }
+                },
+            }
+        }
+        // String interpolation returns string type ([]u8 slice)
+        return TypeRegistry.STRING;
     }
 
     /// Check optional unwrap: expr.? - unwraps optional, panics if null

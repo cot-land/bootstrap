@@ -969,6 +969,9 @@ fn convertIRNode(func: *ssa.Func, node: *const ir.Node, ir_to_ssa: *std.AutoHash
         .list_len => .list_len,
         .list_free => .list_free,
 
+        // String operations
+        .str_concat => .str_concat,
+
         else => .copy,
     };
 

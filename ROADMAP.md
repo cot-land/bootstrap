@@ -103,7 +103,6 @@ The bootstrap .cot files must use ONLY these features (already working in Zig co
 - Field access: `obj.field`
 - Method calls: `obj.method(args)`
 - Struct literals: `Point{ .x = 1, .y = 2 }`
-- String interpolation: `"x = {x}"`
 - Null coalescing: `x ?? default`
 
 **Statements:**

@@ -128,6 +128,8 @@ get_expected() {
         test_maxint) echo 42 ;;
         test_minint) echo 42 ;;
         test_interpolation) echo 42 ;;
+        test_interpolation2) echo 42 ;;
+        test_interpolation3) echo 42 ;;
         test_interp_var) echo 42 ;;
         test_type_alias) echo 42 ;;
         test_u8_local) echo 1 ;;

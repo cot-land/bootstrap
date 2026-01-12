@@ -1,6 +1,7 @@
-// Test simple string concatenation without variables
-// Just two string literals
+// Test simple string interpolation with embedded string literal
+// expected: 42
 fn main() int {
     var s = "hello ${"world"}";
+    if (len(s) != 11) return 1;
     return 42;
 }

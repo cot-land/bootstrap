@@ -1,0 +1,11 @@
+// Test string interpolation with variable
+// expected: 42
+fn main() int {
+    var name = "world";
+    var s = "hello ${name}";
+
+    // s should be "hello world" (length 11)
+    if (len(s) != 11) return 1;
+
+    return 42;
+}

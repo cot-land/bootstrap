@@ -8,8 +8,8 @@
 
 | Platform | Status | Notes |
 |----------|--------|-------|
-| ARM64 (macOS) | ✅ All Pass | Comprehensive + 65 individual |
-| x86_64 (Linux) | ✅ All Pass | Comprehensive + 65 individual |
+| ARM64 (macOS) | ✅ 63/65 Pass | Comprehensive passes, 2 interp tests skip |
+| x86_64 (Linux) | ✅ 63/65 Pass | Comprehensive passes, 2 interp tests skip |
 
 ```bash
 # Fast validation (default - runs comprehensive test only)
@@ -150,7 +150,7 @@ zig build test                    # 135+ embedded tests
 | Equality | Done | `s1 == s2` (variable vs literal, variable vs variable) |
 | Indexing | Done | `s[i]` returns byte |
 | Slicing | Done | `s[i:j]` |
-| Interpolation | Done | `"Hello {name}!"` |
+| Interpolation | Done | `"Hello ${name}!"` - chains str_concat calls |
 | Concatenation | Done | Via `cot_str_concat` |
 
 ---

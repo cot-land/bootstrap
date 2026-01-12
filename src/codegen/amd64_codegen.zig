@@ -920,7 +920,7 @@ pub const CodeGen = struct {
 
         // Check source op type for special 16-byte handling
         // These ops leave ptr in rax, len/payload in rdx
-        if (src_value.op == .slice_make or src_value.op == .union_init or src_value.op == .const_slice) {
+        if (src_value.op == .slice_make or src_value.op == .union_init or src_value.op == .const_slice or src_value.op == .str_concat) {
             // Store 16-byte value: ptr/tag at offset, len/payload at offset+8
             try x86.movMemReg(self.buf, .rbp, total_offset, .rax);
             try x86.movMemReg(self.buf, .rbp, total_offset + 8, .rdx);
@@ -1059,6 +1059,18 @@ pub const CodeGen = struct {
                 try x86.movRegImm64(self.buf, len_reg, 0);
             }
             return;
+        }
+
+        // Check if it's a str_concat result (stored on stack)
+        if (val.op == .str_concat) {
+            // Result was saved to stack after the call
+            const mcv = self.getValue(val.id);
+            if (mcv == .stack) {
+                const offset = mcv.stack;
+                try x86.movRegMem(self.buf, ptr_reg, .rbp, offset);
+                try x86.movRegMem(self.buf, len_reg, .rbp, offset + 8);
+                return;
+            }
         }
 
         // Check if it's a load from a local (slice stored on stack)
@@ -1729,6 +1741,38 @@ pub const CodeGen = struct {
         try self.emitRuntimeCall("cot_list_free");
     }
 
+    /// Generate code for str_concat: args[0]=left string, args[1]=right string
+    /// Calls cot_str_concat(ptr1, len1, ptr2, len2) -> returns (ptr, len) in rax, rdx
+    pub fn genStrConcat(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+        if (args.len < 2) return;
+
+        // Spill caller-saved registers
+        try self.spillCallerSaved();
+
+        // Load left string (ptr, len) to rdi, rsi
+        const left_val = &self.func.values.items[args[0]];
+        try self.loadSliceToRegs(left_val, .rdi, .rsi);
+
+        // Load right string (ptr, len) to rdx, rcx
+        const right_val = &self.func.values.items[args[1]];
+        try self.loadSliceToRegs(right_val, .rdx, .rcx);
+
+        // Call cot_str_concat(ptr1, len1, ptr2, len2)
+        const func_name = if (self.os == .macos) "_cot_str_concat" else "cot_str_concat";
+        try x86.callSymbol(self.buf, func_name);
+
+        // Result is in rax (ptr), rdx (len) - it's a slice
+        // Save to a temp slot so other ops don't clobber it
+        const temp_offset = self.next_spill_offset;
+        self.next_spill_offset -= 16; // 16 bytes for ptr+len
+        try x86.movMemReg(self.buf, .rbp, temp_offset, .rax);
+        try x86.movMemReg(self.buf, .rbp, temp_offset + 8, .rdx);
+
+        // Track result as stack location
+        try self.setResult(value.id, .{ .stack = temp_offset });
+    }
+
     /// Generate code for alloc: allocate space on stack (returns address)
     /// aux_int = size to allocate, or uses local slot
     pub fn genAlloc(self: *CodeGen, value: *ssa.Value) !void {
@@ -1887,6 +1931,7 @@ pub const CodeGen = struct {
             .list_push => try self.genListPush(value),
             .list_len => try self.genListLen(value),
             .list_free => try self.genListFree(value),
+            .str_concat => try self.genStrConcat(value),
             .arg => try self.genArg(value),
             .retain, .release, .@"unreachable" => {}, // TODO: implement
         }

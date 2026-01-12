@@ -165,6 +165,11 @@ pub const Op = enum(u8) {
     /// Free list. args[0] = handle
     list_free,
 
+    // ========== String Operations ==========
+    /// Concatenate two strings. args[0] = str1, args[1] = str2
+    /// Calls cot_str_concat at runtime, returns new slice (ptr, len)
+    str_concat,
+
     // ========== Control Flow ==========
     /// Function call. args[0] = func, args[1..] = arguments
     call,
