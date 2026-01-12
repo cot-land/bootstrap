@@ -541,7 +541,7 @@ pub const Checker = struct {
 
         return switch (expr) {
             .identifier => |id| self.checkIdentifier(id),
-            .literal => |lit| self.checkLiteral(lit),
+            .literal => |lit| try self.checkLiteral(lit),
             .binary => |bin| try self.checkBinary(bin),
             .unary => |un| try self.checkUnary(un),
             .call => |c| try self.checkCall(c),
@@ -569,23 +569,11 @@ pub const Checker = struct {
     }
 
     /// Check string interpolation: "text ${expr} more"
+    /// NOTE: String interpolation is not yet supported - use []u8 slices instead
     fn checkStringInterp(self: *Checker, si: ast.StringInterp) CheckError!TypeIndex {
-        // Check all interpolated expressions (they should be convertible to string)
-        for (si.segments) |seg| {
-            switch (seg) {
-                .text => {}, // Plain text segments are always valid
-                .expr => |expr_idx| {
-                    const expr_type = try self.checkExpr(expr_idx);
-                    const t = self.types.get(expr_type);
-                    // Allow integers, strings, and booleans in interpolation
-                    if (!isInteger(t) and t != .basic) {
-                        // For now, allow any type - we'll convert to string at runtime
-                    }
-                },
-            }
-        }
-        // String interpolation always produces a string
-        return TypeRegistry.STRING;
+        _ = si;
+        self.err.errorWithCode(Pos{ .offset = 0 }, .E303, "string interpolation not supported - use []u8 slices");
+        return invalid_type;
     }
 
     /// Check optional unwrap: expr.? - unwraps optional, panics if null
@@ -614,12 +602,11 @@ pub const Checker = struct {
     }
 
     /// Check literal expression.
-    fn checkLiteral(self: *Checker, lit: ast.Literal) TypeIndex {
-        _ = self;
+    fn checkLiteral(self: *Checker, lit: ast.Literal) CheckError!TypeIndex {
         return switch (lit.kind) {
             .int => TypeRegistry.INT, // Could use untyped_int for more flexibility
             .float => TypeRegistry.FLOAT,
-            .string => TypeRegistry.STRING,
+            .string => try self.types.makeSlice(TypeRegistry.U8), // String literals are []u8
             .char => TypeRegistry.U8, // char is u8
             .true_lit, .false_lit => TypeRegistry.BOOL,
             .null_lit => invalid_type, // null needs context
@@ -811,20 +798,15 @@ pub const Checker = struct {
         const arg_type = try self.checkExpr(c.args[0]);
         const arg = self.types.get(arg_type);
 
-        // len() works on strings, arrays, and slices
+        // len() works on arrays and slices
         switch (arg) {
-            .basic => |k| {
-                if (k == .string_type) {
-                    return TypeRegistry.INT;
-                }
-            },
             .array, .slice => {
                 return TypeRegistry.INT;
             },
             else => {},
         }
 
-        self.err.errorWithCode(c.span.start, .E300, "len() argument must be string, array, or slice");
+        self.err.errorWithCode(c.span.start, .E300, "len() argument must be array or slice");
         return invalid_type;
     }
 
@@ -839,20 +821,26 @@ pub const Checker = struct {
         const arg_type = try self.checkExpr(c.args[0]);
         const arg = self.types.get(arg_type);
 
-        // print() works on strings and integers
+        // print() works on integers and booleans
         switch (arg) {
             .basic => |k| {
-                if (k == .string_type or k == .i64_type or k == .i32_type or
+                if (k == .i64_type or k == .i32_type or
                     k == .i16_type or k == .i8_type or k == .u64_type or
                     k == .u32_type or k == .u16_type or k == .u8_type or k == .bool_type)
                 {
                     return TypeRegistry.VOID;
                 }
             },
+            .slice => |s| {
+                // Allow []u8 byte slices
+                if (s.elem == TypeRegistry.U8) {
+                    return TypeRegistry.VOID;
+                }
+            },
             else => {},
         }
 
-        self.err.errorWithCode(c.span.start, .E300, "print() argument must be string or integer");
+        self.err.errorWithCode(c.span.start, .E300, "print() argument must be []u8 or integer");
         return TypeRegistry.VOID;
     }
 
@@ -1004,7 +992,6 @@ pub const Checker = struct {
         return switch (base) {
             .array => |a| a.elem,
             .slice => |s| s.elem,
-            .basic => |k| if (k == .string_type) TypeRegistry.U8 else invalid_type,
             else => blk: {
                 self.err.errorWithCode(i.span.start, .E303, "cannot index this type");
                 break :blk invalid_type;
@@ -1041,11 +1028,6 @@ pub const Checker = struct {
         return switch (base) {
             .array => |a| try self.types.makeSlice(a.elem),
             .slice => base_type, // Slicing a slice returns same slice type
-            .basic => |k| if (k == .string_type) try self.types.makeSlice(TypeRegistry.U8) else blk: {
-                // Slicing a string returns []u8 (a byte slice)
-                self.err.errorWithCode(se.span.start, .E303, "cannot slice this type");
-                break :blk invalid_type;
-            },
             else => blk: {
                 self.err.errorWithCode(se.span.start, .E303, "cannot slice this type");
                 break :blk invalid_type;
@@ -1614,7 +1596,6 @@ pub const Checker = struct {
         const elem_type: TypeIndex = switch (iter) {
             .array => |a| a.elem,
             .slice => |s| s.elem,
-            .basic => |k| if (k == .string_type) TypeRegistry.U8 else invalid_type,
             else => blk: {
                 self.err.errorWithCode(fs.span.start, .E303, "cannot iterate over this type");
                 break :blk invalid_type;
@@ -1890,7 +1871,6 @@ pub const Checker = struct {
                 .untyped_int => TypeRegistry.INT,
                 .untyped_float => TypeRegistry.FLOAT,
                 .untyped_bool => TypeRegistry.BOOL,
-                .untyped_string => TypeRegistry.STRING,
                 else => idx,
             },
             else => idx,
@@ -1913,8 +1893,8 @@ pub const Checker = struct {
         const tb = self.types.get(b);
         if (isNumeric(ta) and isNumeric(tb)) return true;
 
-        // String types are comparable (for == and !=)
-        if (isString(ta) and isString(tb)) return true;
+        // Byte slices ([]u8) are comparable to each other
+        if (isByteSlice(ta) and isByteSlice(tb)) return true;
 
         return false;
     }
@@ -1972,11 +1952,12 @@ fn isBool(t: Type) bool {
     };
 }
 
-fn isString(t: Type) bool {
-    return switch (t) {
-        .basic => |k| k == .string_type or k == .untyped_string,
-        else => false,
-    };
+/// Check if type is a byte slice ([]u8)
+fn isByteSlice(t: Type) bool {
+    if (t == .slice) {
+        return t.slice.elem == TypeRegistry.U8;
+    }
+    return false;
 }
 
 // ============================================================================

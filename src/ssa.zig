@@ -92,9 +92,9 @@ pub const Op = enum(u8) {
     // Constants
     const_int,
     const_float,
-    const_string,
     const_bool,
     const_nil,
+    const_slice, // String literal: aux = string index, type = []u8
 
     // Phi node (SSA join point)
     phi,
@@ -182,9 +182,6 @@ pub const Op = enum(u8) {
     list_len,
     // Free list. args[0] = handle
     list_free,
-
-    // String operations
-    str_concat,
 
     // Function
     call,

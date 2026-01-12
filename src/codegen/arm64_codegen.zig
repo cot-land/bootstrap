@@ -198,7 +198,7 @@ pub const CodeGen = struct {
     os: be.OS,
     tracking: std.AutoHashMap(ssa.ValueID, InstTracking),
     reg_manager: RegisterManager,
-    string_offsets: *std.StringHashMap(u32),
+    string_infos: []const be.StringInfo,
     next_spill_offset: u12,
     stack_size: u32,
 
@@ -212,7 +212,7 @@ pub const CodeGen = struct {
         func: *ssa.Func,
         type_reg: *types.TypeRegistry,
         os: be.OS,
-        string_offsets: *std.StringHashMap(u32),
+        string_infos: []const be.StringInfo,
         stack_size: u32,
     ) CodeGen {
         return .{
@@ -223,8 +223,8 @@ pub const CodeGen = struct {
             .os = os,
             .tracking = std.AutoHashMap(ssa.ValueID, InstTracking).init(allocator),
             .reg_manager = .{},
-            .string_offsets = string_offsets,
-            .next_spill_offset = @intCast(stack_size), // Spill slots start after locals
+            .string_infos = string_infos,
+            .next_spill_offset = 16, // Spill slots start after fp/lr (at sp+0 to sp+15)
             .stack_size = stack_size,
         };
     }
@@ -377,15 +377,31 @@ pub const CodeGen = struct {
         for (caller_saved) |reg| {
             if (self.reg_manager.isFree(reg)) continue;
 
+            // Get the value ID in this register
+            const vid = if (RegisterManager.indexOf(reg)) |idx|
+                self.reg_manager.registers[idx]
+            else
+                null;
+
+            // Skip spilling const_slice - they can be regenerated
+            if (vid) |value_id| {
+                if (value_id < self.func.values.items.len) {
+                    const val = &self.func.values.items[value_id];
+                    if (val.op == .const_slice or val.op == .const_int or val.op == .const_bool) {
+                        // Constants can be regenerated, just free the register
+                        self.reg_manager.markFree(reg);
+                        continue;
+                    }
+                }
+            }
+
             // Check if we should skip spilling this value
             if (self.liveness_info) |lv| {
-                if (RegisterManager.indexOf(reg)) |idx| {
-                    if (self.reg_manager.registers[idx]) |vid| {
-                        // If value is not used after this instruction, just free the register
-                        if (!lv.isUsedAfter(vid, self.current_inst)) {
-                            self.reg_manager.markFree(reg);
-                            continue;
-                        }
+                if (vid) |value_id| {
+                    // If value is not used after this instruction, just free the register
+                    if (!lv.isUsedAfter(value_id, self.current_inst)) {
+                        self.reg_manager.markFree(reg);
+                        continue;
                     }
                 }
             }
@@ -445,6 +461,37 @@ pub const CodeGen = struct {
             try aarch64.movRegImm64(self.buf, reg, imm);
             try self.setResult(value.id, .{ .register = reg });
         }
+    }
+
+    pub fn genConstSlice(self: *CodeGen, value: *ssa.Value) !void {
+        // const_slice: aux_int = string index in string_infos
+        // Result is a slice (ptr, len) in x0/x1
+        const string_idx: usize = @intCast(value.aux_int);
+
+        // Spill x0 and x1 if they contain other values (to avoid clobbering)
+        try self.spillReg(.x0);
+        try self.spillReg(.x1);
+
+        if (string_idx >= self.string_infos.len) {
+            // Invalid string index - emit null slice
+            try aarch64.movRegImm64(self.buf, .x0, 0);
+            try aarch64.movRegImm64(self.buf, .x1, 0);
+            self.reg_manager.markUsed(.x0, value.id);
+            try self.setResult(value.id, .{ .register = .x0 });
+            return;
+        }
+
+        const info = self.string_infos[string_idx];
+
+        // Load string address into x0 using ADRP + ADD with relocations
+        try aarch64.loadSymbolAddr(self.buf, .x0, info.symbol_name);
+
+        // Load length into x1
+        try aarch64.movRegImm64(self.buf, .x1, @intCast(info.len));
+
+        // Result is a fat pointer: x0 = ptr, x1 = len
+        self.reg_manager.markUsed(.x0, value.id);
+        try self.setResult(value.id, .{ .register = .x0 });
     }
 
     pub fn genAdd(self: *CodeGen, value: *ssa.Value) !void {
@@ -655,7 +702,7 @@ pub const CodeGen = struct {
 
         // Check source op type for special 16-byte handling
         // These ops leave ptr in x0, len/payload in x1
-        if (src_value.op == .slice_make or src_value.op == .union_init or src_value.op == .str_concat) {
+        if (src_value.op == .slice_make or src_value.op == .union_init or src_value.op == .const_slice) {
             // Store 16-byte value: ptr/tag at offset, len/payload at offset+8
             try aarch64.strRegImm(self.buf, .x0, .sp, sp_offset);
             const sp_offset_plus8 = convertOffset(total_offset + 8, self.stack_size);
@@ -663,20 +710,28 @@ pub const CodeGen = struct {
             return;
         }
 
-        if (src_value.op == .const_string) {
-            // Store string literal: load ptr from rodata, store ptr+len
-            const str_content = src_value.aux_str;
-            const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
-                str_content[1 .. str_content.len - 1]
-            else
-                str_content;
-            const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
-            try aarch64.loadSymbolAddr(self.buf, .x0, sym_name);
-            try aarch64.strRegImm(self.buf, .x0, .sp, sp_offset);
-            try aarch64.movRegImm64(self.buf, .x0, @intCast(stripped.len));
-            const sp_offset_plus8 = convertOffset(total_offset + 8, self.stack_size);
-            try aarch64.strRegImm(self.buf, .x0, .sp, sp_offset_plus8);
-            return;
+        // Handle call results
+        if (src_value.op == .call) {
+            const ret_type = self.type_reg.get(src_value.type_idx);
+            const ret_size = self.type_reg.sizeOf(src_value.type_idx);
+
+            if (ret_type == .struct_type) {
+                // Struct return: result is at stack offset, copy to destination
+                const src_mcv = self.getValue(src_id);
+                if (src_mcv == .stack) {
+                    const src_stack_offset = src_mcv.stack;
+                    var copied: u32 = 0;
+                    while (copied < ret_size) {
+                        // Load from result location
+                        try aarch64.ldrRegImm(self.buf, scratch0, .sp, src_stack_offset + @as(u12, @intCast(copied)));
+                        // Store to destination local
+                        const dst_offset = convertOffset(total_offset + @as(i32, @intCast(copied)), self.stack_size);
+                        try aarch64.strRegImm(self.buf, scratch0, .sp, dst_offset);
+                        copied += 8;
+                    }
+                    return;
+                }
+            }
         }
 
         // Standard value store
@@ -728,15 +783,11 @@ pub const CodeGen = struct {
     pub fn genComparison(self: *CodeGen, value: *ssa.Value) !void {
         const args = value.args();
 
-        // Check if this is a string comparison
+        // Check if we're comparing slices (need runtime call)
         const left_val = &self.func.values.items[args[0]];
-        const right_val = &self.func.values.items[args[1]];
-        const is_string_cmp = left_val.type_idx == types.TypeRegistry.STRING or
-            right_val.type_idx == types.TypeRegistry.STRING or
-            left_val.op == .const_string or right_val.op == .const_string;
-
-        if (is_string_cmp and (value.op == .eq or value.op == .ne)) {
-            try self.genStringComparison(value, args, left_val, right_val);
+        const left_type = self.type_reg.get(left_val.type_idx);
+        if (left_type == .slice) {
+            try self.genSliceComparison(value);
             return;
         }
 
@@ -767,109 +818,136 @@ pub const CodeGen = struct {
         try self.setResult(value.id, .{ .register = dest });
     }
 
-    /// Generate string comparison: call cot_str_eq(ptr1, len1, ptr2, len2)
-    fn genStringComparison(self: *CodeGen, value: *ssa.Value, args: []const ssa.ValueID, left_val: *ssa.Value, right_val: *ssa.Value) !void {
+    /// Generate slice/string comparison by calling cot_str_eq runtime function
+    fn genSliceComparison(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+
+        // Spill caller-saved registers
         try self.spillCallerSaved();
 
-        // Load first string into x0 (ptr) and x1 (len)
-        try self.loadStringOperand(left_val, args[0], .x0, .x1);
+        // Load left slice (ptr, len) - may be from local or from const_slice result
+        const left_val = &self.func.values.items[args[0]];
+        try self.loadSliceToRegs(left_val, .x0, .x1);
 
-        // Load second string into x2 (ptr) and x3 (len)
-        try self.loadStringOperand(right_val, args[1], .x2, .x3);
+        // Load right slice (ptr, len)
+        const right_val = &self.func.values.items[args[1]];
+        try self.loadSliceToRegs(right_val, .x2, .x3);
 
-        // Call cot_str_eq
-        try aarch64.callSymbol(self.buf, "_cot_str_eq");
+        // Call cot_str_eq(ptr1, len1, ptr2, len2) -> returns 1 if equal, 0 if not
+        const func_name = if (self.os == .macos) "_cot_str_eq" else "cot_str_eq";
+        try self.buf.addRelocation(.pc_rel_32, func_name, 0);
+        try aarch64.bl(self.buf, 0);
 
-        // Result in x0: 1 if equal, 0 if not equal
-        // For != comparison, invert the result
+        // Result is in x0 (1 = equal, 0 = not equal)
+        // For .ne, we need to invert: cmp x0, #0; cset x0, eq
         if (value.op == .ne) {
-            try aarch64.movRegImm64(self.buf, scratch1, 1);
-            try aarch64.eorRegReg(self.buf, .x0, .x0, scratch1);
+            try aarch64.cmpRegImm12(self.buf, .x0, 0);
+            try aarch64.cset(self.buf, .x0, .eq);
         }
 
         self.reg_manager.markUsed(.x0, value.id);
         try self.setResult(value.id, .{ .register = .x0 });
     }
 
-    /// Load a string operand's ptr and len into destination registers
-    fn loadStringOperand(self: *CodeGen, val: *ssa.Value, val_id: ssa.ValueID, ptr_reg: aarch64.Reg, len_reg: aarch64.Reg) !void {
-        if (val.op == .const_string) {
-            // String literal: load symbol address and immediate length
-            const str_content = val.aux_str;
-            const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
-                str_content[1 .. str_content.len - 1]
-            else
-                str_content;
-            const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
-            try aarch64.loadSymbolAddr(self.buf, ptr_reg, sym_name);
-            try aarch64.movRegImm64(self.buf, len_reg, @intCast(stripped.len));
-        } else if (val.op == .load or val.op == .copy or val.op == .arg) {
-            // Variable: load ptr and len from stack (string is fat pointer: 8 bytes ptr + 8 bytes len)
-            // For load ops, local index is in args[0], not aux_int
-            const val_args = val.args();
-            if (val_args.len == 0) return;
-            const local_idx: u32 = @intCast(val_args[0]);
-            if (local_idx < self.func.locals.len) {
-                const offset = self.func.locals[local_idx].offset;
-                const sp_offset = convertOffset(offset, self.stack_size);
-                const sp_offset_plus8 = convertOffset(offset + 8, self.stack_size);
-                try aarch64.ldrRegImm(self.buf, ptr_reg, .sp, sp_offset); // ptr
-                try aarch64.ldrRegImm(self.buf, len_reg, .sp, sp_offset_plus8); // len
+    /// Load a slice value's (ptr, len) into two registers
+    fn loadSliceToRegs(self: *CodeGen, val: *ssa.Value, ptr_reg: aarch64.Reg, len_reg: aarch64.Reg) !void {
+        // Check if it's a const_slice (already has ptr in x0, len in x1 pattern)
+        if (val.op == .const_slice) {
+            // Regenerate the const_slice to get ptr and len
+            const string_idx: usize = @intCast(val.aux_int);
+            if (string_idx < self.string_infos.len) {
+                const info = self.string_infos[string_idx];
+                try aarch64.loadSymbolAddr(self.buf, ptr_reg, info.symbol_name);
+                try aarch64.movRegImm64(self.buf, len_reg, @intCast(info.len));
+            } else {
+                try aarch64.movRegImm64(self.buf, ptr_reg, 0);
+                try aarch64.movRegImm64(self.buf, len_reg, 0);
             }
-        } else {
-            // Fallback: use MCValue (just loads ptr, len would be wrong)
-            const mcv = self.getValue(val_id);
-            try self.loadToReg(ptr_reg, mcv);
-            try aarch64.movRegImm64(self.buf, len_reg, 0); // Unknown len
+            return;
+        }
+
+        // Check if it's a load from a local (slice stored on stack)
+        if (val.op == .load) {
+            const val_args = val.args();
+            if (val_args.len > 0 and val_args[0] < self.func.locals.len) {
+                const local_idx: u32 = @intCast(val_args[0]);
+                const local = self.func.locals[local_idx];
+                const sp_offset = convertOffset(local.offset, self.stack_size);
+                // Slice on stack: ptr at offset, len at offset+8
+                try aarch64.ldrRegImm(self.buf, ptr_reg, .sp, sp_offset);
+                try aarch64.ldrRegImm(self.buf, len_reg, .sp, sp_offset + 8);
+                return;
+            }
+        }
+
+        // Fallback: try to get from tracking (may only have ptr)
+        const mcv = self.getValue(val.id);
+        switch (mcv) {
+            .register => |reg| {
+                if (reg != ptr_reg) {
+                    try aarch64.movRegReg(self.buf, ptr_reg, reg);
+                }
+                // Assume len is in next register (x1 if ptr is x0)
+                // This is a rough heuristic for const_slice results
+                try aarch64.movRegImm64(self.buf, len_reg, 0);
+            },
+            .stack => |offset| {
+                try aarch64.ldrRegImm(self.buf, ptr_reg, .sp, @intCast(offset));
+                try aarch64.ldrRegImm(self.buf, len_reg, .sp, @intCast(offset + 8));
+            },
+            else => {
+                try aarch64.movRegImm64(self.buf, ptr_reg, 0);
+                try aarch64.movRegImm64(self.buf, len_reg, 0);
+            },
         }
     }
 
     pub fn genCall(self: *CodeGen, value: *ssa.Value) !void {
         try self.spillCallerSaved();
 
-        // ARM64 ABI: x0-x7 for arguments
         const arg_regs = [_]aarch64.Reg{ .x0, .x1, .x2, .x3, .x4, .x5, .x6, .x7 };
         const args = value.args();
+
+        // Check if callee returns a struct (need to pass result address in x8)
+        const ret_type = self.type_reg.get(value.type_idx);
+        const returns_struct = (ret_type == .struct_type);
+
+        // If struct return, allocate temp space and set x8
+        // We use a fixed offset at end of current spill area
+        var struct_result_offset: u12 = 0;
+        if (returns_struct) {
+            const ret_size = self.type_reg.sizeOf(value.type_idx);
+            struct_result_offset = self.next_spill_offset;
+            // Compute address of result slot: sp + offset
+            try aarch64.addRegImm12(self.buf, .x8, .sp, struct_result_offset);
+            self.next_spill_offset += @intCast(alignTo(ret_size, 8));
+        }
 
         var reg_idx: usize = 0;
         for (args) |arg_id| {
             if (reg_idx >= arg_regs.len) break;
 
             const arg_val = &self.func.values.items[arg_id];
+            const arg_type = self.type_reg.get(arg_val.type_idx);
 
-            // Check if this is a string argument (needs ptr + len = 2 registers)
-            if (arg_val.op == .const_string) {
-                // String literal: load symbol address and immediate length
-                const str_content = arg_val.aux_str;
-                const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
-                    str_content[1 .. str_content.len - 1]
-                else
-                    str_content;
-                const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
-                try aarch64.loadSymbolAddr(self.buf, arg_regs[reg_idx], sym_name);
-                if (reg_idx + 1 < arg_regs.len) {
-                    try aarch64.movRegImm64(self.buf, arg_regs[reg_idx + 1], @intCast(stripped.len));
-                }
-                reg_idx += 2; // String takes 2 registers
-            } else if (arg_val.type_idx == types.TypeRegistry.STRING and (arg_val.op == .load or arg_val.op == .copy or arg_val.op == .arg)) {
-                // String variable: load ptr and len from stack
-                // For load ops, local index is in args[0], not aux_int
+            if (arg_type == .struct_type) {
+                // Struct argument: pass pointer to local
                 const arg_val_args = arg_val.args();
-                if (arg_val_args.len > 0) {
+                if (arg_val_args.len > 0 and arg_val_args[0] < self.func.locals.len) {
                     const local_idx: u32 = @intCast(arg_val_args[0]);
-                    if (local_idx < self.func.locals.len) {
-                        const offset = self.func.locals[local_idx].offset;
-                        const sp_offset = convertOffset(offset, self.stack_size);
-                        const sp_offset_plus8 = convertOffset(offset + 8, self.stack_size);
-                        try aarch64.ldrRegImm(self.buf, arg_regs[reg_idx], .sp, sp_offset);
-                        if (reg_idx + 1 < arg_regs.len) {
-                            try aarch64.ldrRegImm(self.buf, arg_regs[reg_idx + 1], .sp, sp_offset_plus8);
-                        }
-                    }
+                    const local = self.func.locals[local_idx];
+                    const sp_offset = convertOffset(local.offset, self.stack_size);
+                    // Compute address: sp + offset
+                    try aarch64.addRegImm12(self.buf, arg_regs[reg_idx], .sp, sp_offset);
                 }
-                reg_idx += 2; // String takes 2 registers
+                reg_idx += 1;
+            } else if (arg_type == .slice) {
+                // Slice argument: pass ptr in reg[i], len in reg[i+1]
+                if (reg_idx + 1 >= arg_regs.len) break;
+                try self.loadSliceToRegs(arg_val, arg_regs[reg_idx], arg_regs[reg_idx + 1]);
+                reg_idx += 2;
             } else {
-                // Regular argument
+                // Scalar argument
                 const arg_mcv = self.getValue(arg_id);
                 try self.loadToReg(arg_regs[reg_idx], arg_mcv);
                 reg_idx += 1;
@@ -883,9 +961,16 @@ pub const CodeGen = struct {
             value.aux_str;
         try aarch64.callSymbol(self.buf, sym_name);
 
-        // Result is in x0
-        self.reg_manager.markUsed(.x0, value.id);
-        try self.setResult(value.id, .{ .register = .x0 });
+        // Handle result
+        if (returns_struct) {
+            // Struct result is at struct_result_offset on stack
+            // Track as stack location for later use
+            try self.setResult(value.id, .{ .stack = struct_result_offset });
+        } else {
+            // Scalar/string result is in x0 (and x1 for string)
+            self.reg_manager.markUsed(.x0, value.id);
+            try self.setResult(value.id, .{ .register = .x0 });
+        }
     }
 
     /// Generate code for field access
@@ -899,7 +984,9 @@ pub const CodeGen = struct {
         const maybe_local_or_ssa = args[0];
         const field_offset: i32 = @intCast(value.aux_int);
         const size = self.type_reg.sizeOf(value.type_idx);
-        const dest = try self.allocReg(value.id);
+
+        // Always use x0 for field results (genStore expects this)
+        const dest: aarch64.Reg = .x0;
 
         if (maybe_local_or_ssa < self.func.locals.len) {
             // CASE 1: Direct local field access
@@ -921,6 +1008,7 @@ pub const CodeGen = struct {
             }
         }
 
+        self.reg_manager.markUsed(.x0, value.id);
         try self.setResult(value.id, .{ .register = dest });
     }
 
@@ -1276,27 +1364,37 @@ pub const CodeGen = struct {
         const args = value.args();
         if (args.len < 2) return;
 
-        // Load map handle into x0 via MCValue
-        const handle_mcv = self.getValue(args[0]);
-        try self.loadToReg(.x0, handle_mcv);
+        try self.spillCallerSaved();
 
-        // Load key - special handling for const_string (need ptr + len)
+        // Load key FIRST to avoid clobbering handle
+        // Check if key is a slice (string key)
         const key_val = &self.func.values.items[args[1]];
-        if (key_val.op == .const_string) {
-            const str_content = key_val.aux_str;
-            const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
-                str_content[1 .. str_content.len - 1]
-            else
-                str_content;
-            const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
-            try aarch64.loadSymbolAddr(self.buf, .x1, sym_name);
-            try aarch64.movRegImm64(self.buf, .x2, @intCast(stripped.len));
+        const key_type = self.type_reg.get(key_val.type_idx);
+        if (key_type == .slice) {
+            // String key: load directly based on op type
+            if (key_val.op == .const_slice) {
+                // Regenerate const_slice into x1/x2
+                const string_idx: usize = @intCast(key_val.aux_int);
+                if (string_idx < self.string_infos.len) {
+                    const info = self.string_infos[string_idx];
+                    try aarch64.loadSymbolAddr(self.buf, .x1, info.symbol_name);
+                    try aarch64.movRegImm64(self.buf, .x2, @intCast(info.len));
+                }
+            } else {
+                // Load slice from stack or other location
+                try self.loadSliceToRegs(key_val, .x1, .x2);
+            }
         } else {
             const key_mcv = self.getValue(args[1]);
             try self.loadToReg(.x1, key_mcv);
         }
 
-        try aarch64.callSymbol(self.buf, "_cot_map_get");
+        // Load map handle into x0 AFTER loading key to avoid clobber
+        const handle_mcv = self.getValue(args[0]);
+        try self.loadToReg(.x0, handle_mcv);
+
+        const func_name = if (self.os == .macos) "_cot_map_get" else "cot_map_get";
+        try aarch64.callSymbol(self.buf, func_name);
 
         self.reg_manager.markUsed(.x0, value.id);
         try self.setResult(value.id, .{ .register = .x0 });
@@ -1340,62 +1438,77 @@ pub const CodeGen = struct {
         const args = value.args();
         if (args.len < 3) return;
 
-        // Load map handle into x0 via MCValue
-        const handle_mcv = self.getValue(args[0]);
-        try self.loadToReg(.x0, handle_mcv);
+        try self.spillCallerSaved();
 
-        // Load key - special handling for const_string (need ptr + len)
+        // Load key FIRST to avoid clobbering
         const key_val = &self.func.values.items[args[1]];
-        if (key_val.op == .const_string) {
-            const str_content = key_val.aux_str;
-            const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
-                str_content[1 .. str_content.len - 1]
-            else
-                str_content;
-            const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
-            try aarch64.loadSymbolAddr(self.buf, .x1, sym_name);
-            try aarch64.movRegImm64(self.buf, .x2, @intCast(stripped.len));
+        const key_type = self.type_reg.get(key_val.type_idx);
+        if (key_type == .slice) {
+            // String key: load directly based on op type
+            if (key_val.op == .const_slice) {
+                // Regenerate const_slice into x1/x2
+                const string_idx: usize = @intCast(key_val.aux_int);
+                if (string_idx < self.string_infos.len) {
+                    const info = self.string_infos[string_idx];
+                    try aarch64.loadSymbolAddr(self.buf, .x1, info.symbol_name);
+                    try aarch64.movRegImm64(self.buf, .x2, @intCast(info.len));
+                }
+            } else {
+                // Load slice from stack or other location
+                try self.loadSliceToRegs(key_val, .x1, .x2);
+            }
         } else {
-            // For non-const strings, load ptr via MCValue (len would need separate tracking)
             const key_mcv = self.getValue(args[1]);
             try self.loadToReg(.x1, key_mcv);
-            // TODO: handle string len properly for non-const strings
         }
 
-        // Load value into x3 via MCValue
+        // Load value into x3 BEFORE handle (x3 won't be clobbered by handle load)
         const val_mcv = self.getValue(args[2]);
         try self.loadToReg(.x3, val_mcv);
 
-        try aarch64.callSymbol(self.buf, "_cot_map_set");
+        // Load map handle into x0 LAST to avoid clobber
+        const handle_mcv = self.getValue(args[0]);
+        try self.loadToReg(.x0, handle_mcv);
+
+        const func_name = if (self.os == .macos) "_cot_map_set" else "cot_map_set";
+        try aarch64.callSymbol(self.buf, func_name);
     }
 
     /// Generate code for map_has: args[0]=handle, args[1]=key
-    /// Inline op type lookup for key
     pub fn genMapHas(self: *CodeGen, value: *ssa.Value) !void {
         const args = value.args();
         if (args.len < 2) return;
 
-        // Load map handle into x0 via MCValue
-        const handle_mcv = self.getValue(args[0]);
-        try self.loadToReg(.x0, handle_mcv);
+        try self.spillCallerSaved();
 
-        // Load key - special handling for const_string (need ptr + len)
+        // Load key FIRST to avoid clobbering handle
         const key_val = &self.func.values.items[args[1]];
-        if (key_val.op == .const_string) {
-            const str_content = key_val.aux_str;
-            const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
-                str_content[1 .. str_content.len - 1]
-            else
-                str_content;
-            const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
-            try aarch64.loadSymbolAddr(self.buf, .x1, sym_name);
-            try aarch64.movRegImm64(self.buf, .x2, @intCast(stripped.len));
+        const key_type = self.type_reg.get(key_val.type_idx);
+        if (key_type == .slice) {
+            // String key: load directly based on op type
+            if (key_val.op == .const_slice) {
+                // Regenerate const_slice into x1/x2
+                const string_idx: usize = @intCast(key_val.aux_int);
+                if (string_idx < self.string_infos.len) {
+                    const info = self.string_infos[string_idx];
+                    try aarch64.loadSymbolAddr(self.buf, .x1, info.symbol_name);
+                    try aarch64.movRegImm64(self.buf, .x2, @intCast(info.len));
+                }
+            } else {
+                // Load slice from stack or other location
+                try self.loadSliceToRegs(key_val, .x1, .x2);
+            }
         } else {
             const key_mcv = self.getValue(args[1]);
             try self.loadToReg(.x1, key_mcv);
         }
 
-        try aarch64.callSymbol(self.buf, "_cot_map_has");
+        // Load map handle into x0 AFTER loading key to avoid clobber
+        const handle_mcv = self.getValue(args[0]);
+        try self.loadToReg(.x0, handle_mcv);
+
+        const func_name = if (self.os == .macos) "_cot_map_has" else "cot_map_has";
+        try aarch64.callSymbol(self.buf, func_name);
         self.reg_manager.markUsed(.x0, value.id);
         try self.setResult(value.id, .{ .register = .x0 });
     }
@@ -1476,72 +1589,6 @@ pub const CodeGen = struct {
         try aarch64.callSymbol(self.buf, "_cot_list_free");
     }
 
-    /// Generate code for str_concat: concatenate two strings via runtime
-    /// Call cot_str_concat(ptr1, len1, ptr2, len2) -> (new_ptr in x0, new_len in x1)
-    /// Uses inline op type lookup (archive pattern)
-    pub fn genStrConcat(self: *CodeGen, value: *ssa.Value) !void {
-        const args = value.args();
-        if (args.len < 2) return;
-
-        // Load first string (ptr in x0, len in x1)
-        const str1_val = &self.func.values.items[args[0]];
-        if (str1_val.op == .const_string) {
-            const str_content = str1_val.aux_str;
-            const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
-                str_content[1 .. str_content.len - 1]
-            else
-                str_content;
-            const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
-            try aarch64.loadSymbolAddr(self.buf, .x0, sym_name);
-            try aarch64.movRegImm64(self.buf, .x1, @intCast(stripped.len));
-        } else if (str1_val.op == .load or str1_val.op == .copy) {
-            // For load ops, local index is in args[0], not aux_int
-            const str1_args = str1_val.args();
-            if (str1_args.len == 0) return;
-            const local_idx: u32 = @intCast(str1_args[0]);
-            if (local_idx < self.func.locals.len) {
-                const offset = self.func.locals[local_idx].offset;
-                const sp_offset = convertOffset(offset, self.stack_size);
-                const sp_offset_plus8 = convertOffset(offset + 8, self.stack_size);
-                try aarch64.ldrRegImm(self.buf, .x0, .sp, sp_offset); // ptr
-                try aarch64.ldrRegImm(self.buf, .x1, .sp, sp_offset_plus8); // len
-            }
-        } else if (str1_val.op == .str_concat) {
-            // Result from previous str_concat already in x0/x1
-        }
-
-        // Load second string (ptr in x2, len in x3)
-        const str2_val = &self.func.values.items[args[1]];
-        if (str2_val.op == .const_string) {
-            const str_content = str2_val.aux_str;
-            const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
-                str_content[1 .. str_content.len - 1]
-            else
-                str_content;
-            const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
-            try aarch64.loadSymbolAddr(self.buf, .x2, sym_name);
-            try aarch64.movRegImm64(self.buf, .x3, @intCast(stripped.len));
-        } else if (str2_val.op == .load or str2_val.op == .copy) {
-            // For load ops, local index is in args[0], not aux_int
-            const str2_args = str2_val.args();
-            if (str2_args.len == 0) return;
-            const local_idx: u32 = @intCast(str2_args[0]);
-            if (local_idx < self.func.locals.len) {
-                const offset = self.func.locals[local_idx].offset;
-                const sp_offset = convertOffset(offset, self.stack_size);
-                const sp_offset_plus8 = convertOffset(offset + 8, self.stack_size);
-                try aarch64.ldrRegImm(self.buf, .x2, .sp, sp_offset); // ptr
-                try aarch64.ldrRegImm(self.buf, .x3, .sp, sp_offset_plus8); // len
-            }
-        }
-
-        try aarch64.callSymbol(self.buf, "_cot_str_concat");
-
-        // Result: ptr in x0, len in x1
-        self.reg_manager.markUsed(.x0, value.id);
-        try self.setResult(value.id, .{ .register = .x0 });
-    }
-
     /// Generate code for alloc: allocate space on stack (returns address)
     /// aux_int = size to allocate, or uses local slot
     pub fn genAlloc(self: *CodeGen, value: *ssa.Value) !void {
@@ -1574,24 +1621,65 @@ pub const CodeGen = struct {
         if (local_idx >= self.func.locals.len) return;
 
         const local = self.func.locals[@intCast(local_idx)];
-        const sp_offset = convertOffset(local.offset, self.stack_size);
         const field_offset: u12 = @intCast(@as(u32, @intCast(value.aux_int)));
 
-        const dest = try self.allocReg(value.id);
+        // Check if local is a struct parameter that was copied in prologue
+        // If local.size > 8, it's an actual struct (not a pointer)
+        const local_type = self.type_reg.get(local.type_idx);
+        const is_struct_copy = (local_type == .struct_type);
 
-        // Load pointer from local
-        try aarch64.ldrRegImm(self.buf, scratch0, .sp, sp_offset);
+        if (is_struct_copy) {
+            // Local IS the struct (after prologue copy), access field directly
+            const sp_offset = convertOffset(local.offset + @as(i32, @intCast(field_offset)), self.stack_size);
 
-        // Load from ptr + field_offset
-        try aarch64.ldrRegImm(self.buf, dest, scratch0, field_offset);
+            const dest = try self.allocReg(value.id);
+            const size = self.type_reg.sizeOf(value.type_idx);
+            if (size == 1) {
+                try aarch64.ldrbRegImm(self.buf, dest, .sp, sp_offset);
+            } else {
+                try aarch64.ldrRegImm(self.buf, dest, .sp, sp_offset);
+            }
+            try self.setResult(value.id, .{ .register = dest });
+        } else {
+            // Local is a pointer, dereference to access field
+            const sp_offset = convertOffset(local.offset, self.stack_size);
+            try aarch64.ldrRegImm(self.buf, scratch0, .sp, sp_offset);
 
-        try self.setResult(value.id, .{ .register = dest });
+            const dest = try self.allocReg(value.id);
+            try aarch64.ldrRegImm(self.buf, dest, scratch0, field_offset);
+            try self.setResult(value.id, .{ .register = dest });
+        }
     }
 
     pub fn genReturn(self: *CodeGen, block: *ssa.Block) !void {
+        const ret_type = self.type_reg.get(self.func.return_type);
+
         if (block.control != ssa.null_value) {
-            const ret_mcv = self.getValue(block.control);
-            try self.loadToReg(.x0, ret_mcv);
+            const ret_val = &self.func.values.items[block.control];
+
+            if (ret_type == .struct_type) {
+                // Struct return: copy result to address in x19 (saved from x8 in prologue)
+                // Find source local and copy all bytes
+                const args = ret_val.args();
+                if (args.len > 0 and args[0] < self.func.locals.len) {
+                    const local_idx: u32 = @intCast(args[0]);
+                    const local = self.func.locals[local_idx];
+                    const struct_size = local.size;
+                    var copied: u32 = 0;
+                    while (copied < struct_size) {
+                        const src_offset = convertOffset(local.offset + @as(i32, @intCast(copied)), self.stack_size);
+                        // Load from our local
+                        try aarch64.ldrRegImm(self.buf, scratch0, .sp, src_offset);
+                        // Store to caller's result address
+                        try aarch64.strRegImm(self.buf, scratch0, .x19, @intCast(copied));
+                        copied += 8;
+                    }
+                }
+            } else {
+                // Scalar return: load to x0
+                const ret_mcv = self.getValue(block.control);
+                try self.loadToReg(.x0, ret_mcv);
+            }
         }
 
         // Epilogue: ldp fp, lr, [sp], #stack_size; ret
@@ -1615,13 +1703,7 @@ pub const CodeGen = struct {
                 // nil is represented as 0
                 try self.setResult(value.id, .{ .immediate = 0 });
             },
-            .const_string => {
-                // String constants are stored as lea_symbol references
-                try self.setResult(value.id, .{ .lea_symbol = .{
-                    .name = value.aux_str,
-                    .len = value.aux_str.len,
-                } });
-            },
+            .const_slice => try self.genConstSlice(value),
             .add => try self.genAdd(value),
             .sub => try self.genSub(value),
             .mul => try self.genMul(value),
@@ -1662,7 +1744,6 @@ pub const CodeGen = struct {
             .list_push => try self.genListPush(value),
             .list_len => try self.genListLen(value),
             .list_free => try self.genListFree(value),
-            .str_concat => try self.genStrConcat(value),
             .arg => try self.genArg(value),
             .retain, .release, .@"unreachable" => {}, // TODO: implement
         }
@@ -1683,8 +1764,20 @@ pub const CodeGen = struct {
         // mov fp, sp
         try aarch64.movFromSp(self.buf, .fp);
 
+        // For struct returns, save x8 (result pointer) to x19 (callee-saved)
+        // IMPORTANT: Also mark x19 as reserved so it won't be allocated
+        const ret_type = self.type_reg.get(self.func.return_type);
+        if (ret_type == .struct_type) {
+            try aarch64.movRegReg(self.buf, .x19, .x8);
+            // Mark x19 as used so the register allocator won't clobber it
+            self.reg_manager.markUsed(.x19, 0xFFFFFFFF); // Use sentinel value
+        }
+
         // Spill parameters to local slots
-        // String parameters use 2 registers (ptr + len), others use 1
+        // Simplified calling convention:
+        // - Scalars (int, bool, enum, ptr): 1 register
+        // - Strings: 2 registers (ptr + len) - special case for efficiency
+        // - Structs: passed by pointer, copy to local slot
         const param_regs = [_]aarch64.Reg{ .x0, .x1, .x2, .x3, .x4, .x5, .x6, .x7 };
         const num_params = self.func.param_count;
 
@@ -1694,19 +1787,38 @@ pub const CodeGen = struct {
 
             const local = self.func.locals[param_idx];
             const sp_offset = convertOffset(local.offset, self.stack_size);
+            const param_type = self.type_reg.get(local.type_idx);
 
-            // Check if this parameter is a string (needs 2 registers: ptr + len)
-            if (local.type_idx == types.TypeRegistry.STRING) {
-                // Store ptr
-                try aarch64.strRegImm(self.buf, param_regs[reg_idx], .sp, sp_offset);
+            if (param_type == .struct_type) {
+                // Struct parameter: register holds pointer to caller's copy
+                // Copy entire struct from that address to our local slot
+                const src_addr = param_regs[reg_idx];
+                const param_size = local.size;
+                var copied: u32 = 0;
+                while (copied < param_size) {
+                    const dst_offset = convertOffset(local.offset + @as(i32, @intCast(copied)), self.stack_size);
+                    // Load 8 bytes from source
+                    try aarch64.ldrRegImm(self.buf, scratch0, src_addr, @intCast(copied));
+                    // Store to our stack slot
+                    try aarch64.strRegImm(self.buf, scratch0, .sp, dst_offset);
+                    copied += 8;
+                }
                 reg_idx += 1;
-                // Store len
-                if (reg_idx < param_regs.len) {
-                    const sp_offset_len = convertOffset(local.offset + 8, self.stack_size);
-                    try aarch64.strRegImm(self.buf, param_regs[reg_idx], .sp, sp_offset_len);
+            } else if (param_type == .slice) {
+                // Slice parameter: 2 registers (ptr + len)
+                if (reg_idx + 1 < param_regs.len) {
+                    // Store ptr at offset, len at offset+8
+                    try aarch64.strRegImm(self.buf, param_regs[reg_idx], .sp, sp_offset);
+                    const sp_offset_plus8 = convertOffset(local.offset + 8, self.stack_size);
+                    try aarch64.strRegImm(self.buf, param_regs[reg_idx + 1], .sp, sp_offset_plus8);
+                    reg_idx += 2;
+                } else {
+                    // Not enough registers, just store ptr
+                    try aarch64.strRegImm(self.buf, param_regs[reg_idx], .sp, sp_offset);
                     reg_idx += 1;
                 }
             } else {
+                // Scalar: single register
                 try aarch64.strRegImm(self.buf, param_regs[reg_idx], .sp, sp_offset);
                 reg_idx += 1;
             }

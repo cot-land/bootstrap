@@ -44,12 +44,12 @@ pub const Op = enum(u8) {
     const_int,
     /// Float constant. aux_float = value
     const_float,
-    /// String constant. aux_str = value
-    const_string,
     /// Boolean constant. aux = 0 or 1
     const_bool,
     /// Null constant.
     const_null,
+    /// Slice constant (string literal). aux = string index in driver's string table
+    const_slice,
 
     // ========== Variables ==========
     /// Local variable reference. aux = local index
@@ -164,11 +164,6 @@ pub const Op = enum(u8) {
     list_len,
     /// Free list. args[0] = handle
     list_free,
-
-    // ========== String Operations (runtime calls) ==========
-    /// Concatenate two strings. args[0]=str1_ptr, args[1]=str1_len, args[2]=str2_ptr, args[3]=str2_len
-    /// Returns: ptr to new string (len stored at offset 8)
-    str_concat,
 
     // ========== Control Flow ==========
     /// Function call. args[0] = func, args[1..] = arguments
@@ -584,6 +579,7 @@ pub const FuncBuilder = struct {
     nodes: std.ArrayList(Node),
     current_block: BlockIndex,
     local_map: std.StringHashMap(u32), // name -> local index
+    max_call_ret_size: u32, // Max struct return size from function calls
 
     pub fn init(allocator: std.mem.Allocator, name: []const u8, type_idx: TypeIndex, return_type: TypeIndex, span: Span) FuncBuilder {
         var fb = FuncBuilder{
@@ -597,6 +593,7 @@ pub const FuncBuilder = struct {
             .nodes = std.ArrayList(Node){ .items = &.{}, .capacity = 0 },
             .current_block = 0,
             .local_map = std.StringHashMap(u32).init(allocator),
+            .max_call_ret_size = 0,
         };
 
         // Create entry block
@@ -683,14 +680,14 @@ pub const FuncBuilder = struct {
         return self.emit(Node.init(.const_float, type_idx, span));
     }
 
-    /// Emit a constant string.
-    pub fn emitConstString(self: *FuncBuilder, value: []const u8, span: Span) !NodeIndex {
-        return self.emit(Node.init(.const_string, TypeRegistry.STRING, span).withAuxStr(value));
-    }
-
     /// Emit a constant bool.
     pub fn emitConstBool(self: *FuncBuilder, value: bool, span: Span) !NodeIndex {
         return self.emit(Node.init(.const_bool, TypeRegistry.BOOL, span).withAux(if (value) 1 else 0));
+    }
+
+    /// Emit a constant slice (string literal). string_idx is index into driver's string table.
+    pub fn emitConstSlice(self: *FuncBuilder, string_idx: u32, type_idx: TypeIndex, span: Span) !NodeIndex {
+        return self.emit(Node.init(.const_slice, type_idx, span).withAux(@intCast(string_idx)));
     }
 
     /// Emit local variable load.
@@ -784,6 +781,9 @@ pub const FuncBuilder = struct {
             // Advance by variable size
             frame_offset += @as(i32, @intCast(local.size));
         }
+
+        // Add space for struct return temps (from function calls)
+        frame_offset += @as(i32, @intCast(self.max_call_ret_size));
 
         // Round total frame size to 16-byte alignment (ABI requirement)
         const frame_size: u32 = @intCast(roundUp(frame_offset, 16));

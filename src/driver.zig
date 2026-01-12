@@ -34,6 +34,9 @@ const arm64_codegen = @import("codegen/arm64_codegen.zig");
 // Re-export Location from ssa
 pub const Location = ssa.Location;
 
+// Re-export StringInfo from backend
+pub const StringInfo = be.StringInfo;
+
 // ============================================================================
 // Target Configuration
 // ============================================================================
@@ -111,6 +114,9 @@ pub const Driver = struct {
     ir_data: ?*ir.IR = null,
     err_reporter: ?*errors.ErrorReporter = null,
     global_scope: ?*check.Scope = null,
+
+    // String literals from lowering (for rodata section)
+    string_literals: std.ArrayList([]const u8) = .{ .items = &.{}, .capacity = 0 },
 
     pub fn init(allocator: Allocator, options: CompileOptions) Driver {
         return .{
@@ -246,6 +252,9 @@ pub const Driver = struct {
             return .{ .success = false, .error_count = 1 };
         };
         self.ir_data.?.* = ir_result;
+
+        // Copy string literals from lowerer before it's deinitialized
+        self.string_literals = lowerer.string_literals;
 
         if (self.options.debug_ir) {
             self.dumpIR();
@@ -450,41 +459,48 @@ pub const Driver = struct {
         // Add rodata section for string literals
         const rodata_name = if (os == .macos) "__cstring" else ".rodata";
         const rodata_idx = try obj.addSection(rodata_name, .rodata);
-        var rodata_section = obj.getSection(rodata_idx);
 
-        // Collect all string literals and add to rodata
-        var string_offsets = std.StringHashMap(u32).init(self.allocator);
-        defer string_offsets.deinit();
+        // Build string info array and populate rodata
+        var string_infos = std.ArrayList(StringInfo){ .items = &.{}, .capacity = 0 };
+        defer string_infos.deinit(self.allocator);
 
-        for (funcs.items) |*func| {
-            for (func.values.items) |*val| {
-                if (val.op == .const_string) {
-                    const str_content = val.aux_str;
-                    // Strip quotes if present
-                    const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
-                        str_content[1 .. str_content.len - 1]
-                    else
-                        str_content;
+        var rodata_buf = be.CodeBuffer.init(self.allocator);
+        defer rodata_buf.deinit();
 
-                    // Only add if not already present
-                    if (!string_offsets.contains(stripped)) {
-                        const offset: u32 = @intCast(rodata_section.size());
-                        try rodata_section.append(self.allocator, stripped);
-                        try string_offsets.put(stripped, offset);
+        for (self.string_literals.items, 0..) |str, i| {
+            const offset: u32 = @intCast(rodata_buf.pos());
 
-                        // Create symbol for this string - use hash-based name matching codegen
-                        const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
-                        _ = try obj.addSymbol(.{
-                            .name = sym_name,
-                            .kind = .data,
-                            .section = rodata_idx,
-                            .offset = offset,
-                            .size = @intCast(stripped.len),
-                            .global = false,
-                        });
-                    }
-                }
+            // Create symbol name for this string literal
+            const sym_name = if (os == .macos)
+                try std.fmt.allocPrint(self.allocator, "_str_{d}", .{i})
+            else
+                try std.fmt.allocPrint(self.allocator, "str_{d}", .{i});
+
+            // Add symbol for this string in rodata section
+            _ = try obj.addSymbol(.{
+                .name = sym_name,
+                .kind = .data,
+                .section = rodata_idx,
+                .offset = offset,
+                .size = @intCast(str.len),
+                .global = false, // Local symbol
+            });
+
+            try string_infos.append(self.allocator, .{
+                .offset = offset,
+                .len = @intCast(str.len),
+                .symbol_name = sym_name,
+            });
+
+            // Write string bytes to rodata (no null terminator needed for slices)
+            for (str) |byte| {
+                try rodata_buf.emit8(byte);
             }
+        }
+
+        // Add rodata to object file
+        if (rodata_buf.pos() > 0) {
+            try obj.addCode(rodata_idx, &rodata_buf);
         }
 
         // Generate code for each function
@@ -511,8 +527,8 @@ pub const Driver = struct {
 
             // Generate function code
             switch (arch) {
-                .x86_64 => try self.generateX86Function(&code_buf, func, &string_offsets),
-                .aarch64 => try self.generateAArch64Function(&code_buf, func, &string_offsets),
+                .x86_64 => try self.generateX86Function(&code_buf, func, string_infos.items),
+                .aarch64 => try self.generateAArch64Function(&code_buf, func, string_infos.items),
             }
         }
 
@@ -535,7 +551,7 @@ pub const Driver = struct {
     // x86_64 Code Generation (Integrated Register Allocation)
     // ========================================================================
 
-    fn generateX86Function(self: *Driver, buf: *be.CodeBuffer, func: *ssa.Func, string_offsets: *std.StringHashMap(u32)) !void {
+    fn generateX86Function(self: *Driver, buf: *be.CodeBuffer, func: *ssa.Func, string_infos: []const StringInfo) !void {
         const type_reg = self.type_reg orelse return error.NoTypeRegistry;
 
         // Create CodeGen with integrated register allocation
@@ -545,7 +561,7 @@ pub const Driver = struct {
             func,
             type_reg,
             self.options.target.os,
-            string_offsets,
+            string_infos,
         );
         defer cg.deinit();
 
@@ -649,9 +665,12 @@ pub const Driver = struct {
     // AArch64 Code Generation (Integrated Register Allocation)
     // ========================================================================
 
-    fn generateAArch64Function(self: *Driver, buf: *be.CodeBuffer, func: *ssa.Func, string_offsets: *std.StringHashMap(u32)) !void {
+    fn generateAArch64Function(self: *Driver, buf: *be.CodeBuffer, func: *ssa.Func, string_infos: []const StringInfo) !void {
         const type_reg = self.type_reg orelse return error.NoTypeRegistry;
-        const stack_size = alignTo(func.frame_size + 16, 16); // +16 for fp/lr
+        // +16 for fp/lr, +32 for spill slots (frame_size already includes space for struct return temps)
+        // Spill padding ensures spill slots don't overlap with locals
+        const spill_padding: u32 = 32; // 4 spill slots
+        const stack_size = alignTo(func.frame_size + 16 + spill_padding, 16);
 
         // Create CodeGen with integrated register allocation
         var cg = arm64_codegen.CodeGen.init(
@@ -660,7 +679,7 @@ pub const Driver = struct {
             func,
             type_reg,
             self.options.target.os,
-            string_offsets,
+            string_infos,
             stack_size,
         );
         defer cg.deinit();
@@ -883,9 +902,9 @@ fn convertIRNode(func: *ssa.Func, node: *const ir.Node, ir_to_ssa: *std.AutoHash
         // Constants
         .const_int => .const_int,
         .const_bool => .const_bool,
-        .const_string => .const_string,
         .const_float => .const_float,
         .const_null => .const_nil,
+        .const_slice => .const_slice,
 
         // Arithmetic
         .add => .add,
@@ -949,9 +968,6 @@ fn convertIRNode(func: *ssa.Func, node: *const ir.Node, ir_to_ssa: *std.AutoHash
         .list_get => .list_get,
         .list_len => .list_len,
         .list_free => .list_free,
-
-        // String operations
-        .str_concat => .str_concat,
 
         else => .copy,
     };

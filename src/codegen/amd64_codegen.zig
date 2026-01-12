@@ -234,8 +234,8 @@ pub const CodeGen = struct {
     /// Register allocation state
     reg_manager: RegisterManager,
 
-    /// String literal offsets (for rodata section)
-    string_offsets: *std.StringHashMap(u32),
+    /// String literal info (for rodata section)
+    string_infos: []const be.StringInfo,
 
     /// Next available spill slot offset (grows negative from rbp)
     next_spill_offset: i32,
@@ -253,7 +253,7 @@ pub const CodeGen = struct {
         func: *ssa.Func,
         type_reg: *types.TypeRegistry,
         os: be.OS,
-        string_offsets: *std.StringHashMap(u32),
+        string_infos: []const be.StringInfo,
     ) CodeGen {
         return .{
             .allocator = allocator,
@@ -263,7 +263,7 @@ pub const CodeGen = struct {
             .os = os,
             .tracking = std.AutoHashMap(ssa.ValueID, InstTracking).init(allocator),
             .reg_manager = .{},
-            .string_offsets = string_offsets,
+            .string_infos = string_infos,
             // Spill slots start below locals.
             // Estimate max spill slots: each SSA value might need one in worst case.
             .next_spill_offset = -@as(i32, @intCast(func.frame_size)) - 8,
@@ -524,6 +524,33 @@ pub const CodeGen = struct {
             try x86.movRegImm64(self.buf, reg, imm);
             try self.setResult(value.id, .{ .register = reg });
         }
+    }
+
+    /// Generate code for a constant slice (string literal)
+    pub fn genConstSlice(self: *CodeGen, value: *ssa.Value) !void {
+        // const_slice: aux_int = string index in string_infos
+        // Result is a slice (ptr, len) in rax/rdx (x86_64 two-value return convention)
+        const string_idx: usize = @intCast(value.aux_int);
+        if (string_idx >= self.string_infos.len) {
+            // Invalid string index - emit null slice
+            try x86.movRegImm64(self.buf, .rax, 0);
+            try x86.movRegImm64(self.buf, .rdx, 0);
+            self.reg_manager.markUsed(.rax, value.id);
+            try self.setResult(value.id, .{ .register = .rax });
+            return;
+        }
+
+        const info = self.string_infos[string_idx];
+
+        // Load string address into rax using LEA [rip + symbol]
+        try x86.leaRipSymbol(self.buf, .rax, info.symbol_name);
+
+        // Load length into rdx
+        try x86.movRegImm64(self.buf, .rdx, @intCast(info.len));
+
+        // Result is a fat pointer: rax = ptr, rdx = len
+        self.reg_manager.markUsed(.rax, value.id);
+        try self.setResult(value.id, .{ .register = .rax });
     }
 
     /// Generate code for an add operation
@@ -872,25 +899,10 @@ pub const CodeGen = struct {
 
         // Check source op type for special 16-byte handling
         // These ops leave ptr in rax, len/payload in rdx
-        if (src_value.op == .slice_make or src_value.op == .union_init or src_value.op == .str_concat) {
+        if (src_value.op == .slice_make or src_value.op == .union_init) {
             // Store 16-byte value: ptr/tag at offset, len/payload at offset+8
             try x86.movMemReg(self.buf, .rbp, total_offset, .rax);
             try x86.movMemReg(self.buf, .rbp, total_offset + 8, .rdx);
-            return;
-        }
-
-        if (src_value.op == .const_string) {
-            // Store string literal: load ptr from rodata, store ptr+len
-            const str_content = src_value.aux_str;
-            const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
-                str_content[1 .. str_content.len - 1]
-            else
-                str_content;
-            const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
-            try x86.leaRipSymbol(self.buf, .rax, sym_name);
-            try x86.movMemReg(self.buf, .rbp, total_offset, .rax);
-            try x86.movRegImm64(self.buf, .rax, @intCast(stripped.len));
-            try x86.movMemReg(self.buf, .rbp, total_offset + 8, .rax);
             return;
         }
 
@@ -944,18 +956,6 @@ pub const CodeGen = struct {
     pub fn genComparison(self: *CodeGen, value: *ssa.Value) !void {
         const args = value.args();
 
-        // Check if this is a string comparison
-        const left_val = &self.func.values.items[args[0]];
-        const right_val = &self.func.values.items[args[1]];
-        const is_string_cmp = left_val.type_idx == types.TypeRegistry.STRING or
-            right_val.type_idx == types.TypeRegistry.STRING or
-            left_val.op == .const_string or right_val.op == .const_string;
-
-        if (is_string_cmp and (value.op == .eq or value.op == .ne)) {
-            try self.genStringComparison(value, args, left_val, right_val);
-            return;
-        }
-
         const left_mcv = self.getValue(args[0]);
         const right_mcv = self.getValue(args[1]);
 
@@ -984,63 +984,6 @@ pub const CodeGen = struct {
 
         self.freeDeadOperands(value);
         try self.setResult(value.id, .{ .register = dest });
-    }
-
-    /// Generate string comparison: call cot_str_eq(ptr1, len1, ptr2, len2)
-    fn genStringComparison(self: *CodeGen, value: *ssa.Value, args: []const ssa.ValueID, left_val: *ssa.Value, right_val: *ssa.Value) !void {
-        try self.spillCallerSaved();
-
-        // x86_64 calling convention: rdi, rsi, rdx, rcx for first 4 args
-        // Load first string into rdi (ptr) and rsi (len)
-        try self.loadStringOperand(left_val, args[0], .rdi, .rsi);
-
-        // Load second string into rdx (ptr) and rcx (len)
-        try self.loadStringOperand(right_val, args[1], .rdx, .rcx);
-
-        // Call cot_str_eq
-        try self.emitRuntimeCall("cot_str_eq");
-
-        // Result in rax: 1 if equal, 0 if not equal
-        // For != comparison, invert the result
-        if (value.op == .ne) {
-            try x86.movRegImm64(self.buf, scratch1, 1);
-            try x86.xorRegReg(self.buf, .rax, scratch1);
-        }
-
-        self.freeDeadOperands(value);
-        self.reg_manager.markUsed(.rax, value.id);
-        try self.setResult(value.id, .{ .register = .rax });
-    }
-
-    /// Load a string operand's ptr and len into destination registers
-    fn loadStringOperand(self: *CodeGen, val: *ssa.Value, val_id: ssa.ValueID, ptr_reg: x86.Reg, len_reg: x86.Reg) !void {
-        if (val.op == .const_string) {
-            // String literal: load symbol address and immediate length
-            const str_content = val.aux_str;
-            const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
-                str_content[1 .. str_content.len - 1]
-            else
-                str_content;
-            const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
-            try x86.leaRipSymbol(self.buf, ptr_reg, sym_name);
-            try x86.movRegImm64(self.buf, len_reg, @intCast(stripped.len));
-        } else if (val.op == .load or val.op == .copy or val.op == .arg) {
-            // Variable: load ptr and len from stack (string is fat pointer: 8 bytes ptr + 8 bytes len)
-            // For load ops, local index is in args[0], not aux_int
-            const val_args = val.args();
-            if (val_args.len == 0) return;
-            const local_idx: u32 = @intCast(val_args[0]);
-            if (local_idx < self.func.locals.len) {
-                const offset = self.func.locals[local_idx].offset;
-                try x86.movRegMem(self.buf, ptr_reg, .rbp, offset); // ptr
-                try x86.movRegMem(self.buf, len_reg, .rbp, offset + 8); // len
-            }
-        } else {
-            // Fallback: use MCValue (just loads ptr, len would be wrong)
-            const mcv = self.getValue(val_id);
-            try self.loadToReg(ptr_reg, mcv);
-            try x86.movRegImm64(self.buf, len_reg, 0); // Unknown len
-        }
     }
 
     /// Generate code for field access: load from struct local + field offset
@@ -1421,7 +1364,6 @@ pub const CodeGen = struct {
     }
 
     /// Generate code for map_get: args[0]=handle, args[1]=key
-    /// Key is handled specially for const_string (need ptr + len)
     pub fn genMapGet(self: *CodeGen, value: *ssa.Value) !void {
         const args = value.args();
         if (args.len < 2) return;
@@ -1432,21 +1374,9 @@ pub const CodeGen = struct {
         const handle_mcv = self.getValue(args[0]);
         try self.loadToReg(.rdi, handle_mcv);
 
-        // Load key - special handling for const_string (need ptr + len)
-        const key_val = &self.func.values.items[args[1]];
-        if (key_val.op == .const_string) {
-            const str_content = key_val.aux_str;
-            const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
-                str_content[1 .. str_content.len - 1]
-            else
-                str_content;
-            const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
-            try x86.leaRipSymbol(self.buf, .rsi, sym_name);
-            try x86.movRegImm64(self.buf, .rdx, @intCast(stripped.len));
-        } else {
-            const key_mcv = self.getValue(args[1]);
-            try self.loadToReg(.rsi, key_mcv);
-        }
+        // Load key
+        const key_mcv = self.getValue(args[1]);
+        try self.loadToReg(.rsi, key_mcv);
 
         try self.emitRuntimeCall("cot_map_get");
 
@@ -1486,7 +1416,6 @@ pub const CodeGen = struct {
     }
 
     /// Generate code for map_set: args[0]=handle, args[1]=key, args[2]=value
-    /// Key is handled specially for const_string (need ptr + len)
     pub fn genMapSet(self: *CodeGen, value: *ssa.Value) !void {
         const args = value.args();
         if (args.len < 3) return;
@@ -1497,33 +1426,18 @@ pub const CodeGen = struct {
         const handle_mcv = self.getValue(args[0]);
         try self.loadToReg(.rdi, handle_mcv);
 
-        // Load key - special handling for const_string (need ptr + len)
-        const key_val = &self.func.values.items[args[1]];
-        if (key_val.op == .const_string) {
-            const str_content = key_val.aux_str;
-            const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
-                str_content[1 .. str_content.len - 1]
-            else
-                str_content;
-            const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
-            try x86.leaRipSymbol(self.buf, .rsi, sym_name);
-            try x86.movRegImm64(self.buf, .rdx, @intCast(stripped.len));
-        } else {
-            // For non-const strings, load ptr via MCValue
-            const key_mcv = self.getValue(args[1]);
-            try self.loadToReg(.rsi, key_mcv);
-            // TODO: handle string len properly for non-const strings
-        }
+        // Load key into rsi
+        const key_mcv = self.getValue(args[1]);
+        try self.loadToReg(.rsi, key_mcv);
 
-        // Load value into rcx
+        // Load value into rdx
         const val_mcv = self.getValue(args[2]);
-        try self.loadToReg(.rcx, val_mcv);
+        try self.loadToReg(.rdx, val_mcv);
 
         try self.emitRuntimeCall("cot_map_set");
     }
 
     /// Generate code for map_has: args[0]=handle, args[1]=key
-    /// Key is handled specially for const_string (need ptr + len)
     pub fn genMapHas(self: *CodeGen, value: *ssa.Value) !void {
         const args = value.args();
         if (args.len < 2) return;
@@ -1533,21 +1447,9 @@ pub const CodeGen = struct {
         const handle_mcv = self.getValue(args[0]);
         try self.loadToReg(.rdi, handle_mcv);
 
-        // Load key - special handling for const_string (need ptr + len)
-        const key_val = &self.func.values.items[args[1]];
-        if (key_val.op == .const_string) {
-            const str_content = key_val.aux_str;
-            const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
-                str_content[1 .. str_content.len - 1]
-            else
-                str_content;
-            const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
-            try x86.leaRipSymbol(self.buf, .rsi, sym_name);
-            try x86.movRegImm64(self.buf, .rdx, @intCast(stripped.len));
-        } else {
-            const key_mcv = self.getValue(args[1]);
-            try self.loadToReg(.rsi, key_mcv);
-        }
+        // Load key
+        const key_mcv = self.getValue(args[1]);
+        try self.loadToReg(.rsi, key_mcv);
 
         try self.emitRuntimeCall("cot_map_has");
         self.reg_manager.markUsed(.rax, value.id);
@@ -1641,73 +1543,6 @@ pub const CodeGen = struct {
         try self.emitRuntimeCall("cot_list_free");
     }
 
-    /// Generate code for str_concat: concatenate two strings via runtime
-    /// Call cot_str_concat(ptr1, len1, ptr2, len2) -> (new_ptr in rax, new_len in rdx)
-    /// Uses inline op type lookup (archive pattern)
-    pub fn genStrConcat(self: *CodeGen, value: *ssa.Value) !void {
-        const args = value.args();
-        if (args.len < 2) return;
-
-        try self.spillCallerSaved();
-
-        // Load first string (ptr in rdi, len in rsi)
-        const str1_val = &self.func.values.items[args[0]];
-        if (str1_val.op == .const_string) {
-            const str_content = str1_val.aux_str;
-            const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
-                str_content[1 .. str_content.len - 1]
-            else
-                str_content;
-            const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
-            try x86.leaRipSymbol(self.buf, .rdi, sym_name);
-            try x86.movRegImm64(self.buf, .rsi, @intCast(stripped.len));
-        } else if (str1_val.op == .load or str1_val.op == .copy) {
-            // Load string from local (ptr at offset, len at offset+8)
-            // For load ops, local index is in args[0], not aux_int
-            const str1_args = str1_val.args();
-            if (str1_args.len == 0) return;
-            const local_idx: u32 = @intCast(str1_args[0]);
-            if (local_idx < self.func.locals.len) {
-                const offset = self.func.locals[local_idx].offset;
-                try x86.movRegMem(self.buf, .rdi, .rbp, offset); // ptr
-                try x86.movRegMem(self.buf, .rsi, .rbp, offset + 8); // len
-            }
-        } else if (str1_val.op == .str_concat) {
-            // Result from previous str_concat is in rax/rdx, move to rdi/rsi
-            try x86.movRegReg(self.buf, .rdi, .rax); // ptr
-            try x86.movRegReg(self.buf, .rsi, .rdx); // len
-        }
-
-        // Load second string (ptr in rdx, len in rcx)
-        const str2_val = &self.func.values.items[args[1]];
-        if (str2_val.op == .const_string) {
-            const str_content = str2_val.aux_str;
-            const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
-                str_content[1 .. str_content.len - 1]
-            else
-                str_content;
-            const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
-            try x86.leaRipSymbol(self.buf, .rdx, sym_name);
-            try x86.movRegImm64(self.buf, .rcx, @intCast(stripped.len));
-        } else if (str2_val.op == .load or str2_val.op == .copy) {
-            // For load ops, local index is in args[0], not aux_int
-            const str2_args = str2_val.args();
-            if (str2_args.len == 0) return;
-            const local_idx: u32 = @intCast(str2_args[0]);
-            if (local_idx < self.func.locals.len) {
-                const offset = self.func.locals[local_idx].offset;
-                try x86.movRegMem(self.buf, .rdx, .rbp, offset); // ptr
-                try x86.movRegMem(self.buf, .rcx, .rbp, offset + 8); // len
-            }
-        }
-
-        try self.emitRuntimeCall("cot_str_concat");
-
-        // Result: ptr in rax, len in rdx
-        self.reg_manager.markUsed(.rax, value.id);
-        try self.setResult(value.id, .{ .register = .rax });
-    }
-
     /// Generate code for alloc: allocate space on stack (returns address)
     /// aux_int = size to allocate, or uses local slot
     pub fn genAlloc(self: *CodeGen, value: *ssa.Value) !void {
@@ -1766,43 +1601,10 @@ pub const CodeGen = struct {
         for (args) |arg_id| {
             if (reg_idx >= arg_regs.len) break;
 
-            const arg_val = &self.func.values.items[arg_id];
-
-            // Check if this is a string argument (needs ptr + len = 2 registers)
-            if (arg_val.op == .const_string) {
-                // String literal: load symbol address and immediate length
-                const str_content = arg_val.aux_str;
-                const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
-                    str_content[1 .. str_content.len - 1]
-                else
-                    str_content;
-                const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
-                try x86.leaRipSymbol(self.buf, arg_regs[reg_idx], sym_name);
-                if (reg_idx + 1 < arg_regs.len) {
-                    try x86.movRegImm64(self.buf, arg_regs[reg_idx + 1], @intCast(stripped.len));
-                }
-                reg_idx += 2; // String takes 2 registers
-            } else if (arg_val.type_idx == types.TypeRegistry.STRING and (arg_val.op == .load or arg_val.op == .copy or arg_val.op == .arg)) {
-                // String variable: load ptr and len from stack
-                // For load ops, local index is in args[0], not aux_int
-                const arg_val_args = arg_val.args();
-                if (arg_val_args.len > 0) {
-                    const local_idx: u32 = @intCast(arg_val_args[0]);
-                    if (local_idx < self.func.locals.len) {
-                        const offset = self.func.locals[local_idx].offset;
-                        try x86.movRegMem(self.buf, arg_regs[reg_idx], .rbp, offset);
-                        if (reg_idx + 1 < arg_regs.len) {
-                            try x86.movRegMem(self.buf, arg_regs[reg_idx + 1], .rbp, offset + 8);
-                        }
-                    }
-                }
-                reg_idx += 2; // String takes 2 registers
-            } else {
-                // Regular argument
-                const arg_mcv = self.getValue(arg_id);
-                try self.loadToReg(arg_regs[reg_idx], arg_mcv);
-                reg_idx += 1;
-            }
+            // Regular argument
+            const arg_mcv = self.getValue(arg_id);
+            try self.loadToReg(arg_regs[reg_idx], arg_mcv);
+            reg_idx += 1;
         }
 
         // Call the function
@@ -1847,14 +1649,7 @@ pub const CodeGen = struct {
                 // nil is represented as 0
                 try self.setResult(value.id, .{ .immediate = 0 });
             },
-            .const_string => {
-                // String constants are stored as lea_symbol references
-                // The string will be placed in rodata by the linker
-                try self.setResult(value.id, .{ .lea_symbol = .{
-                    .name = value.aux_str,
-                    .len = value.aux_str.len,
-                } });
-            },
+            .const_slice => try self.genConstSlice(value),
             .add => try self.genAdd(value),
             .sub => try self.genSub(value),
             .mul => try self.genMul(value),
@@ -1896,7 +1691,6 @@ pub const CodeGen = struct {
             .list_push => try self.genListPush(value),
             .list_len => try self.genListLen(value),
             .list_free => try self.genListFree(value),
-            .str_concat => try self.genStrConcat(value),
             .arg => try self.genArg(value),
             .retain, .release, .@"unreachable" => {}, // TODO: implement
         }
@@ -1930,7 +1724,6 @@ pub const CodeGen = struct {
         }
 
         // Spill parameters to local slots
-        // String parameters use 2 registers (ptr + len), others use 1
         const param_regs = [_]x86.Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
         const num_params = self.func.param_count;
 
@@ -1941,20 +1734,8 @@ pub const CodeGen = struct {
             const local = self.func.locals[param_idx];
             const local_offset = local.offset;
 
-            // Check if this parameter is a string (needs 2 registers: ptr + len)
-            if (local.type_idx == types.TypeRegistry.STRING) {
-                // Store ptr
-                try x86.movMemReg(self.buf, .rbp, local_offset, param_regs[reg_idx]);
-                reg_idx += 1;
-                // Store len
-                if (reg_idx < param_regs.len) {
-                    try x86.movMemReg(self.buf, .rbp, local_offset + 8, param_regs[reg_idx]);
-                    reg_idx += 1;
-                }
-            } else {
-                try x86.movMemReg(self.buf, .rbp, local_offset, param_regs[reg_idx]);
-                reg_idx += 1;
-            }
+            try x86.movMemReg(self.buf, .rbp, local_offset, param_regs[reg_idx]);
+            reg_idx += 1;
         }
     }
 };

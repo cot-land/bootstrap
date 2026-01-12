@@ -17,6 +17,17 @@ const debug = @import("../debug.zig");
 
 const Allocator = std.mem.Allocator;
 
+// ============================================================================
+// String Literal Info (for rodata section)
+// ============================================================================
+
+/// String literal info for rodata section
+pub const StringInfo = struct {
+    offset: u32, // Offset in rodata section
+    len: u32, // Length of string (excluding null terminator if any)
+    symbol_name: []const u8, // Symbol name for relocation (e.g., "_str_0")
+};
+
 // Scoped loggers for codegen debugging
 const log_regalloc = debug.scoped(.regalloc);
 const log_codegen = debug.scoped(.codegen);

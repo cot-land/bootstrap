@@ -44,9 +44,6 @@ pub const BasicKind = enum(u8) {
     f32_type,
     f64_type,
 
-    // String ([]u8)
-    string_type,
-
     // Void (no return value)
     void_type,
 
@@ -54,7 +51,6 @@ pub const BasicKind = enum(u8) {
     untyped_int,
     untyped_float,
     untyped_bool,
-    untyped_string,
     untyped_null,
 
     /// Get the name of this basic type.
@@ -72,12 +68,10 @@ pub const BasicKind = enum(u8) {
             .u64_type => "u64",
             .f32_type => "f32",
             .f64_type => "f64",
-            .string_type => "string",
             .void_type => "void",
             .untyped_int => "untyped int",
             .untyped_float => "untyped float",
             .untyped_bool => "untyped bool",
-            .untyped_string => "untyped string",
             .untyped_null => "untyped null",
         };
     }
@@ -116,7 +110,7 @@ pub const BasicKind = enum(u8) {
     /// Check if this is an untyped type.
     pub fn isUntyped(self: BasicKind) bool {
         return switch (self) {
-            .untyped_int, .untyped_float, .untyped_bool, .untyped_string, .untyped_null => true,
+            .untyped_int, .untyped_float, .untyped_bool, .untyped_null => true,
             else => false,
         };
     }
@@ -129,7 +123,6 @@ pub const BasicKind = enum(u8) {
             .i16_type, .u16_type => 2,
             .i32_type, .u32_type, .f32_type => 4,
             .i64_type, .u64_type, .f64_type => 8,
-            .string_type => 16, // ptr (8) + len (8)
             else => 0, // void, untyped
         };
     }
@@ -329,8 +322,8 @@ pub const TypeRegistry = struct {
     pub const U64: TypeIndex = 9;
     pub const F32: TypeIndex = 10;
     pub const F64: TypeIndex = 11;
-    pub const STRING: TypeIndex = 12;
-    pub const VOID: TypeIndex = 13;
+    pub const VOID: TypeIndex = 12;
+    pub const STRING: TypeIndex = 13; // []u8 slice (string alias)
 
     // Type aliases (cot's friendly names)
     pub const INT: TypeIndex = I64; // int = i64
@@ -356,8 +349,8 @@ pub const TypeRegistry = struct {
         try reg.types.append(allocator, .{ .basic = .u64_type }); // 9
         try reg.types.append(allocator, .{ .basic = .f32_type }); // 10
         try reg.types.append(allocator, .{ .basic = .f64_type }); // 11
-        try reg.types.append(allocator, .{ .basic = .string_type }); // 12
-        try reg.types.append(allocator, .{ .basic = .void_type }); // 13
+        try reg.types.append(allocator, .{ .basic = .void_type }); // 12
+        try reg.types.append(allocator, .{ .slice = .{ .elem = U8 } }); // 13 = []u8 (string)
 
         return reg;
     }
@@ -384,7 +377,6 @@ pub const TypeRegistry = struct {
                 .i16_type, .u16_type => 2,
                 .i32_type, .u32_type, .f32_type => 4,
                 .i64_type, .u64_type, .f64_type => 8,
-                .string_type => 16, // ptr + len
                 .void_type, .invalid => 0,
                 else => 8, // Default basic types to 8 bytes
             },
@@ -485,13 +477,13 @@ pub const TypeRegistry = struct {
         if (std.mem.eql(u8, name, "u64")) return U64;
         if (std.mem.eql(u8, name, "f32")) return F32;
         if (std.mem.eql(u8, name, "f64")) return F64;
-        if (std.mem.eql(u8, name, "string")) return STRING;
         if (std.mem.eql(u8, name, "void")) return VOID;
 
         // Aliases
         if (std.mem.eql(u8, name, "int")) return INT;
         if (std.mem.eql(u8, name, "float")) return FLOAT;
         if (std.mem.eql(u8, name, "byte")) return BYTE;
+        if (std.mem.eql(u8, name, "string")) return STRING; // string = []u8
 
         return null;
     }
@@ -540,7 +532,6 @@ pub const TypeRegistry = struct {
         if (std.mem.eql(u8, name, "u32")) return U32;
         if (std.mem.eql(u8, name, "u64")) return U64;
         if (std.mem.eql(u8, name, "bool")) return BOOL;
-        if (std.mem.eql(u8, name, "string")) return STRING;
         if (std.mem.eql(u8, name, "void")) return VOID;
 
         // Check user-defined types
@@ -582,7 +573,6 @@ pub const TypeRegistry = struct {
                     if (kf == .untyped_int and kt.isInteger()) return true;
                     if (kf == .untyped_float and kt.isFloat()) return true;
                     if (kf == .untyped_bool and kt == .bool_type) return true;
-                    if (kf == .untyped_string and kt == .string_type) return true;
                     if (kf == .untyped_null) {
                         // null is assignable to optional types (handled below)
                         return false;
@@ -608,7 +598,7 @@ test "type registry basic types" {
     // Check pre-registered types
     try std.testing.expectEqual(Type{ .basic = .bool_type }, reg.get(TypeRegistry.BOOL));
     try std.testing.expectEqual(Type{ .basic = .i64_type }, reg.get(TypeRegistry.I64));
-    try std.testing.expectEqual(Type{ .basic = .string_type }, reg.get(TypeRegistry.STRING));
+    try std.testing.expectEqual(Type{ .basic = .void_type }, reg.get(TypeRegistry.VOID));
 
     // Check aliases
     try std.testing.expectEqual(TypeRegistry.I64, TypeRegistry.INT);
@@ -622,7 +612,7 @@ test "type registry lookup" {
 
     try std.testing.expectEqual(TypeRegistry.BOOL, reg.lookupBasic("bool").?);
     try std.testing.expectEqual(TypeRegistry.INT, reg.lookupBasic("int").?);
-    try std.testing.expectEqual(TypeRegistry.STRING, reg.lookupBasic("string").?);
+    try std.testing.expectEqual(TypeRegistry.VOID, reg.lookupBasic("void").?);
     try std.testing.expect(reg.lookupBasic("unknown") == null);
 }
 
@@ -636,9 +626,9 @@ test "type registry composite types" {
     try std.testing.expect(t == .pointer);
     try std.testing.expectEqual(TypeRegistry.INT, t.pointer.elem);
 
-    // Create ?string
-    const opt_string = try reg.makeOptional(TypeRegistry.STRING);
-    const t2 = reg.get(opt_string);
+    // Create ?int
+    const opt_int = try reg.makeOptional(TypeRegistry.INT);
+    const t2 = reg.get(opt_int);
     try std.testing.expect(t2 == .optional);
 
     // Create []u8

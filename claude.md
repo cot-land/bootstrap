@@ -335,8 +335,14 @@ zig build test
 # 2. THEN: Build and run comprehensive test (fast validation)
 zig build
 ./run_tests.sh                    # ARM64 - runs comprehensive test by default
+```
 
-# 3. FINALLY: ALWAYS run x86_64 tests (catches platform-specific bugs)
+### x86_64 Testing (PAUSED during bootstrap)
+
+**Note:** x86_64 cross-platform testing is paused during the bootstrap phase to speed up development. The x86_64 codegen was helpful for catching bugs and validating the architecture, but running Docker tests for every change slows down iteration. We'll re-enable thorough x86_64 testing after bootstrap is complete.
+
+```bash
+# OPTIONAL: Run x86_64 tests when needed (not required during bootstrap)
 zig build -Dtarget=x86_64-linux-gnu
 docker run --rm --platform linux/amd64 -v $(pwd):/cot -w /cot cot-zig:0.15.2 ./run_tests_x86_64.sh
 ```
@@ -363,8 +369,6 @@ The `tests/test_comprehensive.cot` file exercises ALL language features in a sin
 The comprehensive test returns specific error codes (1-52) to identify which feature failed.
 If it fails, individual tests run automatically to help isolate the issue.
 
-**IMPORTANT: Always run BOTH native AND x86_64 tests.** The x86_64 tests catch platform-specific codegen bugs that won't appear on ARM64. Never skip the Docker tests.
-
 **Why this order matters:**
 1. `zig build test` catches:
    - Syntax errors in Zig code
@@ -373,8 +377,6 @@ If it fails, individual tests run automatically to help isolate the issue.
    - Exhaustive switch violations (missing cases for new ops/expressions)
 
 2. Comprehensive test validates all features work together
-
-3. x86_64 Docker tests verify cross-platform codegen (critical for self-hosting)
 
 **Current test counts:**
 - 135+ Zig embedded tests (unit tests in source files)
@@ -442,20 +444,20 @@ docker run --platform linux/amd64 -v $(pwd):/cot -w /cot cot-zig:0.15.2 ./run_te
 ./docker_test.sh test_foo # Run single test
 ```
 
-### Quick x86_64 Test Workflow
+### Quick x86_64 Test Workflow (OPTIONAL during bootstrap)
 
-When implementing new features or fixing bugs, use this minimal workflow:
+When implementing new features or fixing bugs after bootstrap is complete:
 
 ```bash
 # 1. Build and run native tests
 zig build && ./run_tests.sh
 
-# 2. Build for x86_64 and run Docker tests (ALWAYS do both!)
+# 2. OPTIONAL: Build for x86_64 and run Docker tests
 zig build -Dtarget=x86_64-linux-gnu && \
   docker run --platform linux/amd64 -v $(pwd):/cot -w /cot cot-zig:0.15.2 ./run_tests_x86_64.sh
 ```
 
-**Do NOT forget x86_64 tests.** Many register allocation and codegen bugs only manifest on x86_64 due to different calling conventions and register layouts.
+**Note:** x86_64 testing is optional during bootstrap. After bootstrap, re-enable it to catch platform-specific codegen bugs.
 
 ---
 

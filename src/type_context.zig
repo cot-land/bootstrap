@@ -90,7 +90,7 @@ pub const TypeContext = struct {
         if (std.mem.eql(u8, name, "f64") or std.mem.eql(u8, name, "float")) return TypeRegistry.FLOAT;
         if (std.mem.eql(u8, name, "f32")) return TypeRegistry.F32;
         if (std.mem.eql(u8, name, "bool")) return TypeRegistry.BOOL;
-        if (std.mem.eql(u8, name, "string")) return TypeRegistry.STRING;
+        if (std.mem.eql(u8, name, "string")) return self.type_reg.makeSlice(TypeRegistry.U8) catch TypeRegistry.VOID;
         if (std.mem.eql(u8, name, "void")) return TypeRegistry.VOID;
 
         // Look up user-defined types in registry
@@ -173,7 +173,7 @@ pub const TypeContext = struct {
         return null;
     }
 
-    /// Get the element type of an array, slice, list, or string.
+    /// Get the element type of an array, slice, or list.
     /// Returns null if the type doesn't have elements.
     pub fn getElementType(self: TypeContext, type_idx: TypeIndex) ?TypeIndex {
         const t = self.type_reg.get(type_idx);
@@ -181,7 +181,6 @@ pub const TypeContext = struct {
             .array => |a| a.elem,
             .slice => |s| s.elem,
             .list_type => |l| l.elem,
-            .basic => |k| if (k == .string_type) TypeRegistry.U8 else null,
             else => null,
         };
     }

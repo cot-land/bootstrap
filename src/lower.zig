@@ -48,6 +48,9 @@ pub const Lowerer = struct {
     // Counter for generating unique names in for-loop desugaring
     for_counter: u32 = 0,
 
+    // String literals collected during lowering (for rodata section)
+    string_literals: std.ArrayList([]const u8),
+
     pub fn init(
         allocator: Allocator,
         tree: *const Ast,
@@ -63,7 +66,15 @@ pub const Lowerer = struct {
             .builder = ir.Builder.init(allocator, type_reg),
             .checker = chk,
             .type_ctx = type_context.TypeContext.init(tree, type_reg),
+            .string_literals = .{ .items = &.{}, .capacity = 0 },
         };
+    }
+
+    /// Add a string literal and return its index.
+    pub fn addStringLiteral(self: *Lowerer, str: []const u8) !u32 {
+        const idx: u32 = @intCast(self.string_literals.items.len);
+        try self.string_literals.append(self.allocator, str);
+        return idx;
     }
 
     pub fn deinit(self: *Lowerer) void {
@@ -464,9 +475,11 @@ pub const Lowerer = struct {
 
                 const struct_size = self.type_reg.sizeOf(struct_type_idx);
 
-                // Allocate temp local for return value
-                const temp_local_idx = try fb.addLocalWithSize("__ret_tmp", struct_type_idx, false, struct_size);
-                log.debug("  return struct: allocated temp local {d} size {d}", .{ temp_local_idx, struct_size });
+                // Reuse existing temp local if available, otherwise allocate new one
+                // This prevents allocating a new stack slot for each return statement
+                const temp_local_idx = fb.lookupLocal("__ret_tmp") orelse
+                    try fb.addLocalWithSize("__ret_tmp", struct_type_idx, false, struct_size);
+                log.debug("  return struct: using temp local {d} size {d}", .{ temp_local_idx, struct_size });
 
                 // Initialize struct fields into temp local
                 try self.lowerStructInitInline(si, temp_local_idx);
@@ -668,12 +681,6 @@ pub const Lowerer = struct {
             .slice => |s| {
                 elem_type = s.elem;
                 is_slice = true;
-            },
-            .basic => |k| {
-                if (k == .string_type) {
-                    elem_type = TypeRegistry.U8;
-                    // String length would need runtime len call
-                }
             },
             else => {
                 log.debug("  for loop: unsupported iterable type", .{});
@@ -880,121 +887,12 @@ pub const Lowerer = struct {
         };
     }
 
-    /// Lower string interpolation by converting to nested str_concat calls.
-    /// "a ${x} b" -> str_concat(str_concat("a ", x), " b")
-    /// Following Roc's design: process left-to-right, building nested concats.
+    /// Lower string interpolation - not supported, use []u8 slices instead
     fn lowerStringInterp(self: *Lowerer, si: ast.StringInterp) Allocator.Error!ir.NodeIndex {
-        const fb = self.current_func orelse return ir.null_node;
-
-        // Filter out empty text segments first
-        var non_empty_segments = std.ArrayList(ast.StringSegment){ .items = &.{}, .capacity = 0 };
-        defer non_empty_segments.deinit(self.allocator);
-
-        for (si.segments) |segment| {
-            switch (segment) {
-                .text => |raw_text| {
-                    // Check if segment would be empty after cleanup
-                    var text = raw_text;
-                    if (text.len > 0 and (text[0] == '"' or text[0] == '}')) {
-                        text = text[1..];
-                    }
-                    if (text.len >= 2 and text[text.len - 2] == '$' and text[text.len - 1] == '{') {
-                        text = text[0 .. text.len - 2];
-                    } else if (text.len > 0 and text[text.len - 1] == '"') {
-                        text = text[0 .. text.len - 1];
-                    }
-                    // Only include non-empty text segments
-                    if (text.len > 0) {
-                        try non_empty_segments.append(self.allocator, segment);
-                    }
-                },
-                .expr => {
-                    // Always include expression segments
-                    try non_empty_segments.append(self.allocator, segment);
-                },
-            }
-        }
-
-        // Empty interpolation returns empty string
-        if (non_empty_segments.items.len == 0) {
-            const empty = ir.Node.init(.const_string, TypeRegistry.STRING, Span.fromPos(Pos.zero))
-                .withAuxStr("\"\"");
-            return try fb.emit(empty);
-        }
-
-        // Single segment - just return it directly
-        if (non_empty_segments.items.len == 1) {
-            return try self.lowerStringSegment(non_empty_segments.items[0]);
-        }
-
-        // Multiple segments: build nested str_concat calls left-to-right
-        // "a ${x} b" becomes: str_concat(str_concat("a ", x), " b")
-        var result = try self.lowerStringSegment(non_empty_segments.items[0]);
-
-        for (non_empty_segments.items[1..]) |segment| {
-            const seg_node = try self.lowerStringSegment(segment);
-
-            // Create str_concat(result, seg_node)
-            var concat_node = ir.Node.init(.str_concat, TypeRegistry.STRING, si.span);
-            concat_node.args_storage[0] = result;
-            concat_node.args_storage[1] = seg_node;
-            concat_node.args_len = 2;
-
-            result = try fb.emit(concat_node);
-        }
-
-        return result;
-    }
-
-    /// Helper to lower a single string segment (text or expression)
-    fn lowerStringSegment(self: *Lowerer, segment: ast.StringSegment) Allocator.Error!ir.NodeIndex {
-        const fb = self.current_func orelse return ir.null_node;
-
-        switch (segment) {
-            .text => |raw_text| {
-                // Clean up segment text from scanner artifacts:
-                // - string_interp_start: starts with ", ends with ${
-                // - string_interp_mid: starts with }, ends with ${
-                // - string_interp_end: starts with }, ends with "
-                var text = raw_text;
-
-                // Strip leading " (first segment)
-                if (text.len > 0 and text[0] == '"') {
-                    text = text[1..];
-                }
-                // Strip leading } (middle/end segment)
-                else if (text.len > 0 and text[0] == '}') {
-                    text = text[1..];
-                }
-
-                // Strip trailing ${ (first/middle segment)
-                if (text.len >= 2 and text[text.len - 2] == '$' and text[text.len - 1] == '{') {
-                    text = text[0 .. text.len - 2];
-                }
-                // Strip trailing " (end segment)
-                else if (text.len > 0 and text[text.len - 1] == '"') {
-                    text = text[0 .. text.len - 1];
-                }
-
-                // Skip empty segments
-                if (text.len == 0) {
-                    // Return a placeholder empty string node
-                    const node = ir.Node.init(.const_string, TypeRegistry.STRING, Span.fromPos(Pos.zero))
-                        .withAuxStr("\"\"");
-                    return try fb.emit(node);
-                }
-
-                // Wrap with quotes for const_string format
-                const quoted = try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{text});
-                const node = ir.Node.init(.const_string, TypeRegistry.STRING, Span.fromPos(Pos.zero))
-                    .withAuxStr(quoted);
-                return try fb.emit(node);
-            },
-            .expr => |expr_idx| {
-                // Lower the expression - must be a string type (like Roc)
-                return try self.lowerExpr(expr_idx);
-            },
-        }
+        _ = self;
+        _ = si;
+        // String interpolation is not supported - should be caught by type checker
+        return ir.null_node;
     }
 
     fn lowerNewExpr(self: *Lowerer, ne: ast.NewExpr) Allocator.Error!ir.NodeIndex {
@@ -1077,15 +975,17 @@ pub const Lowerer = struct {
                 return try fb.emit(node);
             },
             .string => {
-                // Strip quotes from string literal: "hello" -> hello
+                // Strip quotes from string literal
                 const raw = lit.value;
-                const stripped = if (raw.len >= 2 and raw[0] == '"' and raw[raw.len - 1] == '"')
+                const str = if (raw.len >= 2 and raw[0] == '"' and raw[raw.len - 1] == '"')
                     raw[1 .. raw.len - 1]
                 else
                     raw;
-                const node = ir.Node.init(.const_string, TypeRegistry.STRING, Span.fromPos(Pos.zero))
-                    .withAuxStr(stripped);
-                return try fb.emit(node);
+
+                // Add to string table and emit const_slice
+                const string_idx = try self.addStringLiteral(str);
+                const slice_type = self.type_reg.makeSlice(TypeRegistry.U8) catch TypeRegistry.VOID;
+                return try fb.emitConstSlice(string_idx, slice_type, Span.fromPos(Pos.zero));
             },
             .char => {
                 const value: i64 = if (lit.value.len > 0) @intCast(lit.value[0]) else 0;
@@ -1121,13 +1021,6 @@ pub const Lowerer = struct {
             return self.lowerExpr(bin.left);
         }
 
-        // Check for string literal comparisons - constant fold them
-        if (bin.op == .equal_equal or bin.op == .bang_equal) {
-            if (try self.tryFoldStringComparison(bin)) |result| {
-                return result;
-            }
-        }
-
         const left = try self.lowerExpr(bin.left);
         const right = try self.lowerExpr(bin.right);
 
@@ -1157,54 +1050,6 @@ pub const Lowerer = struct {
             .withArgs(&.{ left, right });
 
         return try fb.emit(node);
-    }
-
-    /// Try to constant-fold string literal comparison.
-    /// Returns the result node if both operands are string literals, null otherwise.
-    fn tryFoldStringComparison(self: *Lowerer, bin: ast.Binary) Allocator.Error!?ir.NodeIndex {
-        const fb = self.current_func orelse return null;
-
-        // Get left operand - must be string literal
-        const left_node = self.tree.getNode(bin.left);
-        const left_str = switch (left_node) {
-            .expr => |expr| switch (expr) {
-                .literal => |lit| if (lit.kind == .string) stripQuotes(lit.value) else return null,
-                else => return null,
-            },
-            else => return null,
-        };
-
-        // Get right operand - must be string literal
-        const right_node = self.tree.getNode(bin.right);
-        const right_str = switch (right_node) {
-            .expr => |expr| switch (expr) {
-                .literal => |lit| if (lit.kind == .string) stripQuotes(lit.value) else return null,
-                else => return null,
-            },
-            else => return null,
-        };
-
-        // Compare the strings
-        const are_equal = std.mem.eql(u8, left_str, right_str);
-        const result: i64 = switch (bin.op) {
-            .equal_equal => if (are_equal) 1 else 0,
-            .bang_equal => if (are_equal) 0 else 1,
-            else => return null,
-        };
-
-        log.debug("  string comparison constant folded: \"{s}\" vs \"{s}\" = {d}", .{ left_str, right_str, result });
-
-        const node = ir.Node.init(.const_bool, TypeRegistry.BOOL, Span.fromPos(Pos.zero))
-            .withAux(result);
-        return try fb.emit(node);
-    }
-
-    /// Helper to strip quotes from a string literal
-    fn stripQuotes(raw: []const u8) []const u8 {
-        if (raw.len >= 2 and raw[0] == '"' and raw[raw.len - 1] == '"') {
-            return raw[1 .. raw.len - 1];
-        }
-        return raw;
     }
 
     fn lowerUnary(self: *Lowerer, un: ast.Unary) Allocator.Error!ir.NodeIndex {
@@ -1349,6 +1194,15 @@ pub const Lowerer = struct {
         // Look up the function's return type from the AST (fixes u8 return type bug)
         const return_type = self.type_ctx.getFuncReturnType(func_name) orelse TypeRegistry.VOID;
 
+        // Track max struct return size for frame allocation
+        const ret_type_info = self.type_reg.get(return_type);
+        if (ret_type_info == .struct_type) {
+            const ret_size = self.type_reg.sizeOf(return_type);
+            if (ret_size > fb.max_call_ret_size) {
+                fb.max_call_ret_size = ret_size;
+            }
+        }
+
         const node = ir.Node.init(.call, return_type, Span.fromPos(Pos.zero))
             .withArgs(try self.allocator.dupe(ir.NodeIndex, args.items))
             .withAuxStr(func_name);
@@ -1423,16 +1277,6 @@ pub const Lowerer = struct {
                                         .withAux(@intCast(a.length));
                                     log.debug("  len(array var) constant folded to {d}", .{a.length});
                                     return try fb.emit(node);
-                                },
-                                .basic => |k| {
-                                    if (k == .string_type) {
-                                        // String is ptr+len, len is at offset 8
-                                        const node = ir.Node.init(.field, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                                            .withArgs(&.{@as(ir.NodeIndex, @intCast(local_idx))})
-                                            .withAux(8); // len is at offset 8
-                                        log.debug("  len(string var) runtime: local={d}, offset=8", .{local_idx});
-                                        return try fb.emit(node);
-                                    }
                                 },
                                 else => {},
                             }
@@ -1934,20 +1778,6 @@ pub const Lowerer = struct {
                         .withAux(@intCast(elem_size));
                     log.debug("  slice index: local={d}, elem_size={d}", .{ local_idx, elem_size });
                     return try fb.emit(slice_idx_node);
-                } else if (local_type == .basic and local_type.basic == .string_type) {
-                    // String indexing: string is ptr+len at local (same as slice), returns byte
-                    const elem_size: u32 = 1; // strings are byte arrays
-
-                    // Lower the index expression
-                    const idx_node = try self.lowerExpr(index.index);
-
-                    // Emit slice_index op - strings use same pattern as slices
-                    // args[0] = string local index, args[1] = index value, aux = elem_size
-                    const str_idx_node = ir.Node.init(.slice_index, TypeRegistry.U8, Span.fromPos(Pos.zero))
-                        .withArgs(&.{ @intCast(local_idx), idx_node })
-                        .withAux(@intCast(elem_size));
-                    log.debug("  string index: local={d}, elem_size={d}", .{ local_idx, elem_size });
-                    return try fb.emit(str_idx_node);
                 }
             }
         }
@@ -1977,14 +1807,12 @@ pub const Lowerer = struct {
         const elem_size: u32 = switch (base_type) {
             .array => |a| self.type_reg.sizeOf(a.elem),
             .slice => |s| self.type_reg.sizeOf(s.elem),
-            .basic => |k| if (k == .string_type) 1 else 0,
             else => 0,
         };
 
         const slice_type: TypeIndex = switch (base_type) {
             .array => |a| self.type_reg.makeSlice(a.elem) catch TypeRegistry.VOID,
             .slice => base_type_idx, // Slicing a slice returns same type
-            .basic => |k| if (k == .string_type) self.type_reg.makeSlice(TypeRegistry.U8) catch TypeRegistry.VOID else TypeRegistry.VOID,
             else => TypeRegistry.VOID,
         };
 
@@ -2411,8 +2239,8 @@ pub const Lowerer = struct {
                         if (std.mem.eql(u8, name, "f64") or std.mem.eql(u8, name, "float")) return TypeRegistry.FLOAT;
                         if (std.mem.eql(u8, name, "f32")) return TypeRegistry.F32;
                         if (std.mem.eql(u8, name, "bool")) return TypeRegistry.BOOL;
-                        if (std.mem.eql(u8, name, "string")) return TypeRegistry.STRING;
                         if (std.mem.eql(u8, name, "void")) return TypeRegistry.VOID;
+                        if (std.mem.eql(u8, name, "string")) return TypeRegistry.STRING;
                         // Look up in registry
                         return self.type_reg.lookupByName(name) orelse TypeRegistry.VOID;
                     },
@@ -2448,7 +2276,7 @@ pub const Lowerer = struct {
                         return switch (lit.kind) {
                             .int => TypeRegistry.INT,
                             .float => TypeRegistry.FLOAT,
-                            .string => TypeRegistry.STRING,
+                            .string => self.type_reg.makeSlice(TypeRegistry.U8) catch TypeRegistry.VOID,
                             .char => TypeRegistry.INT, // char is an int
                             .true_lit, .false_lit => TypeRegistry.BOOL,
                             .null_lit => TypeRegistry.VOID,
@@ -2537,7 +2365,6 @@ pub const Lowerer = struct {
                         return switch (base_type) {
                             .array => |a| a.elem,
                             .slice => |s| s.elem,
-                            .basic => |k| if (k == .string_type) TypeRegistry.U8 else TypeRegistry.VOID,
                             else => TypeRegistry.VOID,
                         };
                     },
@@ -2549,7 +2376,6 @@ pub const Lowerer = struct {
                         return switch (base_type) {
                             .array => |a| self.type_reg.makeSlice(a.elem) catch TypeRegistry.VOID,
                             .slice => base_type_idx, // Slicing a slice returns same type
-                            .basic => |k| if (k == .string_type) self.type_reg.makeSlice(TypeRegistry.U8) catch TypeRegistry.VOID else TypeRegistry.VOID,
                             else => TypeRegistry.VOID,
                         };
                     },
@@ -2579,8 +2405,8 @@ pub const Lowerer = struct {
                         return TypeRegistry.VOID;
                     },
 
-                    // String interpolation always returns string type
-                    .string_interp => return TypeRegistry.STRING,
+                    // String interpolation is not supported
+                    .string_interp => return TypeRegistry.VOID,
 
                     else => return TypeRegistry.VOID,
                 }
