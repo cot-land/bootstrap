@@ -705,6 +705,38 @@ pub const Lowerer = struct {
                         _ = try fb.emit(store);
                         log.debug("  deref assign: store through pointer", .{});
                     },
+                    .index => |idx| {
+                        // Indexed assignment: list[i] = value or arr[i] = value
+                        // Get the base type to determine if this is a List or array
+                        const base_type_idx = self.checker.expr_types.get(idx.base) orelse TypeRegistry.INVALID;
+                        const base_type = self.type_reg.get(base_type_idx);
+
+                        if (base_type == .list_type) {
+                            // List indexed assignment: list[i] = value
+                            // Emit list_set(handle, index, value)
+
+                            // Lower the base (list handle)
+                            const handle_node = try self.lowerExpr(idx.base);
+
+                            // Lower the index
+                            const index_node = try self.lowerExpr(idx.index);
+
+                            // Lower the value
+                            const value_node = try self.lowerExpr(assign.value);
+
+                            // Get element type from list using type context
+                            const elem_type = self.type_ctx.getListElementType(base_type_idx) orelse TypeRegistry.INT;
+
+                            // Emit list_set
+                            const list_set = ir.Node.init(.list_set, elem_type, Span.fromPos(Pos.zero))
+                                .withArgs(&.{ handle_node, index_node, value_node });
+                            _ = try fb.emit(list_set);
+                            log.debug("  list indexed assign", .{});
+                        } else {
+                            // Array indexed assignment - TODO if needed
+                            log.debug("  array indexed assign not yet implemented", .{});
+                        }
+                    },
                     else => {},
                 }
             },

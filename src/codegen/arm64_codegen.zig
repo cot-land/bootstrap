@@ -2582,6 +2582,87 @@ pub const CodeGen = struct {
         try aarch64.callSymbol(self.buf, "_cot_list_push");
     }
 
+    /// Generate code for list_set: args[0]=handle, args[1]=index, args[2]=value
+    /// For small elements (<= 8 bytes): x0=handle, x1=index, x2=value
+    /// For large elements (> 8 bytes): x0=handle, x1=index, x2=pointer to value
+    pub fn genListSet(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+        if (args.len < 3) return;
+
+        // Get the value's type to determine element size
+        const value_ssa = &self.func.values.items[args[2]];
+        const elem_size = self.type_reg.sizeOf(value_ssa.type_idx);
+
+        const handle_mcv = self.getValue(args[0]);
+        const index_mcv = self.getValue(args[1]);
+        const val_mcv = self.getValue(args[2]);
+
+        if (elem_size <= 8) {
+            // Small element - pass value directly in x2
+            // Handle register clobbering carefully
+            // Load in reverse order of dependencies: value, index, handle
+
+            // Save value first if it's in x0 or x1 (will be clobbered)
+            if (val_mcv == .register and (val_mcv.register == .x0 or val_mcv.register == .x1)) {
+                try aarch64.movRegReg(self.buf, .x2, val_mcv.register);
+            }
+
+            // Save index if it's in x0 (will be clobbered by handle load)
+            if (index_mcv == .register and index_mcv.register == .x0) {
+                try aarch64.movRegReg(self.buf, .x1, .x0);
+                try self.loadToReg(.x0, handle_mcv);
+                // Value may need loading if not already saved
+                if (!(val_mcv == .register and (val_mcv.register == .x0 or val_mcv.register == .x1))) {
+                    try self.loadToReg(.x2, val_mcv);
+                }
+            } else {
+                // Normal order: load handle to x0, index to x1, value to x2
+                try self.loadToReg(.x0, handle_mcv);
+                try self.loadToReg(.x1, index_mcv);
+                if (!(val_mcv == .register and (val_mcv.register == .x0 or val_mcv.register == .x1))) {
+                    try self.loadToReg(.x2, val_mcv);
+                }
+            }
+        } else {
+            // Large element - pass pointer in x2
+            switch (val_mcv) {
+                .stack => |stack_offset| {
+                    // Value already on stack - use its address directly
+                    try self.loadToReg(.x0, handle_mcv);
+                    try self.loadToReg(.x1, index_mcv);
+                    try self.addSpOffset(.x2, stack_offset);
+                },
+                .register => |reg| {
+                    // Value in register - need to copy to stack first
+                    const temp_offset = self.next_spill_offset;
+                    self.next_spill_offset +|= @intCast(alignTo(elem_size, 8));
+
+                    // Store to temp location
+                    if (elem_size > 8 and elem_size <= 16 and value_ssa.op == .union_init) {
+                        try self.strSpOffset(.x0, temp_offset);
+                        try self.strSpOffset(.x1, temp_offset + 8);
+                    } else {
+                        try self.strSpOffset(reg, temp_offset);
+                    }
+
+                    try self.loadToReg(.x0, handle_mcv);
+                    try self.loadToReg(.x1, index_mcv);
+                    try self.addSpOffset(.x2, temp_offset);
+                },
+                else => {
+                    // Unknown location - allocate temp
+                    const temp_offset = self.next_spill_offset;
+                    self.next_spill_offset +|= @intCast(alignTo(elem_size, 8));
+                    try self.loadToReg(.x0, handle_mcv);
+                    try self.loadToReg(.x1, index_mcv);
+                    try self.addSpOffset(.x2, temp_offset);
+                },
+            }
+        }
+
+        try aarch64.callSymbol(self.buf, "_cot_list_set");
+    }
+
     /// Generate code for list_len: args[0]=handle
     pub fn genListLen(self: *CodeGen, value: *ssa.Value) !void {
         const args = value.args();
@@ -2914,6 +2995,7 @@ pub const CodeGen = struct {
             .map_free => try self.genMapFree(value),
             .list_new => try self.genListNew(value),
             .list_push => try self.genListPush(value),
+            .list_set => try self.genListSet(value),
             .list_len => try self.genListLen(value),
             .list_free => try self.genListFree(value),
             .str_concat => try self.genStrConcat(value),

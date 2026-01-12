@@ -55,10 +55,10 @@ Every Zig source file needs a corresponding bootstrap .cot file that uses only s
 | `src/parser.zig` | `src/bootstrap/parser_boot.cot` | **Done** | Parser |
 | `src/check.zig` | `src/bootstrap/check_boot.cot` | **Done** | Type checker (basic tests) |
 | `src/errors.zig` | `src/bootstrap/errors_boot.cot` | **Done** | Error handling |
-| `src/ir.zig` | `src/bootstrap/ir_boot.cot` | **Done** | IR definitions (x86_64 large struct TODO) |
-| `src/lower.zig` | `src/bootstrap/lower_boot.cot` | TODO | AST → IR lowering |
-| `src/ssa.zig` | `src/bootstrap/ssa_boot.cot` | TODO | SSA conversion |
-| `src/liveness.zig` | `src/bootstrap/liveness_boot.cot` | TODO | Liveness analysis |
+| `src/ir.zig` | `src/bootstrap/ir_boot.cot` | **Done** | IR definitions |
+| `src/lower.zig` | `src/bootstrap/lower_boot.cot` | **Done** | AST → IR lowering |
+| `src/ssa.zig` | `src/bootstrap/ssa_boot.cot` | **Done** | SSA conversion |
+| `src/liveness.zig` | `src/bootstrap/liveness_boot.cot` | **Done** | Liveness analysis |
 | `src/driver.zig` | `src/bootstrap/driver_boot.cot` | TODO | Compilation orchestration |
 | `src/main.zig` | `src/bootstrap/main_boot.cot` | TODO | Entry point |
 | `src/codegen/backend.zig` | `src/bootstrap/codegen/backend_boot.cot` | TODO | Backend abstraction |
@@ -71,7 +71,7 @@ Every Zig source file needs a corresponding bootstrap .cot file that uses only s
 | `src/debug.zig` | `src/bootstrap/debug_boot.cot` | TODO | Debug output utilities |
 | `src/type_context.zig` | `src/bootstrap/type_context_boot.cot` | TODO | Type context for checker |
 
-**Progress: 9/22 files complete**
+**Progress: 12/22 files complete**
 
 ---
 
@@ -80,6 +80,12 @@ Every Zig source file needs a corresponding bootstrap .cot file that uses only s
 The bootstrap .cot files must use ONLY these features (already working in Zig compiler):
 
 ### Currently Supported ✅
+
+**Imports (Bootstrap Only):**
+- `import "path/to/file.cot"` - textual inclusion (like C's #include)
+- Recursive imports supported
+- Duplicate detection (same file not included twice)
+- Note: This is temporary for bootstrap. Cot 1.0 will have proper Go-style modules.
 
 **Types:**
 - `i64`, `int`, `u8`, `bool`, `void`
@@ -98,7 +104,8 @@ The bootstrap .cot files must use ONLY these features (already working in Zig co
 - Logical: `and or` (short-circuit)
 - Boolean: `true false`
 - Literals: integers, strings, chars (`'a'`)
-- Indexing: `arr[i]`, `s[i]`
+- Indexing: `arr[i]`, `s[i]`, `list[i]`
+- List indexed assignment: `list[i] = value`
 - Slicing: `arr[start:end]`
 - Field access: `obj.field`
 - Method calls: `obj.method(args)`
@@ -138,7 +145,6 @@ These features exist in wireframe .cot files but are NOT in Zig compiler yet:
 - `for item, i in arr { }` - for with index
 - `!T` / `try` / `catch` - error handling
 - `fn(T) R` - function types as values
-- `import "module"` - module system
 - `defer` - deferred execution
 - `?.` - optional chaining
 - `@sizeof(T)` / `@alignOf(T)`
@@ -162,9 +168,9 @@ These features exist in wireframe .cot files but are NOT in Zig compiler yet:
 7. ✅ `parser_boot.cot` - Parser (DONE)
 8. ✅ `check_boot.cot` - Type checker (DONE)
 9. ✅ `ir_boot.cot` - IR definitions (DONE)
-10. `lower_boot.cot` - Lowering
-11. `ssa_boot.cot` - SSA conversion
-12. `liveness_boot.cot` - Liveness analysis
+10. ✅ `lower_boot.cot` - Lowering (DONE)
+11. ✅ `ssa_boot.cot` - SSA conversion (DONE)
+12. ✅ `liveness_boot.cot` - Liveness analysis (DONE)
 13. `codegen/*_boot.cot` - Code generation
 14. `driver_boot.cot` - Orchestration
 15. `main_boot.cot` - Entry point

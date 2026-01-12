@@ -1,0 +1,27 @@
+// Test for bootstrap import system
+import "test_import_helper.cot"
+
+fn main() int {
+    // Test function from imported file
+    var sum: int = helper_add(10, 20)
+    if sum != 30 {
+        return 1
+    }
+
+    // Test constant from imported file
+    if HELPER_CONST != 100 {
+        return 2
+    }
+
+    // Test local function
+    var local_result: int = local_fn(5)
+    if local_result != 50 {
+        return 3
+    }
+
+    return 42
+}
+
+fn local_fn(x: int) int {
+    return x * 10
+}

@@ -1,0 +1,8 @@
+// Helper file for testing imports
+// This file is imported by test_import.cot
+
+fn helper_add(a: int, b: int) int {
+    return a + b
+}
+
+const HELPER_CONST: int = 100

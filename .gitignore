@@ -72,6 +72,7 @@ test_us
 types_boot
 errors_boot
 check_boot
+lower_boot
 test_map_large_struct
 test_map_struct_debug
 test_struct_init_simple
@@ -79,6 +80,8 @@ test_pointer
 test_pointer_param
 test_pointer_basic
 ir_boot
+ssa_boot
+liveness_boot
 taf
 test_all
 test_asl
@@ -87,3 +90,6 @@ test_sm
 test_struct2
 test_sul
 test_sum
+test_import
+test_import_nested
+test_list_set

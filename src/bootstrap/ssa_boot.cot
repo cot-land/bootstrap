@@ -1,0 +1,936 @@
+// SSA (Static Single Assignment) form for cot bootstrap.
+//
+// Maps to Go's cmd/compile/internal/ssa/
+// - func.go (Func structure, value/block factories)
+// - block.go (Block, Edge with bidirectional indices)
+// - value.go (Value with use counting)
+// - dom.go (dominance computation)
+// - copyelim.go (phi elimination)
+//
+// Key patterns from Go:
+// - Dense ID allocation for array indexing
+// - Explicit use counting for O(1) DCE
+// - Bidirectional edges for O(1) removal
+
+// Type index (reference to type registry)
+type TypeIndex = int
+
+// Value and Block IDs (dense allocation)
+type ValueID = int
+type BlockID = int
+
+const NULL_VALUE: int = 2147483647
+const NULL_BLOCK: int = 2147483647
+
+// ============================================================================
+// SSA Operations
+// ============================================================================
+
+enum Op: int {
+    // Constants
+    const_int,
+    const_float,
+    const_bool,
+    const_nil,
+    const_slice,
+
+    // Phi node (SSA join point)
+    phi,
+
+    // Copy (for register allocation)
+    copy,
+
+    // Arithmetic
+    add,
+    sub,
+    mul,
+    div,
+    mod,
+    neg,
+
+    // Comparison
+    eq,
+    ne,
+    lt,
+    le,
+    gt,
+    ge,
+
+    // Logical
+    log_and,
+    log_or,
+    log_not,
+
+    // Conditional select (ternary)
+    select,
+
+    // Memory
+    load,
+    store,
+    addr,
+    alloc,
+    ptr_load,
+    ptr_store,
+
+    // Struct/array field access
+    field_local,
+    field_value,
+    ptr_field,
+    ptr_field_store,
+
+    // Array/slice indexing
+    index_local,
+    index_value,
+    field,
+    index,
+
+    // Slice construction
+    slice_local,
+    slice_value,
+    slice_make,
+
+    // Slice indexing
+    slice_index,
+
+    // Union operations
+    union_init,
+    union_tag,
+    union_payload,
+
+    // Map operations
+    map_new,
+    map_set,
+    map_get,
+    map_has,
+    map_size,
+    map_free,
+
+    // List operations
+    list_new,
+    list_push,
+    list_get,
+    list_set,
+    list_len,
+    list_free,
+
+    // String operations
+    str_concat,
+
+    // Function
+    call,
+    arg,
+
+    // ARC
+    retain,
+    release,
+
+    // Control (block terminators)
+    ret,
+    jump,
+    branch,
+    op_unreachable,
+}
+
+// ============================================================================
+// Location - Where a value lives after register allocation
+// ============================================================================
+
+union Location {
+    reg: int,
+    stack: int,
+    none: int,
+}
+
+fn locationIsReg(loc: Location) bool {
+    return switch loc {
+        .reg |_| => true,
+        .stack |_| => false,
+        .none |_| => false,
+    }
+}
+
+fn locationGetReg(loc: Location) int {
+    return switch loc {
+        .reg |r| => r,
+        .stack |_| => 0 - 1,
+        .none |_| => 0 - 1,
+    }
+}
+
+fn locationGetStack(loc: Location) int {
+    return switch loc {
+        .reg |_| => 0,
+        .stack |s| => s,
+        .none |_| => 0,
+    }
+}
+
+// ============================================================================
+// Edge (bidirectional CFG edge)
+// ============================================================================
+
+struct Edge {
+    block: BlockID,
+    reverse_idx: int,
+}
+
+// ============================================================================
+// Block kinds (terminators)
+// ============================================================================
+
+enum BlockKind: int {
+    plain,
+    block_if,
+    block_ret,
+    exit,
+}
+
+// ============================================================================
+// Value - An SSA value assigned exactly once
+// ============================================================================
+
+struct Value {
+    id: ValueID,
+    op: Op,
+    type_idx: TypeIndex,
+    block: BlockID,
+
+    // Arguments (other values this depends on)
+    args: List<ValueID>,
+
+    // Use count for dead code elimination
+    uses: int,
+
+    // Auxiliary data
+    aux_int: int,
+    aux_str: string,
+
+    // Source position
+    pos: int,
+}
+
+fn newValue(id: ValueID, op: Op, type_idx: TypeIndex, block: BlockID) Value {
+    var v: Value = Value{
+        .id = id,
+        .op = op,
+        .type_idx = type_idx,
+        .block = block,
+        .args = new List<ValueID>(),
+        .uses = 0,
+        .aux_int = 0,
+        .aux_str = "",
+        .pos = 0,
+    }
+    return v
+}
+
+fn valueAddArg(v: *Value, arg: ValueID) void {
+    v.*.args.push(arg)
+}
+
+fn valueNumArgs(v: *Value) int {
+    return v.*.args.len()
+}
+
+fn valueGetArg(v: *Value, i: int) ValueID {
+    return v.*.args.get(i)
+}
+
+fn valueSetArg(v: *Value, i: int, arg: ValueID) void {
+    v.*.args[i] = arg
+}
+
+// ============================================================================
+// Block - A basic block in SSA form
+// ============================================================================
+
+struct Block {
+    id: BlockID,
+    kind: BlockKind,
+
+    // Successors and predecessors
+    succs: List<Edge>,
+    preds: List<Edge>,
+
+    // Values in this block
+    values: List<ValueID>,
+
+    // Control value (branch condition for if blocks)
+    control: ValueID,
+
+    // Auxiliary data
+    aux: int,
+}
+
+fn newBlock(id: BlockID) Block {
+    var b: Block = Block{
+        .id = id,
+        .kind = BlockKind.plain,
+        .succs = new List<Edge>(),
+        .preds = new List<Edge>(),
+        .values = new List<ValueID>(),
+        .control = NULL_VALUE,
+        .aux = 0,
+    }
+    return b
+}
+
+fn blockAddSucc(b: *Block, target: BlockID) int {
+    var idx: int = b.*.succs.len()
+    var edge: Edge = Edge{
+        .block = target,
+        .reverse_idx = 0,
+    }
+    b.*.succs.push(edge)
+    return idx
+}
+
+fn blockAddPred(b: *Block, source: BlockID, reverse_idx: int) void {
+    var edge: Edge = Edge{
+        .block = source,
+        .reverse_idx = reverse_idx,
+    }
+    b.*.preds.push(edge)
+}
+
+fn blockSetControl(b: *Block, ctrl: ValueID) void {
+    b.*.control = ctrl
+}
+
+fn blockNumSuccs(b: *Block) int {
+    return b.*.succs.len()
+}
+
+fn blockNumPreds(b: *Block) int {
+    return b.*.preds.len()
+}
+
+// ============================================================================
+// LocalInfo - Local variable info for codegen
+// ============================================================================
+
+struct LocalInfo {
+    name: string,
+    type_idx: TypeIndex,
+    size: int,
+    offset: int,
+}
+
+// ============================================================================
+// Func - An SSA function
+// ============================================================================
+
+struct Func {
+    name: string,
+    type_idx: TypeIndex,
+    return_type: TypeIndex,
+
+    // All blocks (indexed by BlockID)
+    blocks: List<Block>,
+
+    // All values (indexed by ValueID)
+    values: List<Value>,
+
+    // Entry block
+    entry: BlockID,
+
+    // Number of parameters
+    param_count: int,
+
+    // Total stack frame size
+    frame_size: int,
+
+    // Local variable info
+    locals: List<LocalInfo>,
+
+    // Register allocation results
+    locations: List<Location>,
+
+    // ID allocators (next available ID)
+    next_vid: int,
+    next_bid: int,
+
+    // Cached dominators
+    idom_cache: List<BlockID>,
+    idom_valid: bool,
+}
+
+fn newFunc(name: string, type_idx: TypeIndex, return_type: TypeIndex) Func {
+    var f: Func = Func{
+        .name = name,
+        .type_idx = type_idx,
+        .return_type = return_type,
+        .blocks = new List<Block>(),
+        .values = new List<Value>(),
+        .entry = 0,
+        .param_count = 0,
+        .frame_size = 0,
+        .locals = new List<LocalInfo>(),
+        .locations = new List<Location>(),
+        .next_vid = 0,
+        .next_bid = 0,
+        .idom_cache = new List<BlockID>(),
+        .idom_valid = false,
+    }
+
+    // Create entry block
+    var entry_id: BlockID = funcNewBlock(&f)
+    f.entry = entry_id
+
+    return f
+}
+
+fn funcNewBlock(f: *Func) BlockID {
+    var id: BlockID = f.*.next_bid
+    f.*.next_bid = f.*.next_bid + 1
+
+    var b: Block = newBlock(id)
+    f.*.blocks.push(b)
+
+    // Invalidate cached dominators
+    f.*.idom_valid = false
+
+    return id
+}
+
+fn funcNewValue(f: *Func, op: Op, type_idx: TypeIndex, block: BlockID) ValueID {
+    var id: ValueID = f.*.next_vid
+    f.*.next_vid = f.*.next_vid + 1
+
+    var v: Value = newValue(id, op, type_idx, block)
+    f.*.values.push(v)
+
+    // Add to block's value list
+    var b: Block = f.*.blocks.get(block)
+    b.values.push(id)
+    f.*.blocks[block] = b
+
+    return id
+}
+
+fn funcGetValue(f: *Func, id: ValueID) Value {
+    return f.*.values.get(id)
+}
+
+fn funcSetValue(f: *Func, id: ValueID, v: Value) void {
+    f.*.values[id] = v
+}
+
+fn funcGetBlock(f: *Func, id: BlockID) Block {
+    return f.*.blocks.get(id)
+}
+
+fn funcSetBlock(f: *Func, id: BlockID, b: Block) void {
+    f.*.blocks[id] = b
+}
+
+fn funcAddEdge(f: *Func, src: BlockID, dst: BlockID) void {
+    var src_block: Block = funcGetBlock(f, src)
+    var dst_block: Block = funcGetBlock(f, dst)
+
+    var src_idx: int = src_block.succs.len()
+    var dst_idx: int = dst_block.preds.len()
+
+    // Add successor to src
+    var succ_edge: Edge = Edge{
+        .block = dst,
+        .reverse_idx = dst_idx,
+    }
+    src_block.succs.push(succ_edge)
+    f.*.blocks[src] = src_block
+
+    // Add predecessor to dst
+    var pred_edge: Edge = Edge{
+        .block = src,
+        .reverse_idx = src_idx,
+    }
+    dst_block.preds.push(pred_edge)
+    f.*.blocks[dst] = dst_block
+
+    // Invalidate cached dominators
+    f.*.idom_valid = false
+}
+
+fn funcInvalidateCFG(f: *Func) void {
+    f.*.idom_valid = false
+}
+
+fn funcAddUse(f: *Func, id: ValueID) void {
+    var v: Value = funcGetValue(f, id)
+    v.uses += 1
+    funcSetValue(f, id, v)
+}
+
+fn funcRemoveUse(f: *Func, id: ValueID) void {
+    var v: Value = funcGetValue(f, id)
+    v.uses -= 1
+    funcSetValue(f, id, v)
+}
+
+fn funcNumValues(f: *Func) int {
+    return f.*.next_vid
+}
+
+fn funcNumBlocks(f: *Func) int {
+    return f.*.next_bid
+}
+
+// ============================================================================
+// Dominators (simplified iterative algorithm)
+// ============================================================================
+
+fn funcGetIdom(f: *Func) List<BlockID> {
+    if f.*.idom_valid {
+        return f.*.idom_cache
+    }
+
+    computeDominators(f)
+    f.*.idom_valid = true
+    return f.*.idom_cache
+}
+
+fn computeDominators(f: *Func) void {
+    var n: int = funcNumBlocks(f)
+
+    // Clear idom cache
+    f.*.idom_cache = new List<BlockID>()
+
+    var i: int = 0
+    while i < n {
+        f.*.idom_cache.push(NULL_BLOCK)
+        i += 1
+    }
+
+    // Entry block dominates itself
+    f.*.idom_cache[f.*.entry] = f.*.entry
+
+    // Iterate until fixed point
+    var changed: bool = true
+    while changed {
+        changed = false
+
+        var bid: int = 0
+        while bid < n {
+            if bid == f.*.entry {
+                bid += 1
+                continue
+            }
+
+            var b: Block = funcGetBlock(f, bid)
+            var num_preds: int = b.preds.len()
+
+            if num_preds == 0 {
+                bid += 1
+                continue
+            }
+
+            // Find first processed predecessor
+            var new_idom: int = NULL_BLOCK
+            var pi: int = 0
+            while pi < num_preds {
+                var pred_edge: Edge = b.preds.get(pi)
+                var pred_block: BlockID = pred_edge.block
+                if f.*.idom_cache.get(pred_block) != NULL_BLOCK {
+                    new_idom = pred_block
+                    pi = num_preds  // break
+                }
+                pi += 1
+            }
+
+            if new_idom == NULL_BLOCK {
+                bid += 1
+                continue
+            }
+
+            // Intersect with other predecessors
+            pi = 0
+            while pi < num_preds {
+                var pred_edge: Edge = b.preds.get(pi)
+                var pred_block: BlockID = pred_edge.block
+                if pred_block != new_idom {
+                    if f.*.idom_cache.get(pred_block) != NULL_BLOCK {
+                        new_idom = intersectDom(f, pred_block, new_idom)
+                    }
+                }
+                pi += 1
+            }
+
+            if f.*.idom_cache.get(bid) != new_idom {
+                f.*.idom_cache[bid] = new_idom
+                changed = true
+            }
+
+            bid += 1
+        }
+    }
+}
+
+fn intersectDom(f: *Func, b1: BlockID, b2: BlockID) BlockID {
+    var finger1: BlockID = b1
+    var finger2: BlockID = b2
+
+    while finger1 != finger2 {
+        while finger1 > finger2 {
+            finger1 = f.*.idom_cache.get(finger1)
+        }
+        while finger2 > finger1 {
+            finger2 = f.*.idom_cache.get(finger2)
+        }
+    }
+
+    return finger1
+}
+
+// ============================================================================
+// Passes
+// ============================================================================
+
+// Check if an operation can be removed (not a side-effecting op)
+fn isRemovable(op: Op) bool {
+    if op == Op.ret {
+        return false
+    }
+    if op == Op.jump {
+        return false
+    }
+    if op == Op.branch {
+        return false
+    }
+    if op == Op.store {
+        return false
+    }
+    if op == Op.call {
+        return false
+    }
+    if op == Op.ptr_store {
+        return false
+    }
+    if op == Op.ptr_field_store {
+        return false
+    }
+    if op == Op.map_set {
+        return false
+    }
+    if op == Op.map_free {
+        return false
+    }
+    if op == Op.list_push {
+        return false
+    }
+    if op == Op.list_set {
+        return false
+    }
+    if op == Op.list_free {
+        return false
+    }
+    return true
+}
+
+// Dead code elimination
+fn deadcode(f: *Func) void {
+    var changed: bool = true
+
+    while changed {
+        changed = false
+
+        var vid: int = 0
+        var num_vals: int = funcNumValues(f)
+
+        while vid < num_vals {
+            var v: Value = funcGetValue(f, vid)
+
+            if v.uses == 0 {
+                if isRemovable(v.op) {
+                    // Decrement uses of our args
+                    var ai: int = 0
+                    var num_args: int = v.args.len()
+                    while ai < num_args {
+                        funcRemoveUse(f, v.args.get(ai))
+                        ai += 1
+                    }
+
+                    // Mark as dead
+                    v.op = Op.op_unreachable
+                    funcSetValue(f, vid, v)
+                    changed = true
+                }
+            }
+
+            vid += 1
+        }
+    }
+}
+
+// Phi elimination - convert trivial phis to copies
+fn phielimValue(v: *Value) bool {
+    if v.*.op != Op.phi {
+        return false
+    }
+
+    var num_args: int = v.*.args.len()
+    var same: int = NULL_VALUE
+
+    var i: int = 0
+    while i < num_args {
+        var arg: ValueID = v.*.args.get(i)
+
+        if arg == v.*.id {
+            // Ignore self-loops
+            i += 1
+            continue
+        }
+
+        if same == NULL_VALUE {
+            same = arg
+        } else {
+            if arg != same {
+                // Different values - not trivial
+                return false
+            }
+        }
+
+        i += 1
+    }
+
+    if same != NULL_VALUE {
+        // Convert phi to copy
+        v.*.op = Op.copy
+
+        // Clear args and add single source
+        v.*.args = new List<ValueID>()
+        v.*.args.push(same)
+
+        return true
+    }
+
+    return false
+}
+
+fn phielim(f: *Func) void {
+    var changed: bool = true
+
+    while changed {
+        changed = false
+
+        var vid: int = 0
+        var num_vals: int = funcNumValues(f)
+
+        while vid < num_vals {
+            var v: Value = funcGetValue(f, vid)
+            if v.op == Op.phi {
+                if phielimValue(&v) {
+                    funcSetValue(f, vid, v)
+                    changed = true
+                }
+            }
+            vid += 1
+        }
+    }
+}
+
+// Follow copy chains to find the original source
+fn followCopies(f: *Func, id: ValueID) ValueID {
+    var current: ValueID = id
+
+    var done: bool = false
+    while not done {
+        var v: Value = funcGetValue(f, current)
+
+        if v.op != Op.copy {
+            done = true
+        } else {
+            if v.args.len() != 1 {
+                done = true
+            } else {
+                current = v.args.get(0)
+            }
+        }
+    }
+
+    return current
+}
+
+// Copy elimination - propagate copies to eliminate chains
+fn copyelim(f: *Func) void {
+    var vid: int = 0
+    var num_vals: int = funcNumValues(f)
+
+    while vid < num_vals {
+        var v: Value = funcGetValue(f, vid)
+        var num_args: int = v.args.len()
+
+        var ai: int = 0
+        while ai < num_args {
+            var arg: ValueID = v.args.get(ai)
+            var resolved: ValueID = followCopies(f, arg)
+
+            if resolved != arg {
+                v.args[ai] = resolved
+            }
+
+            ai += 1
+        }
+
+        funcSetValue(f, vid, v)
+        vid += 1
+    }
+}
+
+// ============================================================================
+// Test
+// ============================================================================
+
+fn main() int {
+    // Test Func creation
+    var f: Func = newFunc("test", 0, 0)
+
+    if f.entry != 0 {
+        return 1
+    }
+
+    if funcNumBlocks(&f) != 1 {
+        return 2
+    }
+
+    // Test value creation
+    var v1: ValueID = funcNewValue(&f, Op.const_int, 1, f.entry)
+    var v2: ValueID = funcNewValue(&f, Op.const_int, 1, f.entry)
+
+    if v1 != 0 {
+        return 3
+    }
+
+    if v2 != 1 {
+        return 4
+    }
+
+    if funcNumValues(&f) != 2 {
+        return 5
+    }
+
+    // Test block creation
+    var b2: BlockID = funcNewBlock(&f)
+
+    if b2 != 1 {
+        return 6
+    }
+
+    if funcNumBlocks(&f) != 2 {
+        return 7
+    }
+
+    // Test edge addition
+    funcAddEdge(&f, f.entry, b2)
+
+    var entry_block: Block = funcGetBlock(&f, f.entry)
+    var block2: Block = funcGetBlock(&f, b2)
+
+    if entry_block.succs.len() != 1 {
+        return 8
+    }
+
+    if block2.preds.len() != 1 {
+        return 9
+    }
+
+    // Test value args
+    var v3: ValueID = funcNewValue(&f, Op.add, 1, f.entry)
+    var val3: Value = funcGetValue(&f, v3)
+
+    valueAddArg(&val3, v1)
+    valueAddArg(&val3, v2)
+    funcSetValue(&f, v3, val3)
+
+    // Re-read to verify
+    val3 = funcGetValue(&f, v3)
+
+    if val3.args.len() != 2 {
+        return 10
+    }
+
+    if val3.args.get(0) != v1 {
+        return 11
+    }
+
+    if val3.args.get(1) != v2 {
+        return 12
+    }
+
+    // Test phi elimination
+    var phi_id: ValueID = funcNewValue(&f, Op.phi, 1, f.entry)
+    var phi_val: Value = funcGetValue(&f, phi_id)
+
+    // Trivial phi: phi(v1, v1) -> copy(v1)
+    valueAddArg(&phi_val, v1)
+    valueAddArg(&phi_val, v1)
+    funcSetValue(&f, phi_id, phi_val)
+
+    phielim(&f)
+
+    var phi_after: Value = funcGetValue(&f, phi_id)
+    if phi_after.op != Op.copy {
+        return 13
+    }
+
+    // Test Location union
+    var loc_reg: Location = Location.reg(5)
+    if not locationIsReg(loc_reg) {
+        return 14
+    }
+
+    if locationGetReg(loc_reg) != 5 {
+        return 15
+    }
+
+    var loc_stack: Location = Location.stack(0 - 16)
+    if locationIsReg(loc_stack) {
+        return 16
+    }
+
+    if locationGetStack(loc_stack) != 0 - 16 {
+        return 17
+    }
+
+    // Test dominators
+    var b3: BlockID = funcNewBlock(&f)
+    funcAddEdge(&f, f.entry, b3)
+
+    var idom: List<BlockID> = funcGetIdom(&f)
+
+    // Entry dominates itself
+    if idom.get(f.entry) != f.entry {
+        return 18
+    }
+
+    // Entry dominates b2 and b3
+    if idom.get(b2) != f.entry {
+        return 19
+    }
+
+    if idom.get(b3) != f.entry {
+        return 20
+    }
+
+    // Test list indexed assignment
+    var nums: List<int> = new List<int>()
+    nums.push(10)
+    nums.push(20)
+    nums.push(30)
+
+    nums[0] = 100
+    nums[1] = 200
+
+    if nums.get(0) != 100 {
+        return 21
+    }
+
+    if nums.get(1) != 200 {
+        return 22
+    }
+
+    if nums.get(2) != 30 {
+        return 23
+    }
+
+    return 42
+}

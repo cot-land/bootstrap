@@ -1,0 +1,39 @@
+// Test list indexed assignment: list[i] = value
+
+fn main() int {
+    // Create a list and push some values
+    var list: List<int> = new List<int>()
+    list.push(10)
+    list.push(20)
+    list.push(30)
+
+    // Verify initial values
+    if list.get(0) != 10 { return 1 }
+    if list.get(1) != 20 { return 2 }
+    if list.get(2) != 30 { return 3 }
+
+    // Test indexed assignment
+    list[0] = 100
+    list[1] = 200
+    list[2] = 300
+
+    // Verify updated values
+    if list.get(0) != 100 { return 4 }
+    if list.get(1) != 200 { return 5 }
+    if list.get(2) != 300 { return 6 }
+
+    // Test assignment with computed index
+    var idx: int = 1
+    list[idx] = 999
+
+    if list.get(1) != 999 { return 7 }
+
+    // Verify other elements unchanged
+    if list.get(0) != 100 { return 8 }
+    if list.get(2) != 300 { return 9 }
+
+    // Test length unchanged
+    if list.len() != 3 { return 10 }
+
+    return 42
+}

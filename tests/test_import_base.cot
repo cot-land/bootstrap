@@ -1,0 +1,6 @@
+// Base helper - imported by test_import_nested_helper.cot
+fn base_multiply(a: int, b: int) int {
+    return a * b
+}
+
+const BASE_VALUE: int = 7

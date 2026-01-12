@@ -1,0 +1,8 @@
+// Nested import - imports test_import_base.cot
+import "test_import_base.cot"
+
+fn nested_compute(x: int) int {
+    return base_multiply(x, BASE_VALUE)
+}
+
+const NESTED_VALUE: int = 42

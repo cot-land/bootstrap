@@ -1,0 +1,640 @@
+// Liveness Analysis for SSA
+//
+// Computes per-value liveness information in a single backward pass.
+// Used by codegen to:
+// 1. Free registers when operands die (auto-free dead operands)
+// 2. Choose spill candidates (farthest-next-use heuristic)
+// 3. Avoid unnecessary caller-save spills (only spill live values)
+//
+// Algorithm: Single backward pass over all values
+// - Assign instruction indices in forward order
+// - Walk backward, tracking first (last in execution) use of each value
+// - Mark operand as "dying" if this is its last use
+//
+// Complexity: O(V) time, O(V) space where V = number of values
+
+// ============================================================================
+// Type Aliases (same as ssa_boot.cot)
+// ============================================================================
+
+type ValueID = int
+type BlockID = int
+type TypeIndex = int
+
+// Null value sentinel
+fn nullValue() ValueID {
+    return 0 - 1
+}
+
+// ============================================================================
+// Minimal SSA Types for Liveness (subset of ssa_boot.cot)
+// ============================================================================
+
+// SSA operation enum (minimal subset for testing)
+enum Op: int {
+    invalid,
+    const_int,
+    add,
+    ret,
+}
+
+// SSA Value
+struct Value {
+    id: ValueID,
+    op: Op,
+    type_idx: TypeIndex,
+    block: BlockID,
+    args: List<ValueID>,
+    data: int,
+}
+
+fn newValue(id: ValueID, op: Op, type_idx: TypeIndex, block: BlockID) Value {
+    return Value{
+        .id = id,
+        .op = op,
+        .type_idx = type_idx,
+        .block = block,
+        .args = new List<ValueID>(),
+        .data = 0,
+    }
+}
+
+// Block kind
+enum BlockKind: int {
+    plain,
+    if_block,
+    return_block,
+}
+
+// SSA Block
+struct Block {
+    id: BlockID,
+    preds: List<BlockID>,
+    succs: List<BlockID>,
+    values: List<ValueID>,
+    kind: BlockKind,
+    control: ValueID,
+}
+
+fn newBlock(id: BlockID) Block {
+    return Block{
+        .id = id,
+        .preds = new List<BlockID>(),
+        .succs = new List<BlockID>(),
+        .values = new List<ValueID>(),
+        .kind = BlockKind.plain,
+        .control = nullValue(),
+    }
+}
+
+// SSA Function
+struct Func {
+    name: string,
+    type_idx: TypeIndex,
+    return_type: TypeIndex,
+    blocks: List<Block>,
+    values: List<Value>,
+    entry: BlockID,
+    next_vid: int,
+    next_bid: int,
+}
+
+fn newFunc(name: string, type_idx: TypeIndex, return_type: TypeIndex) Func {
+    var f: Func = Func{
+        .name = name,
+        .type_idx = type_idx,
+        .return_type = return_type,
+        .blocks = new List<Block>(),
+        .values = new List<Value>(),
+        .entry = 0,
+        .next_vid = 0,
+        .next_bid = 0,
+    }
+
+    // Create entry block
+    var entry_id: BlockID = funcNewBlock(&f)
+    f.entry = entry_id
+
+    return f
+}
+
+fn funcNewBlock(f: *Func) BlockID {
+    var id: BlockID = f.*.next_bid
+    f.*.next_bid = f.*.next_bid + 1
+
+    var b: Block = newBlock(id)
+    f.*.blocks.push(b)
+
+    return id
+}
+
+fn funcNewValue(f: *Func, op: Op, type_idx: TypeIndex, block: BlockID) ValueID {
+    var id: ValueID = f.*.next_vid
+    f.*.next_vid = f.*.next_vid + 1
+
+    var v: Value = newValue(id, op, type_idx, block)
+    f.*.values.push(v)
+
+    // Add to block's value list
+    var b: Block = f.*.blocks.get(block)
+    b.values.push(id)
+    f.*.blocks[block] = b
+
+    return id
+}
+
+fn funcNumValues(f: *Func) int {
+    return f.*.next_vid
+}
+
+fn funcNumBlocks(f: *Func) int {
+    return f.*.next_bid
+}
+
+fn funcGetBlock(f: *Func, id: BlockID) Block {
+    return f.*.blocks.get(id)
+}
+
+fn funcGetValue(f: *Func, id: ValueID) Value {
+    return f.*.values.get(id)
+}
+
+fn funcSetValue(f: *Func, id: ValueID, v: Value) void {
+    f.*.values[id] = v
+}
+
+// ============================================================================
+// Liveness Analysis
+// ============================================================================
+
+// Liveness information for a function.
+// All lists are indexed by ValueID.
+struct LivenessInfo {
+    // Instruction index of last use for each value.
+    // 0 means the value is never used (dead).
+    last_use: List<int>,
+
+    // Bitmask of operands that die at each value.
+    // Bit i = 1 means args()[i] dies at this instruction.
+    // Supports up to 8 operands per instruction.
+    deaths: List<int>,
+
+    // Instruction index for each value (when it's defined).
+    // Used to compute distance-to-next-use.
+    inst_index: List<int>,
+}
+
+// Create a new LivenessInfo with capacity for num_values
+fn newLivenessInfo(num_values: int) LivenessInfo {
+    var info: LivenessInfo = LivenessInfo{
+        .last_use = new List<int>(),
+        .deaths = new List<int>(),
+        .inst_index = new List<int>(),
+    }
+
+    // Initialize all to zero
+    var i: int = 0
+    while i < num_values {
+        info.last_use.push(0)
+        info.deaths.push(0)
+        info.inst_index.push(0)
+        i = i + 1
+    }
+
+    return info
+}
+
+// Check if operand i dies at this value.
+// O(1) lookup.
+fn operandDies(info: *LivenessInfo, value_id: ValueID, operand_idx: int) bool {
+    if value_id < 0 {
+        return false
+    }
+    if value_id >= info.*.deaths.len() {
+        return false
+    }
+    var deaths_mask: int = info.*.deaths.get(value_id)
+    var bit: int = 1
+    var shift: int = 0
+    while shift < operand_idx {
+        bit = bit * 2
+        shift = shift + 1
+    }
+    var masked: int = deaths_mask / bit
+    // Check if lowest bit is set
+    var half: int = masked / 2
+    if half * 2 != masked {
+        return true
+    }
+    return false
+}
+
+// Get distance from current instruction to next use of a value.
+// Used for spill candidate selection (farthest-next-use heuristic).
+// Returns 0 if value is dead or already past its last use.
+fn distanceToNextUse(info: *LivenessInfo, value_id: ValueID, current_inst: int) int {
+    if value_id < 0 {
+        return 0
+    }
+    if value_id >= info.*.last_use.len() {
+        return 0
+    }
+    var last: int = info.*.last_use.get(value_id)
+    if last == 0 {
+        return 0
+    }
+    if last <= current_inst {
+        return 0
+    }
+    return last - current_inst
+}
+
+// Check if a value is live at a given instruction index.
+// A value is live if: defined before current AND last_use >= current.
+fn isLiveAt(info: *LivenessInfo, value_id: ValueID, current_inst: int) bool {
+    if value_id < 0 {
+        return false
+    }
+    if value_id >= info.*.last_use.len() {
+        return false
+    }
+    var defined_at: int = info.*.inst_index.get(value_id)
+    var last: int = info.*.last_use.get(value_id)
+    if defined_at <= current_inst and last >= current_inst {
+        return true
+    }
+    return false
+}
+
+// Check if a value is used after a given instruction.
+// Useful for determining if a value needs to survive a function call.
+fn isUsedAfter(info: *LivenessInfo, value_id: ValueID, inst: int) bool {
+    if value_id < 0 {
+        return false
+    }
+    if value_id >= info.*.last_use.len() {
+        return false
+    }
+    var last: int = info.*.last_use.get(value_id)
+    return last > inst
+}
+
+// Set last_use for a value
+fn setLastUse(info: *LivenessInfo, value_id: ValueID, value: int) void {
+    if value_id >= 0 and value_id < info.*.last_use.len() {
+        info.*.last_use[value_id] = value
+    }
+}
+
+// Set deaths mask for a value
+fn setDeaths(info: *LivenessInfo, value_id: ValueID, value: int) void {
+    if value_id >= 0 and value_id < info.*.deaths.len() {
+        info.*.deaths[value_id] = value
+    }
+}
+
+// Set inst_index for a value
+fn setInstIndex(info: *LivenessInfo, value_id: ValueID, value: int) void {
+    if value_id >= 0 and value_id < info.*.inst_index.len() {
+        info.*.inst_index[value_id] = value
+    }
+}
+
+// Get last_use for a value
+fn getLastUse(info: *LivenessInfo, value_id: ValueID) int {
+    if value_id >= 0 and value_id < info.*.last_use.len() {
+        return info.*.last_use.get(value_id)
+    }
+    return 0
+}
+
+// Get deaths mask for a value
+fn getDeaths(info: *LivenessInfo, value_id: ValueID) int {
+    if value_id >= 0 and value_id < info.*.deaths.len() {
+        return info.*.deaths.get(value_id)
+    }
+    return 0
+}
+
+// Get inst_index for a value
+fn getInstIndex(info: *LivenessInfo, value_id: ValueID) int {
+    if value_id >= 0 and value_id < info.*.inst_index.len() {
+        return info.*.inst_index.get(value_id)
+    }
+    return 0
+}
+
+// Compute liveness information for a function.
+// Single backward pass - O(V) time where V = number of values.
+fn computeLiveness(func: *Func) LivenessInfo {
+    var num_values: int = funcNumValues(func)
+
+    var info: LivenessInfo = newLivenessInfo(num_values)
+
+    // Pass 1: Assign instruction indices (forward order)
+    var inst_counter: int = 1  // Start at 1 so 0 means "never used"
+    var num_blocks: int = funcNumBlocks(func)
+
+    var block_idx: int = 0
+    while block_idx < num_blocks {
+        var block: Block = funcGetBlock(func, block_idx)
+        var num_vals: int = block.values.len()
+
+        var value_idx: int = 0
+        while value_idx < num_vals {
+            var value_id: ValueID = block.values.get(value_idx)
+            if value_id >= 0 and value_id < num_values {
+                setInstIndex(&info, value_id, inst_counter)
+            }
+            inst_counter = inst_counter + 1
+            value_idx = value_idx + 1
+        }
+        block_idx = block_idx + 1
+    }
+
+    // Pass 2: Compute last uses (backward order)
+    // We walk backward so the first time we see a use is actually the last use
+    var back_block_idx: int = num_blocks - 1
+    while back_block_idx >= 0 {
+        var block: Block = funcGetBlock(func, back_block_idx)
+
+        // Also check block control value (branch condition)
+        var control: ValueID = block.control
+        if control != nullValue() and control >= 0 and control < num_values {
+            var last_use_ctrl: int = getLastUse(&info, control)
+            if last_use_ctrl == 0 {
+                // Control value's last use is at the end of the block
+                // Use a high instruction index to indicate it's used at block terminator
+                var block_end_inst: int = inst_counter
+                var num_vals: int = block.values.len()
+                if num_vals > 0 {
+                    var last_val_id: ValueID = block.values.get(num_vals - 1)
+                    block_end_inst = getInstIndex(&info, last_val_id) + 1
+                }
+                setLastUse(&info, control, block_end_inst)
+            }
+        }
+
+        var num_vals: int = block.values.len()
+        var back_val_idx: int = num_vals - 1
+        while back_val_idx >= 0 {
+            var value_id: ValueID = block.values.get(back_val_idx)
+            if value_id >= 0 and value_id < num_values {
+                var value: Value = funcGetValue(func, value_id)
+                var current_inst: int = getInstIndex(&info, value_id)
+
+                // For each operand, check if this is its last use
+                var num_args: int = value.args.len()
+                var arg_idx: int = 0
+                while arg_idx < num_args {
+                    var arg_id: ValueID = value.args.get(arg_idx)
+                    if arg_id != nullValue() and arg_id >= 0 and arg_id < num_values {
+                        var arg_last_use: int = getLastUse(&info, arg_id)
+                        if arg_last_use == 0 {
+                            // First time seeing this arg (in backward order) = last use
+                            setLastUse(&info, arg_id, current_inst)
+                            // Mark this operand as dying at this instruction
+                            var deaths_mask: int = getDeaths(&info, value_id)
+                            var bit: int = 1
+                            var shift: int = 0
+                            while shift < arg_idx {
+                                bit = bit * 2
+                                shift = shift + 1
+                            }
+                            setDeaths(&info, value_id, deaths_mask + bit)
+                        }
+                    }
+                    arg_idx = arg_idx + 1
+                }
+            }
+            back_val_idx = back_val_idx - 1
+        }
+        back_block_idx = back_block_idx - 1
+    }
+
+    return info
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn main() int {
+    // Test 1: newLivenessInfo creates properly sized lists
+    var info1: LivenessInfo = newLivenessInfo(5)
+    if info1.last_use.len() != 5 {
+        return 1
+    }
+    if info1.deaths.len() != 5 {
+        return 2
+    }
+    if info1.inst_index.len() != 5 {
+        return 3
+    }
+
+    // Test 2: Initial values are zero
+    if info1.last_use.get(0) != 0 {
+        return 4
+    }
+    if info1.deaths.get(0) != 0 {
+        return 5
+    }
+    if info1.inst_index.get(0) != 0 {
+        return 6
+    }
+
+    // Test 3: setLastUse/getLastUse
+    setLastUse(&info1, 2, 100)
+    if getLastUse(&info1, 2) != 100 {
+        return 7
+    }
+
+    // Test 4: setInstIndex/getInstIndex
+    setInstIndex(&info1, 3, 50)
+    if getInstIndex(&info1, 3) != 50 {
+        return 8
+    }
+
+    // Test 5: setDeaths/getDeaths
+    setDeaths(&info1, 1, 5)  // bits 0 and 2 set
+    if getDeaths(&info1, 1) != 5 {
+        return 9
+    }
+
+    // Test 6: operandDies with bit mask
+    // deaths[1] = 5 = binary 101 = bits 0 and 2 set
+    if not operandDies(&info1, 1, 0) {
+        return 10  // bit 0 should be set
+    }
+    if operandDies(&info1, 1, 1) {
+        return 11  // bit 1 should not be set
+    }
+    if not operandDies(&info1, 1, 2) {
+        return 12  // bit 2 should be set
+    }
+
+    // Test 7: distanceToNextUse
+    setLastUse(&info1, 0, 10)
+    var dist: int = distanceToNextUse(&info1, 0, 5)
+    if dist != 5 {
+        return 13
+    }
+
+    // Distance is 0 if past last use
+    dist = distanceToNextUse(&info1, 0, 15)
+    if dist != 0 {
+        return 14
+    }
+
+    // Distance is 0 for unused value
+    if distanceToNextUse(&info1, 4, 5) != 0 {
+        return 15
+    }
+
+    // Test 8: isLiveAt
+    setInstIndex(&info1, 0, 3)
+    setLastUse(&info1, 0, 10)
+    // Value defined at 3, last use at 10
+    if not isLiveAt(&info1, 0, 3) {
+        return 16
+    }
+    if not isLiveAt(&info1, 0, 7) {
+        return 17
+    }
+    if not isLiveAt(&info1, 0, 10) {
+        return 18
+    }
+    if isLiveAt(&info1, 0, 11) {
+        return 19
+    }
+    if isLiveAt(&info1, 0, 2) {
+        return 20  // before definition
+    }
+
+    // Test 9: isUsedAfter
+    if not isUsedAfter(&info1, 0, 5) {
+        return 21  // used at 10, which is after 5
+    }
+    if isUsedAfter(&info1, 0, 10) {
+        return 22  // not used after 10
+    }
+    if isUsedAfter(&info1, 0, 15) {
+        return 23
+    }
+
+    // Test 10: computeLiveness on a simple function
+    // Create: v0 = const, v1 = const, v2 = add v0 v1, ret v2
+    var f: Func = newFunc("test_liveness", 1, 1)
+
+    var v0: ValueID = funcNewValue(&f, Op.const_int, 1, f.entry)
+    var v1: ValueID = funcNewValue(&f, Op.const_int, 1, f.entry)
+    var v2: ValueID = funcNewValue(&f, Op.add, 1, f.entry)
+    var v3: ValueID = funcNewValue(&f, Op.ret, 0, f.entry)
+
+    // Set args for add: v2 = add v0, v1
+    var add_val: Value = funcGetValue(&f, v2)
+    add_val.args.push(v0)
+    add_val.args.push(v1)
+    funcSetValue(&f, v2, add_val)
+
+    // Set args for ret: ret v2
+    var ret_val: Value = funcGetValue(&f, v3)
+    ret_val.args.push(v2)
+    funcSetValue(&f, v3, ret_val)
+
+    var live_info: LivenessInfo = computeLiveness(&f)
+
+    // v0's last use should be at v2 (the add)
+    var v0_last: int = getLastUse(&live_info, v0)
+    if v0_last == 0 {
+        return 24  // v0 should be used
+    }
+
+    // v0 dies at v2
+    if not operandDies(&live_info, v2, 0) {
+        return 25
+    }
+
+    // v1's last use should be at v2 (the add)
+    var v1_last: int = getLastUse(&live_info, v1)
+    if v1_last == 0 {
+        return 26  // v1 should be used
+    }
+
+    // v1 dies at v2
+    if not operandDies(&live_info, v2, 1) {
+        return 27
+    }
+
+    // v2's last use should be at v3 (the ret)
+    var v2_last: int = getLastUse(&live_info, v2)
+    if v2_last == 0 {
+        return 28  // v2 should be used
+    }
+
+    // v2 dies at v3
+    if not operandDies(&live_info, v3, 0) {
+        return 29
+    }
+
+    // Test 11: Value used in multiple instructions
+    // v0 used in both v2 and v3
+    var f2: Func = newFunc("test_multi_use", 1, 1)
+
+    var u0: ValueID = funcNewValue(&f2, Op.const_int, 1, f2.entry)
+    var u1: ValueID = funcNewValue(&f2, Op.const_int, 1, f2.entry)
+    var u2: ValueID = funcNewValue(&f2, Op.add, 1, f2.entry)
+    var u3: ValueID = funcNewValue(&f2, Op.add, 1, f2.entry)
+    var u4: ValueID = funcNewValue(&f2, Op.ret, 0, f2.entry)
+
+    // u2 = add u0, u1
+    var val2: Value = funcGetValue(&f2, u2)
+    val2.args.push(u0)
+    val2.args.push(u1)
+    funcSetValue(&f2, u2, val2)
+
+    // u3 = add u0, u2 (u0 used again)
+    var val3: Value = funcGetValue(&f2, u3)
+    val3.args.push(u0)
+    val3.args.push(u2)
+    funcSetValue(&f2, u3, val3)
+
+    // ret u3
+    var val4: Value = funcGetValue(&f2, u4)
+    val4.args.push(u3)
+    funcSetValue(&f2, u4, val4)
+
+    var live2: LivenessInfo = computeLiveness(&f2)
+
+    // u0's last use should be at u3 (not u2)
+    var u0_inst: int = getInstIndex(&live2, u0)
+    var u2_inst: int = getInstIndex(&live2, u2)
+    var u3_inst: int = getInstIndex(&live2, u3)
+    var u0_last_use: int = getLastUse(&live2, u0)
+
+    if u0_last_use != u3_inst {
+        return 30  // u0 should die at u3, not u2
+    }
+
+    // u0 should NOT die at u2 (it's used later)
+    if operandDies(&live2, u2, 0) {
+        return 31
+    }
+
+    // u0 SHOULD die at u3
+    if not operandDies(&live2, u3, 0) {
+        return 32
+    }
+
+    // u1 dies at u2 (only use)
+    if not operandDies(&live2, u2, 1) {
+        return 33
+    }
+
+    // u2 dies at u3 (only use)
+    if not operandDies(&live2, u3, 1) {
+        return 34
+    }
+
+    return 42
+}

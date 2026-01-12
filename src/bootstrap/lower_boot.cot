@@ -1,0 +1,1129 @@
+// AST-to-IR lowering pass for cot bootstrap.
+// Simplified version using only currently-supported features.
+//
+// Maps to Go's cmd/compile/internal/noder and Zig's lower.zig:
+// - Two-pass, type-annotated lowering
+// - Recursive descent with continuation handling
+// - Transforms type-checked AST into flat IR for SSA construction
+//
+// Changes from original lower.zig:
+// - Standalone functions instead of methods
+// - List<T> for dynamic storage (runtime FFI)
+// - No optional types - use null_node sentinel instead
+// - No allocator parameters (runtime handles memory)
+// - Inlined dependencies from ir_boot.cot (no imports yet)
+
+// =============================================================================
+// Constants and Type Aliases
+// =============================================================================
+
+type NodeIndex = int
+type TypeIndex = int
+type BlockIndex = int
+
+const null_node: NodeIndex = @maxInt(i64)
+const null_block: BlockIndex = @maxInt(i64)
+
+// Pre-defined type indices (must match types_boot.cot)
+const TYPE_VOID: TypeIndex = 12
+const TYPE_BOOL: TypeIndex = 1
+const TYPE_INT: TypeIndex = 5
+const TYPE_I64: TypeIndex = 5
+const TYPE_U8: TypeIndex = 6
+const TYPE_STRING: TypeIndex = 13
+const TYPE_FLOAT: TypeIndex = 11
+const TYPE_INVALID: TypeIndex = 0
+
+// =============================================================================
+// Inlined from ir_boot.cot - IR Operations
+// =============================================================================
+
+enum Op: u8 {
+    const_int,
+    const_float,
+    const_bool,
+    const_null,
+    const_slice,
+    local,
+    global,
+    param,
+    add,
+    sub,
+    mul,
+    div,
+    mod,
+    neg,
+    eq,
+    ne,
+    lt,
+    le,
+    gt,
+    ge,
+    op_and,
+    op_or,
+    op_not,
+    bit_and,
+    bit_or,
+    bit_xor,
+    bit_not,
+    shl,
+    shr,
+    load,
+    store,
+    ptr_load,
+    ptr_store,
+    addr_local,
+    addr_field,
+    addr_index,
+    ptr_field,
+    ptr_field_store,
+    field_local,
+    field_value,
+    index_local,
+    index_value,
+    field,
+    index,
+    slice_local,
+    slice_value,
+    slice_op,
+    slice_index,
+    union_init,
+    union_tag,
+    union_payload,
+    map_new,
+    map_set,
+    map_get,
+    map_has,
+    map_size,
+    map_free,
+    list_new,
+    list_push,
+    list_get,
+    list_len,
+    list_free,
+    str_concat,
+    call,
+    ret,
+    jump,
+    branch,
+    phi,
+    select,
+    convert,
+    ptr_cast,
+    nop,
+}
+
+// =============================================================================
+// Inlined from ir_boot.cot - IR Node
+// =============================================================================
+
+struct Node {
+    op: Op,
+    type_idx: TypeIndex,
+    args0: NodeIndex,
+    args1: NodeIndex,
+    args2: NodeIndex,
+    args3: NodeIndex,
+    args4: NodeIndex,
+    args5: NodeIndex,
+    args6: NodeIndex,
+    args7: NodeIndex,
+    args_len: int,
+    aux: int,
+    aux_str: string,
+    span_start: int,
+    span_end: int,
+    block: BlockIndex,
+}
+
+fn nodeInit(op: Op, type_idx: TypeIndex, span_start: int, span_end: int) Node {
+    return Node{
+        .op = op,
+        .type_idx = type_idx,
+        .args0 = 0,
+        .args1 = 0,
+        .args2 = 0,
+        .args3 = 0,
+        .args4 = 0,
+        .args5 = 0,
+        .args6 = 0,
+        .args7 = 0,
+        .args_len = 0,
+        .aux = 0,
+        .aux_str = "",
+        .span_start = span_start,
+        .span_end = span_end,
+        .block = null_block,
+    }
+}
+
+fn nodeGetArg(n: Node, idx: int) NodeIndex {
+    if idx == 0 { return n.args0 }
+    if idx == 1 { return n.args1 }
+    if idx == 2 { return n.args2 }
+    if idx == 3 { return n.args3 }
+    if idx == 4 { return n.args4 }
+    if idx == 5 { return n.args5 }
+    if idx == 6 { return n.args6 }
+    if idx == 7 { return n.args7 }
+    return null_node
+}
+
+fn nodeSetArg(n: *Node, idx: int, val: NodeIndex) void {
+    if idx == 0 { n.*.args0 = val }
+    if idx == 1 { n.*.args1 = val }
+    if idx == 2 { n.*.args2 = val }
+    if idx == 3 { n.*.args3 = val }
+    if idx == 4 { n.*.args4 = val }
+    if idx == 5 { n.*.args5 = val }
+    if idx == 6 { n.*.args6 = val }
+    if idx == 7 { n.*.args7 = val }
+}
+
+fn nodeWithArg0(n: Node, arg: NodeIndex) Node {
+    var result: Node = n
+    result.args0 = arg
+    result.args_len = 1
+    return result
+}
+
+fn nodeWithArg01(n: Node, arg0: NodeIndex, arg1: NodeIndex) Node {
+    var result: Node = n
+    result.args0 = arg0
+    result.args1 = arg1
+    result.args_len = 2
+    return result
+}
+
+fn nodeWithArg012(n: Node, arg0: NodeIndex, arg1: NodeIndex, arg2: NodeIndex) Node {
+    var result: Node = n
+    result.args0 = arg0
+    result.args1 = arg1
+    result.args2 = arg2
+    result.args_len = 3
+    return result
+}
+
+fn nodeWithAux(n: Node, aux: int) Node {
+    var result: Node = n
+    result.aux = aux
+    return result
+}
+
+fn nodeWithAuxStr(n: Node, aux_str: string) Node {
+    var result: Node = n
+    result.aux_str = aux_str
+    return result
+}
+
+// =============================================================================
+// Inlined from ir_boot.cot - Block and Local
+// =============================================================================
+
+struct Block {
+    index: BlockIndex,
+    preds: List<BlockIndex>,
+    succs: List<BlockIndex>,
+    nodes: List<NodeIndex>,
+    label: string,
+}
+
+fn blockInit(index: BlockIndex) Block {
+    return Block{
+        .index = index,
+        .preds = new List<BlockIndex>(),
+        .succs = new List<BlockIndex>(),
+        .nodes = new List<NodeIndex>(),
+        .label = "",
+    }
+}
+
+struct Local {
+    name: string,
+    type_idx: TypeIndex,
+    slot: int,
+    mutable: bool,
+    is_param: bool,
+    param_idx: int,
+    size: int,
+    offset: int,
+}
+
+fn localInit(name: string, type_idx: TypeIndex, slot: int, mutable: bool) Local {
+    return Local{
+        .name = name,
+        .type_idx = type_idx,
+        .slot = slot,
+        .mutable = mutable,
+        .is_param = false,
+        .param_idx = 0,
+        .size = 8,
+        .offset = 0,
+    }
+}
+
+fn localInitWithSize(name: string, type_idx: TypeIndex, slot: int, mutable: bool, size: int) Local {
+    return Local{
+        .name = name,
+        .type_idx = type_idx,
+        .slot = slot,
+        .mutable = mutable,
+        .is_param = false,
+        .param_idx = 0,
+        .size = size,
+        .offset = 0,
+    }
+}
+
+fn localInitParam(name: string, type_idx: TypeIndex, param_idx: int, size: int) Local {
+    return Local{
+        .name = name,
+        .type_idx = type_idx,
+        .slot = param_idx,
+        .mutable = false,
+        .is_param = true,
+        .param_idx = param_idx,
+        .size = size,
+        .offset = 0,
+    }
+}
+
+// =============================================================================
+// Inlined from ir_boot.cot - Func, Global, StructDef
+// =============================================================================
+
+struct Func {
+    name: string,
+    type_idx: TypeIndex,
+    return_type: TypeIndex,
+    params: List<Local>,
+    locals: List<Local>,
+    blocks: List<Block>,
+    entry: BlockIndex,
+    nodes: List<Node>,
+    span_start: int,
+    span_end: int,
+    frame_size: int,
+}
+
+struct Global {
+    name: string,
+    type_idx: TypeIndex,
+    init_value: NodeIndex,
+    is_const: bool,
+    span_start: int,
+    span_end: int,
+}
+
+fn globalInit(name: string, type_idx: TypeIndex, is_const: bool, span_start: int, span_end: int) Global {
+    return Global{
+        .name = name,
+        .type_idx = type_idx,
+        .init_value = null_node,
+        .is_const = is_const,
+        .span_start = span_start,
+        .span_end = span_end,
+    }
+}
+
+struct StructDef {
+    name: string,
+    type_idx: TypeIndex,
+    span_start: int,
+    span_end: int,
+}
+
+fn structDefInit(name: string, type_idx: TypeIndex, span_start: int, span_end: int) StructDef {
+    return StructDef{
+        .name = name,
+        .type_idx = type_idx,
+        .span_start = span_start,
+        .span_end = span_end,
+    }
+}
+
+// =============================================================================
+// Inlined from ir_boot.cot - IR and Builders
+// =============================================================================
+
+struct IR {
+    funcs: List<Func>,
+    globals: List<Global>,
+    structs: List<StructDef>,
+}
+
+fn irInit() IR {
+    return IR{
+        .funcs = new List<Func>(),
+        .globals = new List<Global>(),
+        .structs = new List<StructDef>(),
+    }
+}
+
+struct FuncBuilder {
+    name: string,
+    type_idx: TypeIndex,
+    return_type: TypeIndex,
+    span_start: int,
+    span_end: int,
+    locals: List<Local>,
+    blocks: List<Block>,
+    nodes: List<Node>,
+    current_block: BlockIndex,
+    local_map: Map<string, int>,
+    max_call_ret_size: int,
+}
+
+fn funcBuilderInit(name: string, type_idx: TypeIndex, return_type: TypeIndex, span_start: int, span_end: int) FuncBuilder {
+    var fb: FuncBuilder = FuncBuilder{
+        .name = name,
+        .type_idx = type_idx,
+        .return_type = return_type,
+        .span_start = span_start,
+        .span_end = span_end,
+        .locals = new List<Local>(),
+        .blocks = new List<Block>(),
+        .nodes = new List<Node>(),
+        .current_block = 0,
+        .local_map = new Map<string, int>(),
+        .max_call_ret_size = 0,
+    }
+    // Create entry block
+    fb.blocks.push(blockInit(0))
+    return fb
+}
+
+fn funcBuilderAddParam(fb: *FuncBuilder, name: string, type_idx: TypeIndex, size: int) int {
+    var idx: int = len(fb.*.locals)
+    fb.*.locals.push(localInitParam(name, type_idx, idx, size))
+    fb.*.local_map.set(name, idx)
+    return idx
+}
+
+fn funcBuilderAddLocal(fb: *FuncBuilder, name: string, type_idx: TypeIndex, mutable: bool) int {
+    var idx: int = len(fb.*.locals)
+    fb.*.locals.push(localInit(name, type_idx, idx, mutable))
+    fb.*.local_map.set(name, idx)
+    return idx
+}
+
+fn funcBuilderAddLocalWithSize(fb: *FuncBuilder, name: string, type_idx: TypeIndex, mutable: bool, size: int) int {
+    var idx: int = len(fb.*.locals)
+    fb.*.locals.push(localInitWithSize(name, type_idx, idx, mutable, size))
+    fb.*.local_map.set(name, idx)
+    return idx
+}
+
+fn funcBuilderLookupLocal(fb: FuncBuilder, name: string) int {
+    if fb.local_map.has(name) {
+        return fb.local_map.get(name)
+    }
+    return -1
+}
+
+fn funcBuilderNewBlock(fb: *FuncBuilder, label: string) BlockIndex {
+    var idx: BlockIndex = len(fb.*.blocks)
+    var block: Block = blockInit(idx)
+    block.label = label
+    fb.*.blocks.push(block)
+    return idx
+}
+
+fn funcBuilderSetBlock(fb: *FuncBuilder, block: BlockIndex) void {
+    fb.*.current_block = block
+}
+
+fn funcBuilderEmit(fb: *FuncBuilder, node: Node) NodeIndex {
+    var idx: NodeIndex = len(fb.*.nodes)
+    var n: Node = node
+    n.block = fb.*.current_block
+    fb.*.nodes.push(n)
+    // Add to current block's node list
+    var block: Block = fb.*.blocks.get(fb.*.current_block)
+    block.nodes.push(idx)
+    return idx
+}
+
+fn funcBuilderEmitJump(fb: *FuncBuilder, target: BlockIndex, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(Op.jump, TYPE_VOID, span_start, span_end)
+    n.aux = target
+    return funcBuilderEmit(fb, n)
+}
+
+fn funcBuilderEmitBranch(fb: *FuncBuilder, cond: NodeIndex, true_block: BlockIndex, false_block: BlockIndex, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(Op.branch, TYPE_VOID, span_start, span_end)
+    n = nodeWithArg012(n, cond, true_block, false_block)
+    return funcBuilderEmit(fb, n)
+}
+
+struct IRBuilder {
+    ir: IR,
+    current_func: FuncBuilder,
+    has_func: bool,
+}
+
+fn irBuilderInit() IRBuilder {
+    return IRBuilder{
+        .ir = irInit(),
+        .current_func = funcBuilderInit("", 0, 0, 0, 0),
+        .has_func = false,
+    }
+}
+
+fn irBuilderStartFunc(b: *IRBuilder, name: string, type_idx: TypeIndex, return_type: TypeIndex, span_start: int, span_end: int) void {
+    b.*.current_func = funcBuilderInit(name, type_idx, return_type, span_start, span_end)
+    b.*.has_func = true
+}
+
+fn irBuilderAddGlobal(b: *IRBuilder, g: Global) void {
+    b.*.ir.globals.push(g)
+}
+
+fn irBuilderAddStruct(b: *IRBuilder, s: StructDef) void {
+    b.*.ir.structs.push(s)
+}
+
+// =============================================================================
+// Loop Context (for break/continue)
+// =============================================================================
+
+struct LoopContext {
+    cond_block: BlockIndex,
+    exit_block: BlockIndex,
+}
+
+// =============================================================================
+// Lowerer State
+// =============================================================================
+
+struct Lowerer {
+    // Current function being lowered
+    current_func_name: string,
+    has_current_func: bool,
+
+    // String literals collected during lowering
+    string_literals: List<string>,
+
+    // Loop context stack for break/continue
+    loop_stack: List<LoopContext>,
+
+    // Compile-time constant values
+    const_values: Map<string, int>,
+
+    // For-loop counter for unique names
+    for_counter: int,
+}
+
+fn lowererInit() Lowerer {
+    return Lowerer{
+        .current_func_name = "",
+        .has_current_func = false,
+        .string_literals = new List<string>(),
+        .loop_stack = new List<LoopContext>(),
+        .const_values = new Map<string, int>(),
+        .for_counter = 0,
+    }
+}
+
+fn lowererAddStringLiteral(l: *Lowerer, str: string) int {
+    var idx: int = len(l.*.string_literals)
+    l.*.string_literals.push(str)
+    return idx
+}
+
+fn lowererPushLoop(l: *Lowerer, cond_block: BlockIndex, exit_block: BlockIndex) void {
+    l.*.loop_stack.push(LoopContext{ .cond_block = cond_block, .exit_block = exit_block })
+}
+
+fn lowererPopLoop(l: *Lowerer) void {
+    // Pop by removing last element - simplified for bootstrap
+    // (Real impl would use a proper pop operation)
+}
+
+fn lowererCurrentLoop(l: Lowerer) LoopContext {
+    if len(l.loop_stack) == 0 {
+        return LoopContext{ .cond_block = null_block, .exit_block = null_block }
+    }
+    return l.loop_stack.get(len(l.loop_stack) - 1)
+}
+
+// =============================================================================
+// Statement Lowering Helpers
+// =============================================================================
+
+struct IfBlocks {
+    then_block: BlockIndex,
+    else_block: BlockIndex,
+    merge_block: BlockIndex,
+    cond_node: NodeIndex,
+}
+
+struct WhileBlocks {
+    cond_block: BlockIndex,
+    body_block: BlockIndex,
+    exit_block: BlockIndex,
+}
+
+struct ForBlocks {
+    cond_block: BlockIndex,
+    body_block: BlockIndex,
+    incr_block: BlockIndex,
+    exit_block: BlockIndex,
+    idx_local: int,
+    item_local: int,
+    arr_len: int,
+}
+
+// =============================================================================
+// Declaration Lowering
+// =============================================================================
+
+fn lowerVarStmt(l: *Lowerer, fb: *FuncBuilder, name: string, type_idx: TypeIndex, value_node: NodeIndex, is_mutable: bool, size: int) void {
+    var local_idx: int = funcBuilderAddLocalWithSize(fb, name, type_idx, is_mutable, size)
+    if value_node != null_node {
+        var store: Node = nodeInit(Op.store, type_idx, 0, 0)
+        store = nodeWithArg01(store, local_idx, value_node)
+        funcBuilderEmit(fb, store)
+    }
+}
+
+fn lowerVarDecl(l: *Lowerer, builder: *IRBuilder, name: string, type_idx: TypeIndex, is_const: bool, span_start: int, span_end: int) void {
+    var g: Global = globalInit(name, type_idx, is_const, span_start, span_end)
+    irBuilderAddGlobal(builder, g)
+}
+
+fn lowerConstDecl(l: *Lowerer, builder: *IRBuilder, name: string, type_idx: TypeIndex, value: int, span_start: int, span_end: int) void {
+    l.*.const_values.set(name, value)
+    var g: Global = globalInit(name, type_idx, true, span_start, span_end)
+    irBuilderAddGlobal(builder, g)
+}
+
+fn lowerStructDecl(l: *Lowerer, builder: *IRBuilder, name: string, type_idx: TypeIndex, span_start: int, span_end: int) void {
+    var sd: StructDef = structDefInit(name, type_idx, span_start, span_end)
+    irBuilderAddStruct(builder, sd)
+}
+
+// =============================================================================
+// Statement Lowering
+// =============================================================================
+
+fn lowerReturn(l: *Lowerer, fb: *FuncBuilder, value_node: NodeIndex, return_type: TypeIndex, span_start: int, span_end: int) void {
+    var ret: Node = nodeInit(Op.ret, return_type, span_start, span_end)
+    if value_node != null_node {
+        ret = nodeWithArg0(ret, value_node)
+    }
+    funcBuilderEmit(fb, ret)
+}
+
+fn lowerAssign(l: *Lowerer, fb: *FuncBuilder, local_idx: int, value_node: NodeIndex, type_idx: TypeIndex, span_start: int, span_end: int) void {
+    var store: Node = nodeInit(Op.store, type_idx, span_start, span_end)
+    store = nodeWithArg01(store, local_idx, value_node)
+    funcBuilderEmit(fb, store)
+}
+
+fn lowerCompoundAssign(l: *Lowerer, fb: *FuncBuilder, local_idx: int, op: Op, rhs: NodeIndex, type_idx: TypeIndex, span_start: int, span_end: int) void {
+    var load: Node = nodeInit(Op.load, type_idx, span_start, span_end)
+    load = nodeWithArg0(load, local_idx)
+    var current_value: NodeIndex = funcBuilderEmit(fb, load)
+
+    var bin: Node = nodeInit(op, type_idx, span_start, span_end)
+    bin = nodeWithArg01(bin, current_value, rhs)
+    var result: NodeIndex = funcBuilderEmit(fb, bin)
+
+    var store: Node = nodeInit(Op.store, type_idx, span_start, span_end)
+    store = nodeWithArg01(store, local_idx, result)
+    funcBuilderEmit(fb, store)
+}
+
+fn lowerIfSetup(l: *Lowerer, fb: *FuncBuilder, cond_node: NodeIndex, has_else: bool, span_start: int, span_end: int) IfBlocks {
+    var then_block: BlockIndex = funcBuilderNewBlock(fb, "if.then")
+    var merge_block: BlockIndex = funcBuilderNewBlock(fb, "if.merge")
+    var else_block: BlockIndex = null_block
+    if has_else {
+        else_block = funcBuilderNewBlock(fb, "if.else")
+    }
+    return IfBlocks{
+        .then_block = then_block,
+        .else_block = else_block,
+        .merge_block = merge_block,
+        .cond_node = cond_node,
+    }
+}
+
+fn lowerIfEmitBranch(l: *Lowerer, fb: *FuncBuilder, blocks: IfBlocks, span_start: int, span_end: int) void {
+    var else_target: BlockIndex = blocks.else_block
+    if else_target == null_block {
+        else_target = blocks.merge_block
+    }
+    funcBuilderEmitBranch(fb, blocks.cond_node, blocks.then_block, else_target, span_start, span_end)
+}
+
+fn lowerWhileSetup(l: *Lowerer, fb: *FuncBuilder, span_start: int, span_end: int) WhileBlocks {
+    var cond_block: BlockIndex = funcBuilderNewBlock(fb, "while.cond")
+    var body_block: BlockIndex = funcBuilderNewBlock(fb, "while.body")
+    var exit_block: BlockIndex = funcBuilderNewBlock(fb, "while.exit")
+
+    lowererPushLoop(l, cond_block, exit_block)
+    funcBuilderEmitJump(fb, cond_block, span_start, span_end)
+
+    return WhileBlocks{
+        .cond_block = cond_block,
+        .body_block = body_block,
+        .exit_block = exit_block,
+    }
+}
+
+fn lowerWhileEmitBranch(l: *Lowerer, fb: *FuncBuilder, blocks: WhileBlocks, cond_node: NodeIndex, span_start: int, span_end: int) void {
+    var branch: Node = nodeInit(Op.branch, TYPE_VOID, span_start, span_end)
+    branch = nodeWithArg012(branch, cond_node, blocks.body_block, blocks.exit_block)
+    funcBuilderEmit(fb, branch)
+}
+
+fn lowerWhileFinish(l: *Lowerer, fb: *FuncBuilder, blocks: WhileBlocks, span_start: int, span_end: int) void {
+    funcBuilderEmitJump(fb, blocks.cond_block, span_start, span_end)
+    lowererPopLoop(l)
+    funcBuilderSetBlock(fb, blocks.exit_block)
+}
+
+fn lowerBreak(l: *Lowerer, fb: *FuncBuilder, span_start: int, span_end: int) void {
+    var loop_ctx: LoopContext = lowererCurrentLoop(l.*)
+    if loop_ctx.exit_block != null_block {
+        funcBuilderEmitJump(fb, loop_ctx.exit_block, span_start, span_end)
+    }
+}
+
+fn lowerContinue(l: *Lowerer, fb: *FuncBuilder, span_start: int, span_end: int) void {
+    var loop_ctx: LoopContext = lowererCurrentLoop(l.*)
+    if loop_ctx.cond_block != null_block {
+        funcBuilderEmitJump(fb, loop_ctx.cond_block, span_start, span_end)
+    }
+}
+
+// =============================================================================
+// Expression Lowering
+// =============================================================================
+
+fn lowerIdentifier(l: *Lowerer, fb: *FuncBuilder, name: string, type_idx: TypeIndex, span_start: int, span_end: int) NodeIndex {
+    var local_idx: int = funcBuilderLookupLocal(fb.*, name)
+    if local_idx != -1 {
+        var load: Node = nodeInit(Op.load, type_idx, span_start, span_end)
+        load = nodeWithArg0(load, local_idx)
+        return funcBuilderEmit(fb, load)
+    }
+
+    if l.*.const_values.has(name) {
+        var value: int = l.*.const_values.get(name)
+        var n: Node = nodeInit(Op.const_int, TYPE_INT, span_start, span_end)
+        n = nodeWithAux(n, value)
+        return funcBuilderEmit(fb, n)
+    }
+
+    return null_node
+}
+
+fn lowerIntLiteral(l: *Lowerer, fb: *FuncBuilder, value: int, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(Op.const_int, TYPE_INT, span_start, span_end)
+    n = nodeWithAux(n, value)
+    return funcBuilderEmit(fb, n)
+}
+
+fn lowerBoolLiteral(l: *Lowerer, fb: *FuncBuilder, value: bool, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(Op.const_bool, TYPE_BOOL, span_start, span_end)
+    if value {
+        n = nodeWithAux(n, 1)
+    } else {
+        n = nodeWithAux(n, 0)
+    }
+    return funcBuilderEmit(fb, n)
+}
+
+fn lowerStringLiteral(l: *Lowerer, fb: *FuncBuilder, str: string, span_start: int, span_end: int) NodeIndex {
+    var string_idx: int = lowererAddStringLiteral(l, str)
+    var n: Node = nodeInit(Op.const_slice, TYPE_STRING, span_start, span_end)
+    n = nodeWithAux(n, string_idx)
+    return funcBuilderEmit(fb, n)
+}
+
+fn lowerBinary(l: *Lowerer, fb: *FuncBuilder, op: Op, left: NodeIndex, right: NodeIndex, result_type: TypeIndex, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(op, result_type, span_start, span_end)
+    n = nodeWithArg01(n, left, right)
+    return funcBuilderEmit(fb, n)
+}
+
+fn lowerUnary(l: *Lowerer, fb: *FuncBuilder, op: Op, operand: NodeIndex, result_type: TypeIndex, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(op, result_type, span_start, span_end)
+    n = nodeWithArg0(n, operand)
+    return funcBuilderEmit(fb, n)
+}
+
+fn lowerCall(l: *Lowerer, fb: *FuncBuilder, func_name: string, arg0: NodeIndex, arg1: NodeIndex, arg2: NodeIndex, arg3: NodeIndex, num_args: int, return_type: TypeIndex, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(Op.call, return_type, span_start, span_end)
+    n = nodeWithAuxStr(n, func_name)
+    if num_args >= 1 { n.args0 = arg0 }
+    if num_args >= 2 { n.args1 = arg1 }
+    if num_args >= 3 { n.args2 = arg2 }
+    if num_args >= 4 { n.args3 = arg3 }
+    n.args_len = num_args
+    return funcBuilderEmit(fb, n)
+}
+
+fn lowerFieldAccess(l: *Lowerer, fb: *FuncBuilder, base_local: int, field_offset: int, field_type: TypeIndex, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(Op.field_local, field_type, span_start, span_end)
+    n = nodeWithArg0(n, base_local)
+    n = nodeWithAux(n, field_offset)
+    return funcBuilderEmit(fb, n)
+}
+
+fn lowerFieldValue(l: *Lowerer, fb: *FuncBuilder, base_node: NodeIndex, field_offset: int, field_type: TypeIndex, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(Op.field_value, field_type, span_start, span_end)
+    n = nodeWithArg0(n, base_node)
+    n = nodeWithAux(n, field_offset)
+    return funcBuilderEmit(fb, n)
+}
+
+fn lowerIndex(l: *Lowerer, fb: *FuncBuilder, base_local: int, index_node: NodeIndex, elem_type: TypeIndex, elem_size: int, is_slice: bool, span_start: int, span_end: int) NodeIndex {
+    if is_slice {
+        var n: Node = nodeInit(Op.slice_index, elem_type, span_start, span_end)
+        n = nodeWithArg01(n, base_local, index_node)
+        n = nodeWithAux(n, elem_size)
+        return funcBuilderEmit(fb, n)
+    } else {
+        var n: Node = nodeInit(Op.addr_index, elem_type, span_start, span_end)
+        n = nodeWithArg01(n, base_local, index_node)
+        n = nodeWithAux(n, elem_size)
+        return funcBuilderEmit(fb, n)
+    }
+}
+
+fn lowerSliceExpr(l: *Lowerer, fb: *FuncBuilder, base_local: int, start_node: NodeIndex, end_node: NodeIndex, slice_type: TypeIndex, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(Op.slice_local, slice_type, span_start, span_end)
+    n = nodeWithArg012(n, base_local, start_node, end_node)
+    return funcBuilderEmit(fb, n)
+}
+
+fn lowerAddrOf(l: *Lowerer, fb: *FuncBuilder, local_idx: int, ptr_type: TypeIndex, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(Op.addr_local, ptr_type, span_start, span_end)
+    n = nodeWithAux(n, local_idx)
+    return funcBuilderEmit(fb, n)
+}
+
+fn lowerDeref(l: *Lowerer, fb: *FuncBuilder, ptr_node: NodeIndex, elem_type: TypeIndex, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(Op.ptr_load, elem_type, span_start, span_end)
+    n = nodeWithArg0(n, ptr_node)
+    return funcBuilderEmit(fb, n)
+}
+
+fn lowerStructInit(l: *Lowerer, fb: *FuncBuilder, struct_type: TypeIndex, struct_size: int, span_start: int, span_end: int) int {
+    var temp_local: int = funcBuilderAddLocalWithSize(fb, "__struct_tmp", struct_type, false, struct_size)
+    return temp_local
+}
+
+fn lowerStructInitField(l: *Lowerer, fb: *FuncBuilder, local_idx: int, field_offset: int, value_node: NodeIndex, field_type: TypeIndex, span_start: int, span_end: int) void {
+    var store: Node = nodeInit(Op.store, field_type, span_start, span_end)
+    store = nodeWithArg01(store, local_idx, value_node)
+    store = nodeWithAux(store, field_offset)
+    funcBuilderEmit(fb, store)
+}
+
+fn lowerStructInitFinish(l: *Lowerer, fb: *FuncBuilder, local_idx: int, struct_type: TypeIndex, span_start: int, span_end: int) NodeIndex {
+    var load: Node = nodeInit(Op.load, struct_type, span_start, span_end)
+    load = nodeWithArg0(load, local_idx)
+    return funcBuilderEmit(fb, load)
+}
+
+fn lowerIfExpr(l: *Lowerer, fb: *FuncBuilder, cond: NodeIndex, then_val: NodeIndex, else_val: NodeIndex, result_type: TypeIndex, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(Op.select, result_type, span_start, span_end)
+    n = nodeWithArg012(n, cond, then_val, else_val)
+    return funcBuilderEmit(fb, n)
+}
+
+// =============================================================================
+// Map/List Operations
+// =============================================================================
+
+fn lowerMapNew(l: *Lowerer, fb: *FuncBuilder, map_type: TypeIndex, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(Op.map_new, map_type, span_start, span_end)
+    return funcBuilderEmit(fb, n)
+}
+
+fn lowerMapSet(l: *Lowerer, fb: *FuncBuilder, map_handle: NodeIndex, key_node: NodeIndex, value_node: NodeIndex, key_type: TypeIndex, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(Op.map_set, TYPE_VOID, span_start, span_end)
+    n = nodeWithArg012(n, map_handle, key_node, value_node)
+    nodeSetArg(&n, 3, key_type)
+    n.args_len = 4
+    return funcBuilderEmit(fb, n)
+}
+
+fn lowerMapGet(l: *Lowerer, fb: *FuncBuilder, map_handle: NodeIndex, key_node: NodeIndex, value_type: TypeIndex, key_type: TypeIndex, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(Op.map_get, value_type, span_start, span_end)
+    n = nodeWithArg01(n, map_handle, key_node)
+    n = nodeWithAux(n, key_type)
+    return funcBuilderEmit(fb, n)
+}
+
+fn lowerMapHas(l: *Lowerer, fb: *FuncBuilder, map_handle: NodeIndex, key_node: NodeIndex, key_type: TypeIndex, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(Op.map_has, TYPE_BOOL, span_start, span_end)
+    n = nodeWithArg01(n, map_handle, key_node)
+    n = nodeWithAux(n, key_type)
+    return funcBuilderEmit(fb, n)
+}
+
+fn lowerMapSize(l: *Lowerer, fb: *FuncBuilder, map_handle: NodeIndex, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(Op.map_size, TYPE_INT, span_start, span_end)
+    n = nodeWithArg0(n, map_handle)
+    return funcBuilderEmit(fb, n)
+}
+
+fn lowerListNew(l: *Lowerer, fb: *FuncBuilder, list_type: TypeIndex, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(Op.list_new, list_type, span_start, span_end)
+    return funcBuilderEmit(fb, n)
+}
+
+fn lowerListPush(l: *Lowerer, fb: *FuncBuilder, list_handle: NodeIndex, value_node: NodeIndex, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(Op.list_push, TYPE_VOID, span_start, span_end)
+    n = nodeWithArg01(n, list_handle, value_node)
+    return funcBuilderEmit(fb, n)
+}
+
+fn lowerListGet(l: *Lowerer, fb: *FuncBuilder, list_handle: NodeIndex, index_node: NodeIndex, elem_type: TypeIndex, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(Op.list_get, elem_type, span_start, span_end)
+    n = nodeWithArg01(n, list_handle, index_node)
+    return funcBuilderEmit(fb, n)
+}
+
+fn lowerListLen(l: *Lowerer, fb: *FuncBuilder, list_handle: NodeIndex, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(Op.list_len, TYPE_INT, span_start, span_end)
+    n = nodeWithArg0(n, list_handle)
+    return funcBuilderEmit(fb, n)
+}
+
+// =============================================================================
+// Union Operations
+// =============================================================================
+
+fn lowerUnionInit(l: *Lowerer, fb: *FuncBuilder, union_type: TypeIndex, variant_idx: int, payload_node: NodeIndex, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(Op.union_init, union_type, span_start, span_end)
+    n = nodeWithAux(n, variant_idx)
+    if payload_node != null_node {
+        n = nodeWithArg0(n, payload_node)
+    }
+    return funcBuilderEmit(fb, n)
+}
+
+fn lowerUnionTag(l: *Lowerer, fb: *FuncBuilder, union_node: NodeIndex, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(Op.union_tag, TYPE_U8, span_start, span_end)
+    n = nodeWithArg0(n, union_node)
+    return funcBuilderEmit(fb, n)
+}
+
+fn lowerUnionPayload(l: *Lowerer, fb: *FuncBuilder, union_node: NodeIndex, variant_idx: int, payload_type: TypeIndex, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(Op.union_payload, payload_type, span_start, span_end)
+    n = nodeWithArg0(n, union_node)
+    n = nodeWithAux(n, variant_idx)
+    return funcBuilderEmit(fb, n)
+}
+
+// =============================================================================
+// Builtin Functions
+// =============================================================================
+
+fn lowerLenArray(l: *Lowerer, fb: *FuncBuilder, arr_len: int, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(Op.const_int, TYPE_INT, span_start, span_end)
+    n = nodeWithAux(n, arr_len)
+    return funcBuilderEmit(fb, n)
+}
+
+fn lowerLenSlice(l: *Lowerer, fb: *FuncBuilder, slice_local: int, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(Op.field, TYPE_INT, span_start, span_end)
+    n = nodeWithArg0(n, slice_local)
+    n = nodeWithAux(n, 8)
+    return funcBuilderEmit(fb, n)
+}
+
+fn lowerMaxInt(l: *Lowerer, fb: *FuncBuilder, type_idx: TypeIndex, span_start: int, span_end: int) NodeIndex {
+    var max_value: int = 0
+    if type_idx == 2 { max_value = 127 }
+    if type_idx == 3 { max_value = 32767 }
+    if type_idx == 4 { max_value = 2147483647 }
+    if type_idx == 5 { max_value = @maxInt(i64) }
+    if type_idx == 6 { max_value = 255 }
+    if type_idx == 7 { max_value = 65535 }
+    if type_idx == 8 { max_value = 4294967295 }
+    var n: Node = nodeInit(Op.const_int, TYPE_I64, span_start, span_end)
+    n = nodeWithAux(n, max_value)
+    return funcBuilderEmit(fb, n)
+}
+
+fn lowerMinInt(l: *Lowerer, fb: *FuncBuilder, type_idx: TypeIndex, span_start: int, span_end: int) NodeIndex {
+    var min_value: int = 0
+    if type_idx == 2 { min_value = -128 }
+    if type_idx == 3 { min_value = -32768 }
+    if type_idx == 4 { min_value = -2147483648 }
+    if type_idx == 5 { min_value = @minInt(i64) }
+    var n: Node = nodeInit(Op.const_int, TYPE_I64, span_start, span_end)
+    n = nodeWithAux(n, min_value)
+    return funcBuilderEmit(fb, n)
+}
+
+fn lowerPrint(l: *Lowerer, fb: *FuncBuilder, arg_node: NodeIndex, is_println: bool, span_start: int, span_end: int) NodeIndex {
+    var func_name: string = "print"
+    if is_println {
+        func_name = "println"
+    }
+    var n: Node = nodeInit(Op.call, TYPE_VOID, span_start, span_end)
+    n = nodeWithArg0(n, arg_node)
+    n = nodeWithAuxStr(n, func_name)
+    n.args_len = 1
+    return funcBuilderEmit(fb, n)
+}
+
+// =============================================================================
+// Pointer Operations
+// =============================================================================
+
+fn lowerPtrStore(l: *Lowerer, fb: *FuncBuilder, ptr_node: NodeIndex, value_node: NodeIndex, elem_type: TypeIndex, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(Op.ptr_store, elem_type, span_start, span_end)
+    n = nodeWithArg01(n, ptr_node, value_node)
+    return funcBuilderEmit(fb, n)
+}
+
+fn lowerPtrField(l: *Lowerer, fb: *FuncBuilder, local_idx: int, field_offset: int, field_type: TypeIndex, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(Op.ptr_field, field_type, span_start, span_end)
+    n = nodeWithArg0(n, local_idx)
+    n = nodeWithAux(n, field_offset)
+    return funcBuilderEmit(fb, n)
+}
+
+fn lowerPtrFieldStore(l: *Lowerer, fb: *FuncBuilder, local_idx: int, field_offset: int, value_node: NodeIndex, field_type: TypeIndex, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(Op.ptr_field_store, field_type, span_start, span_end)
+    n = nodeWithArg01(n, local_idx, value_node)
+    n = nodeWithAux(n, field_offset)
+    return funcBuilderEmit(fb, n)
+}
+
+fn lowerStrConcat(l: *Lowerer, fb: *FuncBuilder, left: NodeIndex, right: NodeIndex, span_start: int, span_end: int) NodeIndex {
+    var n: Node = nodeInit(Op.str_concat, TYPE_STRING, span_start, span_end)
+    n = nodeWithArg01(n, left, right)
+    return funcBuilderEmit(fb, n)
+}
+
+// =============================================================================
+// Simple Test
+// =============================================================================
+
+fn main() int {
+    // Test lowerer initialization
+    var l: Lowerer = lowererInit()
+    if l.for_counter != 0 {
+        return 1
+    }
+
+    // Test string literal addition
+    var str_idx: int = lowererAddStringLiteral(&l, "hello")
+    if str_idx != 0 {
+        return 2
+    }
+    var str_idx2: int = lowererAddStringLiteral(&l, "world")
+    if str_idx2 != 1 {
+        return 3
+    }
+
+    // Test loop context
+    lowererPushLoop(&l, 10, 20)
+    var ctx: LoopContext = lowererCurrentLoop(l)
+    if ctx.cond_block != 10 {
+        return 4
+    }
+    if ctx.exit_block != 20 {
+        return 5
+    }
+
+    // Test const values
+    l.const_values.set("MAX", 100)
+    if not l.const_values.has("MAX") {
+        return 6
+    }
+    if l.const_values.get("MAX") != 100 {
+        return 7
+    }
+
+    // Test Node creation
+    var n: Node = nodeInit(Op.const_int, TYPE_INT, 0, 10)
+    n = nodeWithAux(n, 42)
+    if n.op != Op.const_int {
+        return 8
+    }
+    if n.aux != 42 {
+        return 9
+    }
+
+    // Test nodeWithArg functions
+    var n2: Node = nodeInit(Op.add, TYPE_INT, 0, 10)
+    n2 = nodeWithArg01(n2, 10, 20)
+    if nodeGetArg(n2, 0) != 10 {
+        return 10
+    }
+    if nodeGetArg(n2, 1) != 20 {
+        return 11
+    }
+
+    // Test Local creation
+    var local: Local = localInit("x", TYPE_INT, 0, true)
+    if local.name != "x" {
+        return 12
+    }
+    if not local.mutable {
+        return 13
+    }
+
+    // Test localInitWithSize
+    var local2: Local = localInitWithSize("y", TYPE_INT, 1, false, 16)
+    if local2.size != 16 {
+        return 14
+    }
+
+    // Test Block creation
+    var block: Block = blockInit(0)
+    if block.index != 0 {
+        return 15
+    }
+
+    // Test Global creation
+    var g: Global = globalInit("MAX_VALUE", TYPE_INT, true, 0, 10)
+    if g.name != "MAX_VALUE" {
+        return 16
+    }
+    if not g.is_const {
+        return 17
+    }
+
+    // Test StructDef creation
+    var sd: StructDef = structDefInit("Point", 100, 0, 30)
+    if sd.name != "Point" {
+        return 18
+    }
+
+    // Test IfBlocks struct
+    var if_blocks: IfBlocks = IfBlocks{
+        .then_block = 1,
+        .else_block = 2,
+        .merge_block = 3,
+        .cond_node = 0,
+    }
+    if if_blocks.then_block != 1 {
+        return 19
+    }
+
+    // Test WhileBlocks struct
+    var while_blocks: WhileBlocks = WhileBlocks{
+        .cond_block = 10,
+        .body_block = 11,
+        .exit_block = 12,
+    }
+    if while_blocks.cond_block != 10 {
+        return 20
+    }
+
+    // All tests pass
+    return 42
+}

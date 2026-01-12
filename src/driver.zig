@@ -162,6 +162,189 @@ pub const Driver = struct {
         };
     }
 
+    // ========================================================================
+    // BOOTSTRAP IMPORT SYSTEM (TEMPORARY)
+    // ========================================================================
+    //
+    // This is a simple textual import system for bootstrapping only.
+    // It does basic file concatenation similar to C's #include.
+    //
+    // For Cot 1.0, this will be replaced with a proper module system
+    // following Go's package/import design with:
+    // - Package declarations
+    // - Explicit exports
+    // - Dependency resolution
+    // - Cycle detection
+    // - Separate compilation
+    //
+    // Syntax: import "path/to/file.cot"
+    //
+    // Limitations:
+    // - No symbol resolution (just textual inclusion)
+    // - No cycle detection
+    // - No duplicate detection (caller must manage)
+    // - Imports must be at the start of the file
+    // ========================================================================
+
+    /// Process import statements and return combined source content.
+    /// Returns the content with all imports resolved (imported content prepended).
+    fn processImports(self: *Driver, content: []const u8, base_path: []const u8) ![]const u8 {
+        var result: std.ArrayList(u8) = .{ .items = &.{}, .capacity = 0 };
+        errdefer result.deinit(self.allocator);
+
+        var imported_files: std.StringHashMap(void) = std.StringHashMap(void).init(self.allocator);
+        defer imported_files.deinit();
+
+        // Track the base file to prevent self-import
+        try imported_files.put(base_path, {});
+
+        // Find and process imports at the start of the file
+        var pos: usize = 0;
+        var content_start: usize = 0;
+
+        while (pos < content.len) {
+            // Skip whitespace and comments
+            pos = skipWhitespaceAndComments(content, pos);
+            if (pos >= content.len) break;
+
+            // Check for import keyword
+            if (pos + 6 <= content.len and std.mem.eql(u8, content[pos .. pos + 6], "import")) {
+                pos += 6;
+
+                // Skip whitespace after 'import'
+                pos = skipWhitespace(content, pos);
+                if (pos >= content.len) break;
+
+                // Expect string literal
+                if (content[pos] != '"') {
+                    // Not a valid import, treat as regular content
+                    break;
+                }
+                pos += 1;
+
+                // Find end of string
+                const path_start = pos;
+                while (pos < content.len and content[pos] != '"' and content[pos] != '\n') {
+                    pos += 1;
+                }
+                if (pos >= content.len or content[pos] != '"') {
+                    std.debug.print("Error: unterminated import string\n", .{});
+                    return error.InvalidImport;
+                }
+                const import_path = content[path_start..pos];
+                pos += 1; // skip closing quote
+
+                // Skip optional semicolon and newline
+                pos = skipWhitespace(content, pos);
+                if (pos < content.len and content[pos] == ';') pos += 1;
+                if (pos < content.len and content[pos] == '\n') pos += 1;
+
+                content_start = pos;
+
+                // Check if already imported
+                if (imported_files.get(import_path) != null) {
+                    continue; // Skip duplicate import
+                }
+                try imported_files.put(try self.allocator.dupe(u8, import_path), {});
+
+                // Resolve import path relative to base file
+                const resolved_path = try self.resolveImportPath(base_path, import_path);
+                defer self.allocator.free(resolved_path);
+
+                // Read imported file
+                const imported_content = self.readFile(resolved_path) catch |err| {
+                    std.debug.print("Error: cannot read import '{s}': {}\n", .{ import_path, err });
+                    return err;
+                };
+
+                // Recursively process imports in the imported file
+                const processed_import = try self.processImports(imported_content, resolved_path);
+                defer if (processed_import.ptr != imported_content.ptr) self.allocator.free(processed_import);
+
+                // Append imported content with a marker comment
+                try result.appendSlice(self.allocator, "// --- imported from: ");
+                try result.appendSlice(self.allocator, import_path);
+                try result.appendSlice(self.allocator, " ---\n");
+                try result.appendSlice(self.allocator, processed_import);
+                try result.appendSlice(self.allocator, "\n// --- end import ---\n\n");
+
+                // Free the imported content if it wasn't reused
+                self.allocator.free(imported_content);
+            } else {
+                // Not an import, done processing imports
+                break;
+            }
+        }
+
+        // If no imports were processed, return original content
+        if (result.items.len == 0) {
+            return content;
+        }
+
+        // Append remaining content (after imports)
+        try result.appendSlice(self.allocator, content[content_start..]);
+
+        return try result.toOwnedSlice(self.allocator);
+    }
+
+    fn skipWhitespace(content: []const u8, start: usize) usize {
+        var pos = start;
+        while (pos < content.len and (content[pos] == ' ' or content[pos] == '\t' or content[pos] == '\r')) {
+            pos += 1;
+        }
+        return pos;
+    }
+
+    fn skipWhitespaceAndComments(content: []const u8, start: usize) usize {
+        var pos = start;
+        while (pos < content.len) {
+            // Skip whitespace
+            if (content[pos] == ' ' or content[pos] == '\t' or content[pos] == '\r' or content[pos] == '\n') {
+                pos += 1;
+                continue;
+            }
+            // Skip line comments
+            if (pos + 1 < content.len and content[pos] == '/' and content[pos + 1] == '/') {
+                while (pos < content.len and content[pos] != '\n') {
+                    pos += 1;
+                }
+                continue;
+            }
+            // Skip block comments
+            if (pos + 1 < content.len and content[pos] == '/' and content[pos + 1] == '*') {
+                pos += 2;
+                while (pos + 1 < content.len) {
+                    if (content[pos] == '*' and content[pos + 1] == '/') {
+                        pos += 2;
+                        break;
+                    }
+                    pos += 1;
+                }
+                continue;
+            }
+            break;
+        }
+        return pos;
+    }
+
+    fn resolveImportPath(self: *Driver, base_path: []const u8, import_path: []const u8) ![]const u8 {
+        // Get directory of base file
+        const base_dir = std.fs.path.dirname(base_path) orelse ".";
+
+        // Join with import path
+        return try std.fs.path.join(self.allocator, &[_][]const u8{ base_dir, import_path });
+    }
+
+    fn readFile(self: *Driver, path: []const u8) ![]const u8 {
+        const file = try std.fs.cwd().openFile(path, .{});
+        defer file.close();
+        return try file.readToEndAlloc(self.allocator, 1024 * 1024 * 10);
+    }
+
+    // ========================================================================
+    // END BOOTSTRAP IMPORT SYSTEM
+    // ========================================================================
+
     /// Main compilation entry point
     pub fn compile(self: *Driver) CompileResult {
         // Phase 1: Read source file
@@ -171,10 +354,22 @@ pub const Driver = struct {
         };
         defer file.close();
 
-        const content = file.readToEndAlloc(self.allocator, 1024 * 1024 * 10) catch {
+        const raw_content = file.readToEndAlloc(self.allocator, 1024 * 1024 * 10) catch {
             std.debug.print("Error: cannot read {s}\n", .{self.options.input_path});
             return .{ .success = false, .error_count = 1 };
         };
+
+        // Process imports (BOOTSTRAP ONLY - textual inclusion)
+        // This will be replaced with proper module system in Cot 1.0
+        const content = self.processImports(raw_content, self.options.input_path) catch |err| {
+            std.debug.print("Error processing imports: {}\n", .{err});
+            self.allocator.free(raw_content);
+            return .{ .success = false, .error_count = 1 };
+        };
+        // Free raw_content if processImports created new content
+        if (content.ptr != raw_content.ptr) {
+            self.allocator.free(raw_content);
+        }
 
         self.src = self.allocator.create(source.Source) catch {
             return .{ .success = false, .error_count = 1 };
@@ -835,6 +1030,16 @@ pub const Driver = struct {
                             estimated += alignTo(elem_size, 8);
                         }
                     },
+                    .list_set => {
+                        // list_set with large elements needs temp space for value
+                        if (value.args().len >= 3) {
+                            const elem_val = &func.values.items[value.args()[2]];
+                            const elem_size = type_reg.sizeOf(elem_val.type_idx);
+                            if (elem_size > 8) {
+                                estimated += alignTo(elem_size, 8);
+                            }
+                        }
+                    },
                     .select => {
                         // select on slice types uses 16 bytes of spill space
                         const ret_type = type_reg.get(value.type_idx);
@@ -1049,6 +1254,7 @@ fn convertIRNode(func: *ssa.Func, node: *const ir.Node, ir_to_ssa: *std.AutoHash
         .list_new => .list_new,
         .list_push => .list_push,
         .list_get => .list_get,
+        .list_set => .list_set,
         .list_len => .list_len,
         .list_free => .list_free,
 

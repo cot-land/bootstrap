@@ -207,6 +207,8 @@ pub const Op = enum(u8) {
     list_push,
     // Get element by index. args[0] = handle, args[1] = index
     list_get,
+    // Set element by index. args[0] = handle, args[1] = index, args[2] = value
+    list_set,
     // Get list length. args[0] = handle
     list_len,
     // Free list. args[0] = handle

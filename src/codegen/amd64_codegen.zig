@@ -1855,6 +1855,30 @@ pub const CodeGen = struct {
         try self.emitRuntimeCall("cot_list_push");
     }
 
+    /// Generate code for list_set: args[0]=handle, args[1]=index, args[2]=value
+    /// Uses MCValue for all operands
+    /// x86_64 calling convention: rdi=handle, rsi=index, rdx=value
+    pub fn genListSet(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+        if (args.len < 3) return;
+
+        try self.spillCallerSaved();
+
+        // Load handle into rdi via MCValue
+        const handle_mcv = self.getValue(args[0]);
+        try self.loadToReg(.rdi, handle_mcv);
+
+        // Load index into rsi via MCValue
+        const index_mcv = self.getValue(args[1]);
+        try self.loadToReg(.rsi, index_mcv);
+
+        // Load value into rdx via MCValue
+        const val_mcv = self.getValue(args[2]);
+        try self.loadToReg(.rdx, val_mcv);
+
+        try self.emitRuntimeCall("cot_list_set");
+    }
+
     /// Generate code for list_len: args[0]=handle
     pub fn genListLen(self: *CodeGen, value: *ssa.Value) !void {
         const args = value.args();
@@ -2197,6 +2221,7 @@ pub const CodeGen = struct {
             .map_free => try self.genMapFree(value),
             .list_new => try self.genListNew(value),
             .list_push => try self.genListPush(value),
+            .list_set => try self.genListSet(value),
             .list_len => try self.genListLen(value),
             .list_free => try self.genListFree(value),
             .str_concat => try self.genStrConcat(value),

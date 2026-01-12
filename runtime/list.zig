@@ -203,6 +203,40 @@ export fn cot_list_elem_size(handle: ?*ListHandle) i64 {
     return @intCast(h.data.elem_size);
 }
 
+/// Set an element in the list at a specific index
+/// For elements <= 8 bytes, value is passed directly
+/// For larger elements, value is a pointer to the source data
+/// Returns 1 on success, 0 on failure (out of bounds)
+export fn cot_list_set(handle: ?*ListHandle, index: i64, value: i64) i64 {
+    const h = handle orelse return 0;
+    const data = h.data;
+
+    debugPrint("set({d}, {x}) - len={d}, elem_size={d}", .{ index, value, data.length, data.elem_size });
+
+    // Bounds check
+    if (index < 0) return 0;
+    const idx: u64 = @intCast(index);
+    if (idx >= data.length) return 0;
+
+    const elements = data.elements_ptr orelse return 0;
+    const offset = idx * data.elem_size;
+
+    if (data.elem_size <= 8) {
+        // Small element - store value directly
+        const dest = elements + offset;
+        const value_bytes = std.mem.asBytes(&value);
+        @memcpy(dest[0..data.elem_size], value_bytes[0..data.elem_size]);
+    } else {
+        // Large element - value is a pointer to the source data
+        const src: [*]const u8 = @ptrFromInt(@as(usize, @intCast(value)));
+        const dest = elements + offset;
+        @memcpy(dest[0..data.elem_size], src[0..data.elem_size]);
+    }
+
+    debugPrint("  set success", .{});
+    return 1;
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -286,4 +320,37 @@ test "list growth" {
     while (i < 100) : (i += 1) {
         try std.testing.expectEqual(i * 10, cot_list_get(handle, i));
     }
+}
+
+test "list set" {
+    const handle = cot_list_new(8) orelse return error.CreateFailed;
+    defer cot_list_free(handle);
+
+    // Push initial values
+    _ = cot_list_push(handle, 10);
+    _ = cot_list_push(handle, 20);
+    _ = cot_list_push(handle, 30);
+
+    // Verify initial values
+    try std.testing.expectEqual(@as(i64, 10), cot_list_get(handle, 0));
+    try std.testing.expectEqual(@as(i64, 20), cot_list_get(handle, 1));
+    try std.testing.expectEqual(@as(i64, 30), cot_list_get(handle, 2));
+
+    // Set values
+    try std.testing.expectEqual(@as(i64, 1), cot_list_set(handle, 0, 100));
+    try std.testing.expectEqual(@as(i64, 1), cot_list_set(handle, 1, 200));
+    try std.testing.expectEqual(@as(i64, 1), cot_list_set(handle, 2, 300));
+
+    // Verify updated values
+    try std.testing.expectEqual(@as(i64, 100), cot_list_get(handle, 0));
+    try std.testing.expectEqual(@as(i64, 200), cot_list_get(handle, 1));
+    try std.testing.expectEqual(@as(i64, 300), cot_list_get(handle, 2));
+
+    // Out of bounds set should return 0
+    try std.testing.expectEqual(@as(i64, 0), cot_list_set(handle, -1, 999));
+    try std.testing.expectEqual(@as(i64, 0), cot_list_set(handle, 3, 999));
+    try std.testing.expectEqual(@as(i64, 0), cot_list_set(handle, 100, 999));
+
+    // Length should be unchanged
+    try std.testing.expectEqual(@as(i64, 3), cot_list_len(handle));
 }

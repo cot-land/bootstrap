@@ -1035,6 +1035,7 @@ pub const Checker = struct {
         return switch (base) {
             .array => |a| a.elem,
             .slice => |s| s.elem,
+            .list_type => |l| l.elem,
             else => blk: {
                 self.err.errorWithCode(i.span.start, .E303, "cannot index this type");
                 break :blk invalid_type;

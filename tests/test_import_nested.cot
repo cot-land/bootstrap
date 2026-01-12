@@ -1,0 +1,29 @@
+// Test nested imports
+import "test_import_nested_helper.cot"
+
+fn main() int {
+    // Test function from nested import (uses base_multiply from base)
+    var result: int = nested_compute(6)
+    // 6 * 7 (BASE_VALUE) = 42
+    if result != 42 {
+        return 1
+    }
+
+    // Test constant from nested helper
+    if NESTED_VALUE != 42 {
+        return 2
+    }
+
+    // Test constant from base (transitively imported)
+    if BASE_VALUE != 7 {
+        return 3
+    }
+
+    // Test function from base (transitively imported)
+    var product: int = base_multiply(3, 4)
+    if product != 12 {
+        return 4
+    }
+
+    return 42
+}
