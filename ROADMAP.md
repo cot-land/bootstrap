@@ -4,154 +4,266 @@
 
 > **Claude: Update this file when you start or complete a roadmap item.**
 
-This document tracks features remaining for self-hosting the cot compiler.
+---
+
+## The Bootstrap Strategy
+
+This roadmap follows a disciplined bootstrap strategy to create a self-hosting cot compiler:
+
+### Phase 1: Cot 0.3 - Minimal Self-Hosting Compiler
+
+**Goal:** Create a cot compiler written in cot that can compile itself.
+
+**Approach:**
+1. For every `.zig` source file, create a matching `.cot` file in `src/bootstrap/`
+2. These `.cot` files use ONLY features the Zig compiler already supports
+3. **No feature creep** - don't add features to the Zig compiler unless absolutely required
+4. The `.cot` files are a "blueprint" showing Zig → Cot translation
+
+### Phase 2: Sync Cycle
+
+**Goal:** Keep `.zig` and `.cot` files in lockstep.
+
+**Process:**
+1. When modifying a `.zig` file, update the corresponding `.cot` file
+2. When adding a feature to support bootstrap, add it to BOTH Zig and test with .cot
+3. Run comprehensive tests on both platforms after each sync
+
+### Phase 3: Evolution (Post-Bootstrap)
+
+**Goal:** Once self-hosted, evolve the compiler using itself.
+
+**Approach:**
+1. Bootstrap compiler (Cot 0.3) compiles itself
+2. Add new features to the .cot compiler using the .cot compiler
+3. Iterate until the "full featured" wireframe files can compile
+4. Eventually retire the Zig bootstrap compiler
 
 ---
 
-## Priority 1: Critical Gaps (Block Self-Hosting)
+## File Mapping: Zig → Bootstrap Cot
 
-These features are used extensively in the .cot wireframe files.
+Every Zig source file needs a corresponding bootstrap .cot file that uses only supported features.
 
-| Feature | Blocking Files | Notes |
-|---------|---------------|-------|
-| If capture `if x \|val\| { }` | All | Unwrap optional with binding |
-| While capture `while next() \|item\| { }` | ir.cot | Iterator pattern |
-| For with index `for item, i in items { }` | scanner.cot | Indexed iteration |
-| Address-of `&x` | checker.cot | Get pointer to value |
-| Dereference `p.*` | - | Access through pointer |
-| Import system `import "module"` | All | Module imports |
+| Zig File | Bootstrap .cot File | Status | Notes |
+|----------|---------------------|--------|-------|
+| `src/token.zig` | `src/bootstrap/token_boot.cot` | **Done** | Token types and keywords |
+| `src/source.zig` | `src/bootstrap/source_boot.cot` | **Done** | Source position tracking |
+| `src/scanner.zig` | `src/bootstrap/scanner_boot.cot` | **Done** | Lexer/tokenizer |
+| `src/ast.zig` | `src/bootstrap/ast_boot.cot` | TODO | AST node types |
+| `src/types.zig` | `src/bootstrap/types_boot.cot` | TODO | Type registry |
+| `src/parser.zig` | `src/bootstrap/parser_boot.cot` | TODO | Parser |
+| `src/check.zig` | `src/bootstrap/check_boot.cot` | TODO | Type checker |
+| `src/errors.zig` | `src/bootstrap/errors_boot.cot` | TODO | Error handling |
+| `src/ir.zig` | `src/bootstrap/ir_boot.cot` | TODO | IR definitions |
+| `src/lower.zig` | `src/bootstrap/lower_boot.cot` | TODO | AST → IR lowering |
+| `src/ssa.zig` | `src/bootstrap/ssa_boot.cot` | TODO | SSA conversion |
+| `src/liveness.zig` | `src/bootstrap/liveness_boot.cot` | TODO | Liveness analysis |
+| `src/driver.zig` | `src/bootstrap/driver_boot.cot` | TODO | Compilation orchestration |
+| `src/main.zig` | `src/bootstrap/main_boot.cot` | TODO | Entry point |
+| `src/codegen/backend.zig` | `src/bootstrap/codegen/backend_boot.cot` | TODO | Backend abstraction |
+| `src/codegen/arm64_codegen.zig` | `src/bootstrap/codegen/arm64_boot.cot` | TODO | ARM64 code generation |
+| `src/codegen/amd64_codegen.zig` | `src/bootstrap/codegen/amd64_boot.cot` | TODO | x86_64 code generation |
+| `src/codegen/aarch64.zig` | `src/bootstrap/codegen/aarch64_boot.cot` | TODO | ARM64 instruction encoding |
+| `src/codegen/x86_64.zig` | `src/bootstrap/codegen/x86_64_boot.cot` | TODO | x86_64 instruction encoding |
+| `src/codegen/object.zig` | `src/bootstrap/codegen/object_boot.cot` | TODO | Mach-O/ELF output |
+| `src/codegen/pe_coff.zig` | `src/bootstrap/codegen/pe_coff_boot.cot` | TODO | Windows PE/COFF output |
+| `src/debug.zig` | `src/bootstrap/debug_boot.cot` | TODO | Debug output utilities |
+| `src/type_context.zig` | `src/bootstrap/type_context_boot.cot` | TODO | Type context for checker |
 
----
-
-## Priority 2: Error Handling (Required for Robust Compiler)
-
-The .cot wireframes use error handling throughout.
-
-| Feature | Status | Notes |
-|---------|--------|-------|
-| Error return type `!T` | Gap | Function can fail |
-| Error return type `!` | Gap | Void + can fail |
-| `error.Name` | Gap | Create error value |
-| `try expr` | Gap | Propagate error |
-| `catch default` | Gap | Handle error with default |
-| `catch \|err\| { }` | Gap | Handle error with block |
-
----
-
-## Priority 3: Function Types
-
-Used in errors.cot for callbacks and handlers.
-
-| Feature | Status | Notes |
-|---------|--------|-------|
-| Function type syntax `fn(T) R` | Gap | Type expression |
-| Function as parameter | Gap | Higher-order functions |
-| Type alias for fn | Gap | `type Handler = fn(Error) void` |
+**Progress: 3/22 files complete**
 
 ---
 
-## Priority 4: Partial Features (Need Completion)
+## Minimal Language Subset for Bootstrap
 
-These have parsing done but codegen is incomplete.
+The bootstrap .cot files must use ONLY these features (already working in Zig compiler):
 
-| Feature | Current Status | What's Missing |
-|---------|----------------|----------------|
-| `break` | Parsing done | Codegen |
-| `continue` | Parsing done | Codegen |
-| Pointer type `*T` | Type exists | Full codegen support |
-| Bitwise `& \| ^ ~ << >>` | Partial | Complete codegen |
-| Logical `and or not` | Partial | Short-circuit evaluation |
+### Currently Supported ✅
 
----
+**Types:**
+- `i64`, `int`, `u8`, `bool`, `void`
+- `string` (fat pointer: ptr + len)
+- `[]T` slices
+- `[N]T` arrays (inferred size: `[1, 2, 3]`)
+- `struct { fields }`
+- `enum: T { variants }`
+- `union { variants }`
+- `type` aliases
+- `Map<K, V>`, `List<T>` (runtime FFI)
 
-## Priority 5: Nice-to-Have (Can Work Around)
+**Expressions:**
+- Arithmetic: `+ - * /`
+- Comparison: `== != < > <= >=`
+- Logical: `and or` (short-circuit)
+- Boolean: `true false`
+- Literals: integers, strings, chars (`'a'`)
+- Indexing: `arr[i]`, `s[i]`
+- Slicing: `arr[start:end]`
+- Field access: `obj.field`
+- Method calls: `obj.method(args)`
+- Struct literals: `Point{ .x = 1, .y = 2 }`
+- String interpolation: `"x = {x}"`
+- Null coalescing: `x ?? default`
 
-These would be nice but have workarounds.
+**Statements:**
+- `var x = value;` / `const x = value;`
+- `x = value;` (reassignment)
+- `x += 1;` (compound assignment)
+- `if cond { } else { }`
+- `while cond { }`
+- `for item in iterable { }`
+- `switch value { cases }`
+- `return value;`
 
-| Feature | Workaround |
-|---------|------------|
-| Optional chaining `?.` | Use explicit `if` checks |
-| String concat `+` | Use interpolation `"{a}{b}"` |
-| `@sizeof(T)` | Hardcode sizes or use type registry |
-| `@intCast(T, v)` | Careful about type sizes |
-| `defer` | Explicit cleanup at each exit point |
-| Discard `_ = expr` | Assign to unused variable |
+**Functions:**
+- `fn name(params) ReturnType { body }`
+- Function calls: `name(args)`
 
----
+**Builtins:**
+- `len(x)` - length of string/array/slice
+- `@intFromEnum(e)` - enum to int
+- `@enumFromInt(T, i)` - int to enum
+- `@maxInt(T)` / `@minInt(T)`
+- `print()` / `println()`
 
-## .cot File Readiness
+### NOT Supported (Must Avoid in Bootstrap) ❌
 
-| File | LOC | Main Blockers | Priority |
-|------|-----|---------------|----------|
-| token.cot | 171 | None | Ready |
-| source.cot | 120 | None | Ready |
-| errors.cot | 198 | fn types | P3 |
-| ast.cot | 513 | None | Ready |
-| types.cot | 458 | None | Ready |
-| scanner.cot | 401 | for-index | P1 |
-| ir.cot | 664 | while-capture | P1 |
-| parser.cot | 1289 | None | Ready |
-| checker.cot | 963 | if-capture, &x, errors | P1, P2 |
+These features exist in wireframe .cot files but are NOT in Zig compiler yet:
 
----
-
-## Suggested Implementation Order
-
-### Phase 1: Control Flow Completion
-1. `break` codegen
-2. `continue` codegen
-3. Logical operators with short-circuit
-
-### Phase 2: Optional Captures
-1. If capture `if x |val| { }`
-2. While capture `while next() |item| { }`
-3. For with index `for item, i in items { }`
-
-### Phase 3: Pointers
-1. Address-of `&x`
-2. Dereference `p.*`
-3. Auto-deref for field access
-
-### Phase 4: Error Handling
-1. `!T` return type
-2. `error.Name` values
-3. `try` propagation
-4. `catch` handling
-
-### Phase 5: Finishing
-1. Import system (or file concatenation workaround)
-2. Function types (if needed)
-3. Remaining builtins
+- `if x |val| { }` - optional capture
+- `while iter() |item| { }` - while capture
+- `for item, i in arr { }` - for with index
+- `&x` - address-of operator
+- `p.*` - explicit dereference
+- `!T` / `try` / `catch` - error handling
+- `fn(T) R` - function types as values
+- `break` / `continue` (parsing only, no codegen)
+- `import "module"` - module system
+- `defer` - deferred execution
+- `?.` - optional chaining
+- `@sizeof(T)` / `@alignOf(T)`
+- `@intCast(T, v)` - explicit casts
 
 ---
 
-## x86_64 Test Failures (5 remaining)
+## Implementation Phases
 
-| Test | Likely Issue |
-|------|--------------|
-| test_bool_or | Boolean/logical codegen |
-| test_for_array | Loop codegen |
-| test_for_slice | Loop codegen |
-| test_list_methods | Collection method calls |
-| test_map_methods | Collection method calls |
+### Phase 1: Complete Bootstrap Files (Current Priority)
 
-These should be fixed before self-hosting to ensure cross-platform support.
+**Objective:** Create all `*_boot.cot` files using only supported features.
+
+**Order of implementation:**
+1. ✅ `token_boot.cot` - Token types (DONE)
+2. ✅ `source_boot.cot` - Source positions (DONE)
+3. ✅ `scanner_boot.cot` - Lexer (DONE)
+4. `ast_boot.cot` - AST nodes
+5. `types_boot.cot` - Type registry
+6. `errors_boot.cot` - Error types (simplified, no callbacks)
+7. `parser_boot.cot` - Parser
+8. `check_boot.cot` - Type checker
+9. `ir_boot.cot` - IR definitions
+10. `lower_boot.cot` - Lowering
+11. `ssa_boot.cot` - SSA conversion
+12. `liveness_boot.cot` - Liveness analysis
+13. `codegen/*_boot.cot` - Code generation
+14. `driver_boot.cot` - Orchestration
+15. `main_boot.cot` - Entry point
+
+### Phase 2: Add Missing Features (Only If Blocking)
+
+Only add features if they're absolutely required and can't be worked around:
+
+| Feature | Priority | Workaround Available? |
+|---------|----------|----------------------|
+| `break` codegen | High | Restructure loops |
+| `continue` codegen | High | Restructure loops |
+| For with index | Medium | Use counter variable |
+| Bitwise operators | Medium | Runtime FFI calls |
+| Address-of `&x` | Low | Pass by value, use indices |
+
+### Phase 3: Self-Hosting Test
+
+Once all bootstrap files are complete:
+
+1. Compile `main_boot.cot` with Zig compiler → produces `cot0` binary
+2. Use `cot0` to compile `main_boot.cot` → produces `cot1` binary
+3. Verify `cot0` and `cot1` produce identical output
+4. `cot1` is the first self-hosted cot compiler (Cot 0.3)
+
+### Phase 4: Evolution
+
+After successful self-hosting:
+
+1. Add features to `cot1` using `cot1` itself
+2. Each iteration: `cotN` compiles `cotN+1`
+3. Eventually support all features in wireframe .cot files
+4. Deprecate Zig bootstrap compiler
 
 ---
 
-## Architecture Notes
+## Sync Process
 
-Self-hosting will reimplement the compiler pipeline:
+When modifying the Zig compiler:
 
 ```
-Source (.cot)
-    → Scanner (token.cot)
-    → Parser (parser.cot) → AST (ast.cot)
-    → Checker (checker.cot) → Types (types.cot)
-    → Lowerer → IR (ir.cot)
-    → SSA conversion
-    → Codegen (arm64/amd64)
-    → Object file output
+1. Make change to .zig file
+2. Run: zig build test
+3. Run: ./run_tests.sh
+4. Update corresponding *_boot.cot file
+5. Test: ./zig-out/bin/cot src/bootstrap/*_boot.cot -o test
+6. Run x86_64 tests in Docker
+7. Commit both .zig and .cot changes together
 ```
 
-The Zig implementation serves as the reference. Each .cot file should produce identical results to its Zig counterpart.
+**Rule:** Never commit a .zig change without updating its .cot counterpart (if it exists).
+
+---
+
+## Wireframe vs Bootstrap Files
+
+There are two sets of .cot files:
+
+| Location | Purpose | Uses |
+|----------|---------|------|
+| `src/*.cot` | **Wireframes** - Ideal syntax | All language features (future) |
+| `src/bootstrap/*.cot` | **Bootstrap** - Minimal syntax | Only supported features |
+
+The wireframe files show what the language WILL look like. The bootstrap files show what we can compile TODAY.
+
+After self-hosting, we can gradually migrate from bootstrap files to wireframe files as we add features.
+
+---
+
+## Current Blockers
+
+| Blocker | Impact | Solution |
+|---------|--------|----------|
+| No `break`/`continue` codegen | Must restructure loops | Add codegen (< 1 day) |
+| No address-of `&x` | Can't take pointers | Use indices instead |
+| No error handling | Can't propagate errors | Return error codes |
+| No imports | Single file compilation | File concatenation |
+
+---
+
+## Success Criteria
+
+Cot 0.3 is complete when:
+
+1. All 22 bootstrap .cot files exist and compile
+2. The resulting binary can compile the bootstrap files
+3. Output is identical whether compiled by Zig or Cot compiler
+4. Tests pass on ARM64 and x86_64
+5. No features added to Zig compiler that aren't in bootstrap .cot
+
+---
+
+## Notes for Claude
+
+When working on bootstrap:
+
+1. **Check STATUS.md** for current feature support before writing .cot code
+2. **Use test_comprehensive.cot** as syntax reference for what works
+3. **Avoid** features listed in "NOT Supported" section
+4. **Propose workarounds** rather than adding new Zig features
+5. **Keep files in sync** - update .cot when changing .zig

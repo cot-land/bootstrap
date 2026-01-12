@@ -6,17 +6,37 @@
 
 ## Test Results
 
-| Platform | Passed | Failed | Skipped |
-|----------|--------|--------|---------|
-| ARM64 (macOS) | 65 | 0 | 10 |
-| x86_64 (Linux) | 60 | 5 | 10 |
+| Platform | Status | Notes |
+|----------|--------|-------|
+| ARM64 (macOS) | ✅ All Pass | Comprehensive + 65 individual |
+| x86_64 (Linux) | ✅ All Pass | Comprehensive + 65 individual |
 
 ```bash
-# Run tests
-./run_tests.sh                    # ARM64 native
-./docker_test.sh                  # x86_64 via Docker
-zig build test                    # Zig unit tests (149 tests)
+# Fast validation (default - runs comprehensive test only)
+./run_tests.sh                    # ARM64 native (~2 seconds)
+./run_tests_x86_64.sh             # x86_64 in Docker
+
+# Full test suite (if comprehensive fails or debugging)
+./run_tests.sh --all              # Run all 65 individual tests
+
+# Zig unit tests
+zig build test                    # 135+ embedded tests
 ```
+
+**Comprehensive test:** `tests/test_comprehensive.cot` exercises ALL language features in a single test. Returns 42 on success, specific error codes (1-52) for failures.
+
+---
+
+## Bootstrap Progress
+
+**Goal:** Self-hosting Cot 0.3 compiler (see ROADMAP.md for details)
+
+| Progress | Count | Status |
+|----------|-------|--------|
+| Bootstrap .cot files done | 3/22 | 14% |
+| Zig source files | 22 | Reference implementation |
+
+**Completed:** `token_boot.cot`, `source_boot.cot`, `scanner_boot.cot`
 
 ---
 
@@ -146,7 +166,7 @@ zig build test                    # Zig unit tests (149 tests)
 | IR | `ir.zig` | Done |
 | SSA | `ssa.zig` | Done |
 | ARM64 Codegen | `arm64_codegen.zig` | Done |
-| x86_64 Codegen | `amd64_codegen.zig` | Done (5 test failures) |
+| x86_64 Codegen | `amd64_codegen.zig` | Done |
 | Mach-O Output | `object.zig` | Done |
 | ELF Output | `object.zig` | Done |
 | PE/COFF Output | `pe_coff.zig` | Done |
