@@ -71,3 +71,7 @@ test_union_switch
 test_us
 types_boot
 errors_boot
+check_boot
+test_map_large_struct
+test_map_struct_debug
+test_struct_init_simple
