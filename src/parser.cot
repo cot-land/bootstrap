@@ -3,77 +3,119 @@
 // Maps to Go's cmd/compile/internal/syntax/parser.go
 // Uses precedence climbing for binary expressions.
 
+module parser;
+
 // =============================================================================
-// LANGUAGE FEATURES USED:
+// LANGUAGE FEATURES USED (Phase 1-7):
 // =============================================================================
-// 1. Tagged unions - for AST node construction
-// 2. Switch expressions - for token dispatch
-// 3. Optional types and capture - if expr |val| { }
-// 4. Methods on structs (fn init(scan: *Scanner) Parser)
-// 5. Compound assignment - count += 1
-// 6. List<T> generic
+// 1. Module declaration and pub visibility (Phase 6)
+// 2. Imports (Phase 6)
+// 3. Result<T, E> for error handling (Phase 2)
+// 4. ? propagation operator (Phase 2)
+// 5. Tagged unions - for AST node construction
+// 6. Switch expressions - for token dispatch
+// 7. Optional types and capture - if expr |val| { }
+// 8. Methods on structs (fn init(scan: *Scanner) Parser)
+// 9. Compound assignment - count += 1
+// 10. List<T> generic
+// 11. Optional chaining .? (Phase 5)
 // =============================================================================
 
-import "token"
-import "source"
-import "scanner"
-import "errors"
-import "ast"
+import token;
+import source;
+import scanner;
+import errors;
+import ast;
 
-// Parser state.
-struct Parser {
+// ============================================================================
+// Parse Error Types
+// ============================================================================
+
+/// Specific parse error codes.
+pub enum ParseErrorKind: u8 {
+    unexpected_token,
+    expected_identifier,
+    expected_expression,
+    expected_type,
+    expected_declaration,
+    expected_block,
+    unclosed_paren,
+    unclosed_brace,
+    unclosed_bracket,
+    invalid_assignment_target,
+}
+
+/// A parse error with location and details.
+pub struct ParseError {
+    kind: ParseErrorKind,
+    message: string,
+    span: Span,
+}
+
+/// Result type for parsing operations.
+pub type ParseResult<T> = Result<T, ParseError>;
+
+// ============================================================================
+// Parser State
+// ============================================================================
+
+/// Parser state.
+pub struct Parser {
     scanner: *Scanner,
     tok: TokenInfo,
     ast: *Ast,
     err: *ErrorReporter,
 }
 
-// Initialize parser.
-fn init(scan: *Scanner, tree: *Ast, reporter: *ErrorReporter) Parser {
+/// Initialize parser.
+pub fn init(scan: *Scanner, tree: *Ast, reporter: *ErrorReporter) Parser {
     var p = Parser{
         .scanner = scan,
         .tok = scan.next(),  // Prime with first token
         .ast = tree,
         .err = reporter,
-    }
-    return p
+    };
+    return p;
 }
 
 // ========================================================================
 // Token handling
 // ========================================================================
 
-// Advance to next token.
-fn advance(self: *Parser) {
-    self.tok = self.scanner.next()
+/// Advance to next token.
+pub fn advance(self: *Parser) void {
+    self.tok = self.scanner.next();
 }
 
-// Check if current token matches.
-fn check(self: *Parser, t: Token) bool {
-    return self.tok.tok == t
+/// Check if current token matches.
+pub fn check(self: *Parser, t: Token) bool {
+    return self.tok.tok == t;
 }
 
-// Consume token if it matches, return true if consumed.
-fn match(self: *Parser, t: Token) bool {
+/// Consume token if it matches, return true if consumed.
+pub fn match(self: *Parser, t: Token) bool {
     if self.check(t) {
-        self.advance()
-        return true
+        self.advance();
+        return true;
     }
-    return false
+    return false;
 }
 
-// Expect a token, report error if not found.
-fn expect(self: *Parser, t: Token) bool {
+/// Expect a token, return error if not found.
+pub fn expect(self: *Parser, t: Token) ParseResult<void> {
     if self.check(t) {
-        self.advance()
-        return true
+        self.advance();
+        return .ok(void{});
     }
-    self.errorExpected(t)
-    return false
+    return .err(ParseError{
+        .kind = .unexpected_token,
+        .message = "expected " ++ t.toString(),
+        .span = self.tok.span,
+    });
 }
 
-// Report "expected X" error.
-fn errorExpected(self: *Parser, t: Token) {
+/// Report "expected X" error (legacy compatibility).
+fn errorExpected(self: *Parser, t: Token) void {
     var msg = switch t {
         .identifier => "expected identifier",
         .lparen => "expected '('",
@@ -87,34 +129,45 @@ fn errorExpected(self: *Parser, t: Token) {
         .equal => "expected '='",
         .comma => "expected ','",
         else => "unexpected token",
-    }
-    self.err.errorAt(self.tok.span.start, msg)
+    };
+    self.err.errorAt(self.tok.span.start, msg);
 }
 
-// Report a syntax error.
-fn syntaxError(self: *Parser, msg: string) {
-    self.err.errorWithCode(self.tok.span.start, .E200, msg)
+/// Create a parse error.
+fn makeError(self: *Parser, kind: ParseErrorKind, msg: string) ParseError {
+    return ParseError{
+        .kind = kind,
+        .message = msg,
+        .span = self.tok.span,
+    };
 }
 
-// Get current position.
-fn pos(self: *Parser) Pos {
-    return self.tok.span.start
+/// Report a syntax error.
+fn syntaxError(self: *Parser, msg: string) void {
+    self.err.errorWithCode(self.tok.span.start, .E200, msg);
+}
+
+/// Get current position.
+pub fn pos(self: *Parser) Pos {
+    return self.tok.span.start;
 }
 
 // ========================================================================
 // File parsing
 // ========================================================================
 
-// Parse a complete file.
-fn parseFile(self: *Parser) {
-    var decls = new List<NodeIndex>
+/// Parse a complete file.
+pub fn parseFile(self: *Parser) ParseResult<void> {
+    var decls = new List<NodeIndex>();
 
     while not self.check(.eof) {
-        if self.parseDecl() |decl_idx| {
-            decls.push(decl_idx)
-        } else {
-            // Error recovery: skip to next declaration
-            self.advance()
+        switch self.parseDecl() {
+            .ok |decl_idx| => decls.push(decl_idx),
+            .err |e| => {
+                // Report error and attempt recovery
+                self.err?.errorAt(e.span.start, e.message);
+                self.advance();  // Skip to next token for recovery
+            },
         }
     }
 
@@ -122,99 +175,175 @@ fn parseFile(self: *Parser) {
         .filename = self.scanner.src.filename,
         .decls = decls.toSlice(),
         .span = Span.init(Pos.zero, self.tok.span.end),
-    }
+    };
+
+    return .ok(void{});
 }
 
 // ========================================================================
 // Declaration parsing
 // ========================================================================
 
-// Parse a declaration.
-fn parseDecl(self: *Parser) ?NodeIndex {
+/// Parse a declaration.
+pub fn parseDecl(self: *Parser) ParseResult<NodeIndex> {
     return switch self.tok.tok {
         .kw_fn => self.parseFnDecl(),
         .kw_var, .kw_let => self.parseVarDecl(),
         .kw_const => self.parseConstDecl(),
         .kw_struct => self.parseStructDecl(),
-        else => {
-            self.syntaxError("expected declaration")
-            return null
-        },
-    }
+        .kw_enum => self.parseEnumDecl(),
+        .kw_union => self.parseUnionDecl(),
+        .kw_type => self.parseTypeAlias(),
+        .kw_pub => self.parsePubDecl(),
+        .kw_module => self.parseModuleDecl(),
+        .kw_import => self.parseImportDecl(),
+        else => .err(self.makeError(.expected_declaration, "expected declaration")),
+    };
 }
 
-// Parse function declaration: fn name(params) type { body }
-fn parseFnDecl(self: *Parser) ?NodeIndex {
-    var start = self.pos()
-    self.advance()  // consume 'fn'
+/// Parse a pub-prefixed declaration.
+fn parsePubDecl(self: *Parser) ParseResult<NodeIndex> {
+    var start = self.pos();
+    self.advance();  // consume 'pub'
+
+    // Parse the actual declaration
+    var inner = self.parseDecl()?;
+
+    // Wrap in pub marker (in AST the node itself would have a pub flag)
+    return .ok(inner);
+}
+
+/// Parse module declaration: module name;
+fn parseModuleDecl(self: *Parser) ParseResult<NodeIndex> {
+    var start = self.pos();
+    self.advance();  // consume 'module'
+
+    if not self.check(.identifier) {
+        return .err(self.makeError(.expected_identifier, "expected module name"));
+    }
+    var name = self.tok.text;
+    self.advance();
+
+    _ = self.match(.semicolon);
+
+    return .ok(self.ast.addNode(Node{
+        .decl = Decl{
+            .module_decl = ModuleDecl{
+                .name = name,
+                .span = Span.init(start, self.tok.span.start),
+            },
+        },
+    }));
+}
+
+/// Parse import declaration: import module;
+fn parseImportDecl(self: *Parser) ParseResult<NodeIndex> {
+    var start = self.pos();
+    self.advance();  // consume 'import'
+
+    if not self.check(.identifier) {
+        return .err(self.makeError(.expected_identifier, "expected module name"));
+    }
+    var name = self.tok.text;
+    self.advance();
+
+    _ = self.match(.semicolon);
+
+    return .ok(self.ast.addNode(Node{
+        .decl = Decl{
+            .import_decl = ImportDecl{
+                .module = name,
+                .span = Span.init(start, self.tok.span.start),
+            },
+        },
+    }));
+}
+
+/// Parse function declaration: fn name(params) type { body }
+pub fn parseFnDecl(self: *Parser) ParseResult<NodeIndex> {
+    var start = self.pos();
+    self.advance();  // consume 'fn'
 
     // Function name
     if not self.check(.identifier) {
-        self.err.errorWithCode(self.pos(), .E203, "expected function name")
-        return null
+        return .err(self.makeError(.expected_identifier, "expected function name"));
     }
-    var name = self.tok.text
-    self.advance()
+    var name = self.tok.text;
+    self.advance();
+
+    // Generic type parameters: <T, U>
+    var type_params: []string = [];
+    if self.match(.less) {
+        var params = new List<string>();
+        while not self.check(.greater) and not self.check(.eof) {
+            if not self.check(.identifier) {
+                return .err(self.makeError(.expected_identifier, "expected type parameter"));
+            }
+            params.push(self.tok.text);
+            self.advance();
+            if not self.match(.comma) {
+                break;
+            }
+        }
+        self.expect(.greater)?;
+        type_params = params.toSlice();
+    }
 
     // Parameters
-    if not self.expect(.lparen) {
-        return null
-    }
-    var params = self.parseFieldList(.rparen)
-    if not self.expect(.rparen) {
-        return null
-    }
+    self.expect(.lparen)?;
+    var params = self.parseFieldList(.rparen)?;
+    self.expect(.rparen)?;
 
     // Return type (optional)
-    var return_type: ?NodeIndex = null
+    var return_type: ?NodeIndex = null;
     if not self.check(.lbrace) and not self.check(.eof) {
-        return_type = self.parseType()
+        return_type = self.parseType()?;
     }
 
     // Body (optional for forward declarations)
-    var body: ?NodeIndex = null
+    var body: ?NodeIndex = null;
     if self.check(.lbrace) {
-        body = self.parseBlock()
+        body = self.parseBlock()?;
     }
 
-    return self.ast.addNode(Node{
+    return .ok(self.ast.addNode(Node{
         .decl = Decl{
             .fn_decl = FnDecl{
                 .name = name,
+                .type_params = type_params,
                 .params = params,
                 .return_type = return_type,
                 .body = body,
                 .span = Span.init(start, self.tok.span.start),
             },
         },
-    })
+    }));
 }
 
-// Parse var/let declaration: var name: type = value
-fn parseVarDecl(self: *Parser) ?NodeIndex {
-    var start = self.pos()
-    self.advance()  // consume 'var' or 'let'
+/// Parse var/let declaration: var name: type = value
+pub fn parseVarDecl(self: *Parser) ParseResult<NodeIndex> {
+    var start = self.pos();
+    self.advance();  // consume 'var' or 'let'
 
     if not self.check(.identifier) {
-        self.err.errorWithCode(self.pos(), .E203, "expected variable name")
-        return null
+        return .err(self.makeError(.expected_identifier, "expected variable name"));
     }
-    var name = self.tok.text
-    self.advance()
+    var name = self.tok.text;
+    self.advance();
 
     // Type annotation (optional)
-    var type_expr: ?NodeIndex = null
+    var type_expr: ?NodeIndex = null;
     if self.match(.colon) {
-        type_expr = self.parseType()
+        type_expr = self.parseType()?;
     }
 
     // Initializer (optional)
-    var value: ?NodeIndex = null
+    var value: ?NodeIndex = null;
     if self.match(.equal) {
-        value = self.parseExpr()
+        value = self.parseExpr()?;
     }
 
-    return self.ast.addNode(Node{
+    return .ok(self.ast.addNode(Node{
         .decl = Decl{
             .var_decl = VarDecl{
                 .name = name,
@@ -223,488 +352,613 @@ fn parseVarDecl(self: *Parser) ?NodeIndex {
                 .span = Span.init(start, self.tok.span.start),
             },
         },
-    })
+    }));
 }
 
-// Parse const declaration: const name: type = value
-fn parseConstDecl(self: *Parser) ?NodeIndex {
-    var start = self.pos()
-    self.advance()  // consume 'const'
+/// Parse const declaration: const name: type = value
+pub fn parseConstDecl(self: *Parser) ParseResult<NodeIndex> {
+    var start = self.pos();
+    self.advance();  // consume 'const'
 
     if not self.check(.identifier) {
-        self.err.errorWithCode(self.pos(), .E203, "expected constant name")
-        return null
+        return .err(self.makeError(.expected_identifier, "expected constant name"));
     }
-    var name = self.tok.text
-    self.advance()
+    var name = self.tok.text;
+    self.advance();
 
     // Type annotation (optional)
-    var type_expr: ?NodeIndex = null
+    var type_expr: ?NodeIndex = null;
     if self.match(.colon) {
-        type_expr = self.parseType()
+        type_expr = self.parseType()?;
     }
 
     // Initializer (required for const)
-    if not self.expect(.equal) {
-        return null
-    }
-    var value = self.parseExpr()
-    if value == null {
-        self.err.errorWithCode(self.pos(), .E201, "expected expression")
-        return null
-    }
+    self.expect(.equal)?;
+    var value = self.parseExpr()?;
 
-    return self.ast.addNode(Node{
+    return .ok(self.ast.addNode(Node{
         .decl = Decl{
             .const_decl = ConstDecl{
                 .name = name,
                 .type_expr = type_expr,
-                .value = value.?,
+                .value = value,
                 .span = Span.init(start, self.tok.span.start),
             },
         },
-    })
+    }));
 }
 
-// Parse struct declaration: struct Name { fields }
-fn parseStructDecl(self: *Parser) ?NodeIndex {
-    var start = self.pos()
-    self.advance()  // consume 'struct'
+/// Parse struct declaration: struct Name { fields }
+pub fn parseStructDecl(self: *Parser) ParseResult<NodeIndex> {
+    var start = self.pos();
+    self.advance();  // consume 'struct'
 
     if not self.check(.identifier) {
-        self.err.errorWithCode(self.pos(), .E203, "expected struct name")
-        return null
+        return .err(self.makeError(.expected_identifier, "expected struct name"));
     }
-    var name = self.tok.text
-    self.advance()
+    var name = self.tok.text;
+    self.advance();
 
-    if not self.expect(.lbrace) {
-        return null
-    }
-    var fields = self.parseFieldList(.rbrace)
-    if not self.expect(.rbrace) {
-        return null
+    // Generic type parameters: <T, U>
+    var type_params: []string = [];
+    if self.match(.less) {
+        var params = new List<string>();
+        while not self.check(.greater) and not self.check(.eof) {
+            if not self.check(.identifier) {
+                return .err(self.makeError(.expected_identifier, "expected type parameter"));
+            }
+            params.push(self.tok.text);
+            self.advance();
+            if not self.match(.comma) {
+                break;
+            }
+        }
+        self.expect(.greater)?;
+        type_params = params.toSlice();
     }
 
-    return self.ast.addNode(Node{
+    self.expect(.lbrace)?;
+    var fields = self.parseFieldList(.rbrace)?;
+    self.expect(.rbrace)?;
+
+    return .ok(self.ast.addNode(Node{
         .decl = Decl{
             .struct_decl = StructDecl{
                 .name = name,
+                .type_params = type_params,
                 .fields = fields,
                 .span = Span.init(start, self.tok.span.start),
             },
         },
-    })
+    }));
 }
 
-// Parse enum declaration: enum Name { variants }
-fn parseEnumDecl(self: *Parser) ?NodeIndex {
-    var start = self.pos()
-    self.advance()  // consume 'enum'
+/// Parse enum declaration: enum Name { variants }
+pub fn parseEnumDecl(self: *Parser) ParseResult<NodeIndex> {
+    var start = self.pos();
+    self.advance();  // consume 'enum'
 
     if not self.check(.identifier) {
-        self.err.errorWithCode(self.pos(), .E203, "expected enum name")
-        return null
+        return .err(self.makeError(.expected_identifier, "expected enum name"));
     }
-    var name = self.tok.text
-    self.advance()
+    var name = self.tok.text;
+    self.advance();
 
-    if not self.expect(.lbrace) {
-        return null
+    // Backing type: enum Foo: u8
+    var backing_type: ?NodeIndex = null;
+    if self.match(.colon) {
+        backing_type = self.parseType()?;
     }
 
-    var variants = new List<EnumVariant>
+    self.expect(.lbrace)?;
+
+    var variants = new List<EnumVariant>();
 
     while not self.check(.rbrace) and not self.check(.eof) {
         if not self.check(.identifier) {
-            self.syntaxError("expected variant name")
-            break
+            return .err(self.makeError(.expected_identifier, "expected variant name"));
         }
-        var variant_name = self.tok.text
-        var variant_start = self.pos()
-        self.advance()
+        var variant_name = self.tok.text;
+        var variant_start = self.pos();
+        self.advance();
 
-        var value: ?NodeIndex = null
+        var value: ?NodeIndex = null;
         if self.match(.equal) {
-            value = self.parseExpr()
+            value = self.parseExpr()?;
         }
 
         variants.push(EnumVariant{
             .name = variant_name,
             .value = value,
             .span = Span.init(variant_start, self.tok.span.start),
-        })
+        });
 
         if not self.match(.comma) {
-            break
+            break;
         }
     }
 
-    if not self.expect(.rbrace) {
-        return null
-    }
+    self.expect(.rbrace)?;
 
-    return self.ast.addNode(Node{
+    return .ok(self.ast.addNode(Node{
         .decl = Decl{
             .enum_decl = EnumDecl{
                 .name = name,
+                .backing_type = backing_type,
                 .variants = variants.toSlice(),
                 .span = Span.init(start, self.tok.span.start),
             },
         },
-    })
+    }));
 }
 
-// Parse field list (for struct fields and function parameters).
-fn parseFieldList(self: *Parser, end: Token) []Field {
-    var fields = new List<Field>
+/// Parse union declaration: union Name { variants }
+pub fn parseUnionDecl(self: *Parser) ParseResult<NodeIndex> {
+    var start = self.pos();
+    self.advance();  // consume 'union'
 
-    while not self.check(end) and not self.check(.eof) {
+    if not self.check(.identifier) {
+        return .err(self.makeError(.expected_identifier, "expected union name"));
+    }
+    var name = self.tok.text;
+    self.advance();
+
+    // Generic type parameters: <T, U>
+    var type_params: []string = [];
+    if self.match(.less) {
+        var params = new List<string>();
+        while not self.check(.greater) and not self.check(.eof) {
+            if not self.check(.identifier) {
+                return .err(self.makeError(.expected_identifier, "expected type parameter"));
+            }
+            params.push(self.tok.text);
+            self.advance();
+            if not self.match(.comma) {
+                break;
+            }
+        }
+        self.expect(.greater)?;
+        type_params = params.toSlice();
+    }
+
+    self.expect(.lbrace)?;
+
+    var variants = new List<UnionVariant>();
+
+    while not self.check(.rbrace) and not self.check(.eof) {
         if not self.check(.identifier) {
-            break
+            return .err(self.makeError(.expected_identifier, "expected variant name"));
+        }
+        var variant_name = self.tok.text;
+        var variant_start = self.pos();
+        self.advance();
+
+        var variant_type: ?NodeIndex = null;
+        if self.match(.colon) {
+            variant_type = self.parseType()?;
         }
 
-        var field_name = self.tok.text
-        var field_start = self.pos()
-        self.advance()
-
-        if not self.expect(.colon) {
-            break
-        }
-
-        var type_idx = self.parseType()
-        if type_idx == null {
-            break
-        }
-
-        fields.push(Field{
-            .name = field_name,
-            .type_expr = type_idx.?,
-            .span = Span.init(field_start, self.tok.span.start),
-        })
+        variants.push(UnionVariant{
+            .name = variant_name,
+            .type_expr = variant_type,
+            .span = Span.init(variant_start, self.tok.span.start),
+        });
 
         if not self.match(.comma) {
-            break
+            break;
         }
     }
 
-    return fields.toSlice()
+    self.expect(.rbrace)?;
+
+    return .ok(self.ast.addNode(Node{
+        .decl = Decl{
+            .union_decl = UnionDecl{
+                .name = name,
+                .type_params = type_params,
+                .variants = variants.toSlice(),
+                .span = Span.init(start, self.tok.span.start),
+            },
+        },
+    }));
+}
+
+/// Parse type alias: type Name = Type;
+pub fn parseTypeAlias(self: *Parser) ParseResult<NodeIndex> {
+    var start = self.pos();
+    self.advance();  // consume 'type'
+
+    if not self.check(.identifier) {
+        return .err(self.makeError(.expected_identifier, "expected type name"));
+    }
+    var name = self.tok.text;
+    self.advance();
+
+    // Generic type parameters: <T, U>
+    var type_params: []string = [];
+    if self.match(.less) {
+        var params = new List<string>();
+        while not self.check(.greater) and not self.check(.eof) {
+            if not self.check(.identifier) {
+                return .err(self.makeError(.expected_identifier, "expected type parameter"));
+            }
+            params.push(self.tok.text);
+            self.advance();
+            if not self.match(.comma) {
+                break;
+            }
+        }
+        self.expect(.greater)?;
+        type_params = params.toSlice();
+    }
+
+    self.expect(.equal)?;
+    var underlying = self.parseType()?;
+    _ = self.match(.semicolon);
+
+    return .ok(self.ast.addNode(Node{
+        .decl = Decl{
+            .type_alias = TypeAliasDecl{
+                .name = name,
+                .type_params = type_params,
+                .underlying = underlying,
+                .span = Span.init(start, self.tok.span.start),
+            },
+        },
+    }));
+}
+
+/// Parse field list (for struct fields and function parameters).
+pub fn parseFieldList(self: *Parser, end: Token) ParseResult<[]Field> {
+    var fields = new List<Field>();
+
+    while not self.check(end) and not self.check(.eof) {
+        if not self.check(.identifier) {
+            break;
+        }
+
+        var field_name = self.tok.text;
+        var field_start = self.pos();
+        self.advance();
+
+        self.expect(.colon)?;
+
+        var type_idx = self.parseType()?;
+
+        fields.push(Field{
+            .name = field_name,
+            .type_expr = type_idx,
+            .span = Span.init(field_start, self.tok.span.start),
+        });
+
+        if not self.match(.comma) {
+            break;
+        }
+    }
+
+    return .ok(fields.toSlice());
 }
 
 // ========================================================================
 // Type parsing
 // ========================================================================
 
-// Parse a type expression.
-fn parseType(self: *Parser) ?NodeIndex {
-    var start = self.pos()
+/// Parse a type expression.
+pub fn parseType(self: *Parser) ParseResult<NodeIndex> {
+    var start = self.pos();
 
     // Optional type: ?T
     if self.match(.question) {
-        var inner = self.parseType()
-        if inner == null {
-            return null
-        }
-        return self.ast.addNode(Node{
+        var inner = self.parseType()?;
+        return .ok(self.ast.addNode(Node{
             .expr = Expr{
                 .type_expr = TypeExpr{
-                    .kind = TypeKind{ .optional = inner.? },
+                    .kind = TypeKind{ .optional = inner },
                     .span = Span.init(start, self.tok.span.start),
                 },
             },
-        })
+        }));
     }
 
     // Pointer type: *T
     if self.match(.star) {
-        var inner = self.parseType()
-        if inner == null {
-            return null
-        }
-        return self.ast.addNode(Node{
+        var inner = self.parseType()?;
+        return .ok(self.ast.addNode(Node{
             .expr = Expr{
                 .type_expr = TypeExpr{
-                    .kind = TypeKind{ .pointer = inner.? },
+                    .kind = TypeKind{ .pointer = inner },
                     .span = Span.init(start, self.tok.span.start),
                 },
             },
-        })
+        }));
     }
 
     // Slice type: []T or Array type: [N]T
     if self.match(.lbracket) {
         if self.match(.rbracket) {
             // Slice: []T
-            var elem = self.parseType()
-            if elem == null {
-                return null
-            }
-            return self.ast.addNode(Node{
+            var elem = self.parseType()?;
+            return .ok(self.ast.addNode(Node{
                 .expr = Expr{
                     .type_expr = TypeExpr{
-                        .kind = TypeKind{ .slice = elem.? },
+                        .kind = TypeKind{ .slice = elem },
                         .span = Span.init(start, self.tok.span.start),
                     },
                 },
-            })
+            }));
         } else {
             // Array: [N]T
-            var size = self.parseExpr()
-            if size == null {
-                return null
-            }
-            if not self.expect(.rbracket) {
-                return null
-            }
-            var elem = self.parseType()
-            if elem == null {
-                return null
-            }
-            return self.ast.addNode(Node{
+            var size = self.parseExpr()?;
+            self.expect(.rbracket)?;
+            var elem = self.parseType()?;
+            return .ok(self.ast.addNode(Node{
                 .expr = Expr{
                     .type_expr = TypeExpr{
-                        .kind = TypeKind{ .array = TypeArray{ .size = size.?, .elem = elem.? } },
+                        .kind = TypeKind{ .array = TypeArray{ .size = size, .elem = elem } },
                         .span = Span.init(start, self.tok.span.start),
                     },
                 },
-            })
+            }));
         }
     }
 
     // Named type: identifier or type keyword
     if self.check(.identifier) or isTypeKeyword(self.tok.tok) {
-        var name = self.tok.text
+        var name = self.tok.text;
         if not self.check(.identifier) {
-            name = self.tok.tok.toString()
+            name = self.tok.tok.toString();
         }
-        self.advance()
-        return self.ast.addNode(Node{
+        self.advance();
+
+        // Check for generic instantiation: Name<T, U>
+        var type_args: []NodeIndex = [];
+        if self.match(.less) {
+            var args = new List<NodeIndex>();
+            while not self.check(.greater) and not self.check(.eof) {
+                var arg = self.parseType()?;
+                args.push(arg);
+                if not self.match(.comma) {
+                    break;
+                }
+            }
+            self.expect(.greater)?;
+            type_args = args.toSlice();
+        }
+
+        return .ok(self.ast.addNode(Node{
             .expr = Expr{
                 .type_expr = TypeExpr{
-                    .kind = TypeKind{ .named = name },
+                    .kind = TypeKind{ .named = NamedType{ .name = name, .type_args = type_args } },
                     .span = Span.init(start, self.tok.span.start),
                 },
             },
-        })
+        }));
     }
 
-    self.err.errorWithCode(self.pos(), .E202, "expected type")
-    return null
+    return .err(self.makeError(.expected_type, "expected type"));
 }
 
 // ========================================================================
 // Expression parsing (precedence climbing)
 // ========================================================================
 
-// Parse an expression.
-fn parseExpr(self: *Parser) ?NodeIndex {
-    return self.parseBinaryExpr(0)
+/// Parse an expression.
+pub fn parseExpr(self: *Parser) ParseResult<NodeIndex> {
+    return self.parseBinaryExpr(0);
 }
 
-// Parse binary expression with precedence climbing.
-fn parseBinaryExpr(self: *Parser, min_prec: u8) ?NodeIndex {
-    var left = self.parseUnaryExpr()
-    if left == null {
-        return null
-    }
+/// Parse binary expression with precedence climbing.
+fn parseBinaryExpr(self: *Parser, min_prec: u8) ParseResult<NodeIndex> {
+    var left = self.parseUnaryExpr()?;
 
     while true {
-        var op = self.tok.tok
-        var prec = binaryPrecedence(op)
+        var op = self.tok.tok;
+        var prec = binaryPrecedence(op);
 
         if prec == .none or @intFromEnum(prec) <= min_prec {
-            break
+            break;
         }
 
-        var op_start = self.pos()
-        self.advance()
+        var op_start = self.pos();
+        self.advance();
 
-        var right = self.parseBinaryExpr(@intFromEnum(prec))
-        if right == null {
-            self.err.errorWithCode(self.pos(), .E201, "expected expression")
-            return null
-        }
+        var right = self.parseBinaryExpr(@intFromEnum(prec))?;
 
         left = self.ast.addNode(Node{
             .expr = Expr{
                 .binary = Binary{
                     .op = op,
-                    .left = left.?,
-                    .right = right.?,
+                    .left = left,
+                    .right = right,
                     .span = Span.init(op_start, self.tok.span.start),
                 },
             },
-        })
+        });
     }
 
-    return left
+    return .ok(left);
 }
 
-// Parse unary expression.
-fn parseUnaryExpr(self: *Parser) ?NodeIndex {
-    var start = self.pos()
+/// Parse unary expression.
+fn parseUnaryExpr(self: *Parser) ParseResult<NodeIndex> {
+    var start = self.pos();
 
-    // Unary operators: -, !, not
-    if self.tok.tok == .minus or self.tok.tok == .bang or self.tok.tok == .kw_not {
-        var op = self.tok.tok
-        self.advance()
-        var operand = self.parseUnaryExpr()
-        if operand == null {
-            return null
-        }
-        return self.ast.addNode(Node{
+    // Unary operators: -, !, not, &
+    if self.tok.tok == .minus or self.tok.tok == .bang or self.tok.tok == .kw_not or self.tok.tok == .ampersand {
+        var op = self.tok.tok;
+        self.advance();
+        var operand = self.parseUnaryExpr()?;
+        return .ok(self.ast.addNode(Node{
             .expr = Expr{
                 .unary = Unary{
                     .op = op,
-                    .operand = operand.?,
+                    .operand = operand,
                     .span = Span.init(start, self.tok.span.start),
                 },
             },
-        })
+        }));
     }
 
-    return self.parsePrimaryExpr()
+    return self.parsePrimaryExpr();
 }
 
-// Parse primary expression (operand + postfix).
-fn parsePrimaryExpr(self: *Parser) ?NodeIndex {
-    var expr = self.parseOperand()
-    if expr == null {
-        return null
-    }
+/// Parse primary expression (operand + postfix).
+fn parsePrimaryExpr(self: *Parser) ParseResult<NodeIndex> {
+    var expr = self.parseOperand()?;
 
-    // Postfix operators: ., [], ()
+    // Postfix operators: ., .?, [], ()
     while true {
-        if self.match(.dot) {
-            // Field access: expr.field
+        if self.match(.dot_question) {
+            // Optional chaining: expr?.field
             if not self.check(.identifier) {
-                self.err.errorWithCode(self.pos(), .E203, "expected field name")
-                return null
+                return .err(self.makeError(.expected_identifier, "expected field name after .?"));
             }
-            var field = self.tok.text
-            var field_end = self.tok.span.end
-            self.advance()
+            var field = self.tok.text;
+            var field_end = self.tok.span.end;
+            self.advance();
 
-            var expr_span = self.ast.getNode(expr.?).span()
+            var expr_span = self.ast.getNode(expr).span();
             expr = self.ast.addNode(Node{
                 .expr = Expr{
-                    .field_access = FieldAccess{
-                        .base = expr.?,
+                    .optional_chain = OptionalChain{
+                        .base = expr,
                         .field = field,
                         .span = Span.init(expr_span.start, field_end),
                     },
                 },
-            })
+            });
+        } else if self.match(.dot) {
+            // Check for .dot followed by .dot again for range: 0..10
+            if self.check(.dot) {
+                self.advance();  // consume second dot
+                var inclusive = self.match(.equal);  // 0..=10
+                var end_expr = self.parseUnaryExpr()?;
+
+                var expr_span = self.ast.getNode(expr).span();
+                expr = self.ast.addNode(Node{
+                    .expr = Expr{
+                        .range = RangeExpr{
+                            .start = expr,
+                            .end = end_expr,
+                            .inclusive = inclusive,
+                            .span = Span.init(expr_span.start, self.tok.span.start),
+                        },
+                    },
+                });
+            } else {
+                // Field access: expr.field
+                if not self.check(.identifier) {
+                    return .err(self.makeError(.expected_identifier, "expected field name"));
+                }
+                var field = self.tok.text;
+                var field_end = self.tok.span.end;
+                self.advance();
+
+                var expr_span = self.ast.getNode(expr).span();
+                expr = self.ast.addNode(Node{
+                    .expr = Expr{
+                        .field_access = FieldAccess{
+                            .base = expr,
+                            .field = field,
+                            .span = Span.init(expr_span.start, field_end),
+                        },
+                    },
+                });
+            }
         } else if self.match(.lbracket) {
             // Index: expr[index]
-            var index = self.parseExpr()
-            if index == null {
-                return null
-            }
-            var end = self.tok.span.end
-            if not self.expect(.rbracket) {
-                return null
-            }
+            var index = self.parseExpr()?;
+            var end = self.tok.span.end;
+            self.expect(.rbracket)?;
 
-            var expr_span = self.ast.getNode(expr.?).span()
+            var expr_span = self.ast.getNode(expr).span();
             expr = self.ast.addNode(Node{
                 .expr = Expr{
                     .index = Index{
-                        .base = expr.?,
-                        .index = index.?,
+                        .base = expr,
+                        .index = index,
                         .span = Span.init(expr_span.start, end),
                     },
                 },
-            })
+            });
         } else if self.match(.lparen) {
             // Call: expr(args)
-            var args = new List<NodeIndex>
+            var args = new List<NodeIndex>();
 
             while not self.check(.rparen) and not self.check(.eof) {
-                var arg = self.parseExpr()
-                if arg == null {
-                    break
-                }
-                args.push(arg.?)
+                var arg = self.parseExpr()?;
+                args.push(arg);
                 if not self.match(.comma) {
-                    break
+                    break;
                 }
             }
 
-            var end = self.tok.span.end
-            if not self.expect(.rparen) {
-                return null
-            }
+            var end = self.tok.span.end;
+            self.expect(.rparen)?;
 
-            var expr_span = self.ast.getNode(expr.?).span()
+            var expr_span = self.ast.getNode(expr).span();
             expr = self.ast.addNode(Node{
                 .expr = Expr{
                     .call = Call{
-                        .callee = expr.?,
+                        .callee = expr,
                         .args = args.toSlice(),
                         .span = Span.init(expr_span.start, end),
                     },
                 },
-            })
+            });
         } else if self.match(.lbrace) {
             // Struct literal: Type{ .field = value, ... }
-            var node = self.ast.getNode(expr.?)
+            var node = self.ast.getNode(expr);
             var type_name = switch node {
                 .expr |e| => switch e {
                     .identifier |id| => id.name,
+                    .type_expr |te| => switch te.kind {
+                        .named |n| => n.name,
+                        else => {
+                            return .err(self.makeError(.expected_expression, "struct literal requires type name"));
+                        },
+                    },
                     else => {
-                        self.err.errorWithCode(self.pos(), .E201, "struct literal requires type name")
-                        return null
+                        return .err(self.makeError(.expected_expression, "struct literal requires type name"));
                     },
                 },
                 else => {
-                    self.err.errorWithCode(self.pos(), .E201, "struct literal requires type name")
-                    return null
+                    return .err(self.makeError(.expected_expression, "struct literal requires type name"));
                 },
-            }
+            };
 
-            var fields = new List<FieldInit>
+            var fields = new List<FieldInit>();
 
             while not self.check(.rbrace) and not self.check(.eof) {
                 // Parse .field = value
-                if not self.expect(.dot) {
-                    return null
-                }
+                self.expect(.dot)?;
                 if not self.check(.identifier) {
-                    self.err.errorWithCode(self.pos(), .E203, "expected field name")
-                    return null
+                    return .err(self.makeError(.expected_identifier, "expected field name"));
                 }
-                var field_name = self.tok.text
-                var field_start = self.tok.span.start
-                self.advance()
+                var field_name = self.tok.text;
+                var field_start = self.tok.span.start;
+                self.advance();
 
-                if not self.expect(.equal) {
-                    return null
-                }
+                self.expect(.equal)?;
 
-                var value = self.parseExpr()
-                if value == null {
-                    return null
-                }
-                var field_end = self.ast.getNode(value.?).span().end
+                var value = self.parseExpr()?;
+                var field_end = self.ast.getNode(value).span().end;
 
                 fields.push(FieldInit{
                     .name = field_name,
-                    .value = value.?,
+                    .value = value,
                     .span = Span.init(field_start, field_end),
-                })
+                });
 
                 if not self.match(.comma) {
-                    break
+                    break;
                 }
             }
 
-            var end = self.tok.span.end
-            if not self.expect(.rbrace) {
-                return null
-            }
+            var end = self.tok.span.end;
+            self.expect(.rbrace)?;
 
-            var expr_span = self.ast.getNode(expr.?).span()
+            var expr_span = self.ast.getNode(expr).span();
             expr = self.ast.addNode(Node{
                 .expr = Expr{
                     .struct_init = StructInit{
@@ -713,36 +967,36 @@ fn parsePrimaryExpr(self: *Parser) ?NodeIndex {
                         .span = Span.init(expr_span.start, end),
                     },
                 },
-            })
+            });
         } else {
-            break
+            break;
         }
     }
 
-    return expr
+    return .ok(expr);
 }
 
-// Parse operand (literals, identifiers, parenthesized expressions).
-fn parseOperand(self: *Parser) ?NodeIndex {
-    var start = self.pos()
+/// Parse operand (literals, identifiers, parenthesized expressions).
+fn parseOperand(self: *Parser) ParseResult<NodeIndex> {
+    var start = self.pos();
 
     return switch self.tok.tok {
         .identifier => {
-            var name = self.tok.text
-            self.advance()
-            return self.ast.addNode(Node{
+            var name = self.tok.text;
+            self.advance();
+            return .ok(self.ast.addNode(Node{
                 .expr = Expr{
                     .identifier = Identifier{
                         .name = name,
                         .span = Span.init(start, self.tok.span.start),
                     },
                 },
-            })
+            }));
         },
         .int_literal => {
-            var value = self.tok.text
-            self.advance()
-            return self.ast.addNode(Node{
+            var value = self.tok.text;
+            self.advance();
+            return .ok(self.ast.addNode(Node{
                 .expr = Expr{
                     .literal = Literal{
                         .kind = .int,
@@ -750,12 +1004,12 @@ fn parseOperand(self: *Parser) ?NodeIndex {
                         .span = Span.init(start, self.tok.span.start),
                     },
                 },
-            })
+            }));
         },
         .float_literal => {
-            var value = self.tok.text
-            self.advance()
-            return self.ast.addNode(Node{
+            var value = self.tok.text;
+            self.advance();
+            return .ok(self.ast.addNode(Node{
                 .expr = Expr{
                     .literal = Literal{
                         .kind = .float,
@@ -763,12 +1017,12 @@ fn parseOperand(self: *Parser) ?NodeIndex {
                         .span = Span.init(start, self.tok.span.start),
                     },
                 },
-            })
+            }));
         },
         .string_literal => {
-            var value = self.tok.text
-            self.advance()
-            return self.ast.addNode(Node{
+            var value = self.tok.text;
+            self.advance();
+            return .ok(self.ast.addNode(Node{
                 .expr = Expr{
                     .literal = Literal{
                         .kind = .string,
@@ -776,12 +1030,12 @@ fn parseOperand(self: *Parser) ?NodeIndex {
                         .span = Span.init(start, self.tok.span.start),
                     },
                 },
-            })
+            }));
         },
         .char_literal => {
-            var value = self.tok.text
-            self.advance()
-            return self.ast.addNode(Node{
+            var value = self.tok.text;
+            self.advance();
+            return .ok(self.ast.addNode(Node{
                 .expr = Expr{
                     .literal = Literal{
                         .kind = .char,
@@ -789,11 +1043,11 @@ fn parseOperand(self: *Parser) ?NodeIndex {
                         .span = Span.init(start, self.tok.span.start),
                     },
                 },
-            })
+            }));
         },
         .kw_true => {
-            self.advance()
-            return self.ast.addNode(Node{
+            self.advance();
+            return .ok(self.ast.addNode(Node{
                 .expr = Expr{
                     .literal = Literal{
                         .kind = .true_lit,
@@ -801,11 +1055,11 @@ fn parseOperand(self: *Parser) ?NodeIndex {
                         .span = Span.init(start, self.tok.span.start),
                     },
                 },
-            })
+            }));
         },
         .kw_false => {
-            self.advance()
-            return self.ast.addNode(Node{
+            self.advance();
+            return .ok(self.ast.addNode(Node{
                 .expr = Expr{
                     .literal = Literal{
                         .kind = .false_lit,
@@ -813,11 +1067,11 @@ fn parseOperand(self: *Parser) ?NodeIndex {
                         .span = Span.init(start, self.tok.span.start),
                     },
                 },
-            })
+            }));
         },
         .kw_null => {
-            self.advance()
-            return self.ast.addNode(Node{
+            self.advance();
+            return .ok(self.ast.addNode(Node{
                 .expr = Expr{
                     .literal = Literal{
                         .kind = .null_lit,
@@ -825,143 +1079,215 @@ fn parseOperand(self: *Parser) ?NodeIndex {
                         .span = Span.init(start, self.tok.span.start),
                     },
                 },
-            })
+            }));
         },
         .lparen => {
-            self.advance()
-            var inner = self.parseExpr()
-            if inner == null {
-                return null
-            }
-            var end = self.tok.span.end
-            if not self.expect(.rparen) {
-                return null
-            }
-            return self.ast.addNode(Node{
+            self.advance();
+            var inner = self.parseExpr()?;
+            var end = self.tok.span.end;
+            self.expect(.rparen)?;
+            return .ok(self.ast.addNode(Node{
                 .expr = Expr{
                     .paren = Paren{
-                        .inner = inner.?,
+                        .inner = inner,
                         .span = Span.init(start, end),
                     },
                 },
-            })
+            }));
         },
-        .kw_if => {
-            return self.parseIfExpr()
-        },
-        .lbrace => {
-            return self.parseBlock()
-        },
+        .kw_if => self.parseIfExpr(),
+        .kw_switch => self.parseSwitchExpr(),
+        .lbrace => self.parseBlock(),
         .lbracket => {
             // Array literal: [elem1, elem2, ...]
-            self.advance()  // consume '['
+            self.advance();  // consume '['
 
-            var elements = new List<NodeIndex>
+            var elements = new List<NodeIndex>();
 
             // Parse comma-separated elements
             while not self.check(.rbracket) and not self.check(.eof) {
-                var elem = self.parseExpr()
-                if elem == null {
-                    break
-                }
-                elements.push(elem.?)
+                var elem = self.parseExpr()?;
+                elements.push(elem);
                 if not self.match(.comma) {
-                    break
+                    break;
                 }
             }
 
-            var end = self.tok.span.end
-            if not self.expect(.rbracket) {
-                return null
-            }
+            var end = self.tok.span.end;
+            self.expect(.rbracket)?;
 
-            return self.ast.addNode(Node{
+            return .ok(self.ast.addNode(Node{
                 .expr = Expr{
                     .array_literal = ArrayLiteral{
                         .elements = elements.toSlice(),
                         .span = Span.init(start, end),
                     },
                 },
-            })
+            }));
         },
-        else => {
-            self.err.errorWithCode(self.pos(), .E201, "expected expression")
-            return null
+        .dot => {
+            // Enum literal: .variant
+            self.advance();  // consume '.'
+            if not self.check(.identifier) {
+                return .err(self.makeError(.expected_identifier, "expected variant name after '.'"));
+            }
+            var variant = self.tok.text;
+            self.advance();
+            return .ok(self.ast.addNode(Node{
+                .expr = Expr{
+                    .enum_literal = EnumLiteral{
+                        .variant = variant,
+                        .span = Span.init(start, self.tok.span.start),
+                    },
+                },
+            }));
         },
-    }
+        else => .err(self.makeError(.expected_expression, "expected expression")),
+    };
 }
 
-// Parse if expression: if cond { then } else { else }
-fn parseIfExpr(self: *Parser) ?NodeIndex {
-    var start = self.pos()
-    self.advance()  // consume 'if'
+/// Parse if expression: if cond { then } else { else }
+fn parseIfExpr(self: *Parser) ParseResult<NodeIndex> {
+    var start = self.pos();
+    self.advance();  // consume 'if'
 
-    var condition = self.parseExpr()
-    if condition == null {
-        return null
+    var condition = self.parseExpr()?;
+
+    // Optional capture: if expr |value| { }
+    var capture: ?string = null;
+    if self.match(.pipe) {
+        if not self.check(.identifier) {
+            return .err(self.makeError(.expected_identifier, "expected capture variable"));
+        }
+        capture = self.tok.text;
+        self.advance();
+        self.expect(.pipe)?;
     }
 
     if not self.check(.lbrace) {
-        self.err.errorWithCode(self.pos(), .E204, "expected '{' after if condition")
-        return null
+        return .err(self.makeError(.expected_block, "expected '{' after if condition"));
     }
-    var then_branch = self.parseBlock()
-    if then_branch == null {
-        return null
-    }
+    var then_branch = self.parseBlock()?;
 
-    var else_branch: ?NodeIndex = null
+    var else_branch: ?NodeIndex = null;
     if self.match(.kw_else) {
         if self.check(.kw_if) {
-            else_branch = self.parseIfExpr()
+            else_branch = self.parseIfExpr()?;
         } else if self.check(.lbrace) {
-            else_branch = self.parseBlock()
+            else_branch = self.parseBlock()?;
         } else {
-            self.syntaxError("expected '{' or 'if' after 'else'")
-            return null
+            return .err(self.makeError(.expected_block, "expected '{' or 'if' after 'else'"));
         }
     }
 
-    return self.ast.addNode(Node{
+    return .ok(self.ast.addNode(Node{
         .expr = Expr{
             .if_expr = IfExpr{
-                .condition = condition.?,
-                .then_branch = then_branch.?,
+                .condition = condition,
+                .capture = capture,
+                .then_branch = then_branch,
                 .else_branch = else_branch,
                 .span = Span.init(start, self.tok.span.start),
             },
         },
-    })
+    }));
+}
+
+/// Parse switch expression: switch expr { cases }
+fn parseSwitchExpr(self: *Parser) ParseResult<NodeIndex> {
+    var start = self.pos();
+    self.advance();  // consume 'switch'
+
+    var target = self.parseExpr()?;
+
+    self.expect(.lbrace)?;
+
+    var cases = new List<SwitchCase>();
+
+    while not self.check(.rbrace) and not self.check(.eof) {
+        var case_start = self.pos();
+
+        if self.match(.kw_else) {
+            // Default case: else => expr
+            self.expect(.arrow)?;
+            var body = self.parseExpr()?;
+            _ = self.match(.comma);
+
+            cases.push(SwitchCase{
+                .pattern = null,
+                .capture = null,
+                .body = body,
+                .span = Span.init(case_start, self.tok.span.start),
+            });
+        } else {
+            // Pattern case: .variant |capture| => expr
+            var pattern = self.parseExpr()?;
+
+            // Optional capture
+            var capture: ?string = null;
+            if self.match(.pipe) {
+                if not self.check(.identifier) {
+                    return .err(self.makeError(.expected_identifier, "expected capture variable"));
+                }
+                capture = self.tok.text;
+                self.advance();
+                self.expect(.pipe)?;
+            }
+
+            self.expect(.arrow)?;
+
+            var body: NodeIndex;
+            if self.check(.lbrace) {
+                body = self.parseBlock()?;
+            } else {
+                body = self.parseExpr()?;
+            }
+            _ = self.match(.comma);
+
+            cases.push(SwitchCase{
+                .pattern = pattern,
+                .capture = capture,
+                .body = body,
+                .span = Span.init(case_start, self.tok.span.start),
+            });
+        }
+    }
+
+    self.expect(.rbrace)?;
+
+    return .ok(self.ast.addNode(Node{
+        .expr = Expr{
+            .switch_expr = SwitchExpr{
+                .target = target,
+                .cases = cases.toSlice(),
+                .span = Span.init(start, self.tok.span.start),
+            },
+        },
+    }));
 }
 
 // ========================================================================
 // Statement parsing
 // ========================================================================
 
-// Parse a block: { statements }
-fn parseBlock(self: *Parser) ?NodeIndex {
-    var start = self.pos()
-    if not self.expect(.lbrace) {
-        return null
-    }
+/// Parse a block: { statements }
+pub fn parseBlock(self: *Parser) ParseResult<NodeIndex> {
+    var start = self.pos();
+    self.expect(.lbrace)?;
 
-    var stmts = new List<NodeIndex>
+    var stmts = new List<NodeIndex>();
 
     while not self.check(.rbrace) and not self.check(.eof) {
-        if self.parseStmt() |stmt_idx| {
-            stmts.push(stmt_idx)
-        } else {
-            // Error recovery: skip token
-            self.advance()
+        switch self.parseStmt() {
+            .ok |stmt_idx| => stmts.push(stmt_idx),
+            .err => self.advance(),  // Error recovery: skip token
         }
     }
 
-    var end = self.tok.span.end
-    if not self.expect(.rbrace) {
-        return null
-    }
+    var end = self.tok.span.end;
+    self.expect(.rbrace)?;
 
-    return self.ast.addNode(Node{
+    return .ok(self.ast.addNode(Node{
         .expr = Expr{
             .block = Block{
                 .stmts = stmts.toSlice(),
@@ -969,29 +1295,29 @@ fn parseBlock(self: *Parser) ?NodeIndex {
                 .span = Span.init(start, end),
             },
         },
-    })
+    }));
 }
 
-// Parse a statement.
-fn parseStmt(self: *Parser) ?NodeIndex {
-    var start = self.pos()
+/// Parse a statement.
+pub fn parseStmt(self: *Parser) ParseResult<NodeIndex> {
+    var start = self.pos();
 
     return switch self.tok.tok {
         .kw_return => {
-            self.advance()
-            var value: ?NodeIndex = null
+            self.advance();
+            var value: ?NodeIndex = null;
             if not self.check(.rbrace) and not self.check(.semicolon) {
-                value = self.parseExpr()
+                value = self.parseExpr()?;
             }
-            _ = self.match(.semicolon)
-            return self.ast.addNode(Node{
+            _ = self.match(.semicolon);
+            return .ok(self.ast.addNode(Node{
                 .stmt = Stmt{
                     .return_stmt = ReturnStmt{
                         .value = value,
                         .span = Span.init(start, self.tok.span.start),
                     },
                 },
-            })
+            }));
         },
         .kw_var, .kw_let => self.parseVarStmt(false),
         .kw_const => self.parseVarStmt(true),
@@ -999,96 +1325,89 @@ fn parseStmt(self: *Parser) ?NodeIndex {
         .kw_while => self.parseWhileStmt(),
         .kw_for => self.parseForStmt(),
         .kw_break => {
-            self.advance()
-            _ = self.match(.semicolon)
-            return self.ast.addNode(Node{
+            self.advance();
+            _ = self.match(.semicolon);
+            return .ok(self.ast.addNode(Node{
                 .stmt = Stmt{
                     .break_stmt = BreakStmt{
                         .span = Span.init(start, self.tok.span.start),
                     },
                 },
-            })
+            }));
         },
         .kw_continue => {
-            self.advance()
-            _ = self.match(.semicolon)
-            return self.ast.addNode(Node{
+            self.advance();
+            _ = self.match(.semicolon);
+            return .ok(self.ast.addNode(Node{
                 .stmt = Stmt{
                     .continue_stmt = ContinueStmt{
                         .span = Span.init(start, self.tok.span.start),
                     },
                 },
-            })
+            }));
         },
         else => {
             // Expression statement or assignment
-            var expr = self.parseExpr()
-            if expr == null {
-                return null
-            }
+            var expr = self.parseExpr()?;
 
             // Check for assignment
             if self.tok.tok == .equal or isCompoundAssign(self.tok.tok) {
-                var op: ?Token = null
+                var op: ?Token = null;
                 if self.tok.tok != .equal {
-                    op = self.tok.tok
+                    op = self.tok.tok;
                 }
-                self.advance()
-                var value = self.parseExpr()
-                if value == null {
-                    return null
-                }
-                _ = self.match(.semicolon)
-                return self.ast.addNode(Node{
+                self.advance();
+                var value = self.parseExpr()?;
+                _ = self.match(.semicolon);
+                return .ok(self.ast.addNode(Node{
                     .stmt = Stmt{
                         .assign_stmt = AssignStmt{
-                            .target = expr.?,
+                            .target = expr,
                             .op = op,
-                            .value = value.?,
+                            .value = value,
                             .span = Span.init(start, self.tok.span.start),
                         },
                     },
-                })
+                }));
             }
 
-            _ = self.match(.semicolon)
-            return self.ast.addNode(Node{
+            _ = self.match(.semicolon);
+            return .ok(self.ast.addNode(Node{
                 .stmt = Stmt{
                     .expr_stmt = ExprStmt{
-                        .expr = expr.?,
+                        .expr = expr,
                         .span = Span.init(start, self.tok.span.start),
                     },
                 },
-            })
+            }));
         },
-    }
+    };
 }
 
-// Parse var/let/const statement.
-fn parseVarStmt(self: *Parser, is_const: bool) ?NodeIndex {
-    var start = self.pos()
-    self.advance()  // consume var/let/const
+/// Parse var/let/const statement.
+fn parseVarStmt(self: *Parser, is_const: bool) ParseResult<NodeIndex> {
+    var start = self.pos();
+    self.advance();  // consume var/let/const
 
     if not self.check(.identifier) {
-        self.err.errorWithCode(self.pos(), .E203, "expected variable name")
-        return null
+        return .err(self.makeError(.expected_identifier, "expected variable name"));
     }
-    var name = self.tok.text
-    self.advance()
+    var name = self.tok.text;
+    self.advance();
 
-    var type_expr: ?NodeIndex = null
+    var type_expr: ?NodeIndex = null;
     if self.match(.colon) {
-        type_expr = self.parseType()
+        type_expr = self.parseType()?;
     }
 
-    var value: ?NodeIndex = null
+    var value: ?NodeIndex = null;
     if self.match(.equal) {
-        value = self.parseExpr()
+        value = self.parseExpr()?;
     }
 
-    _ = self.match(.semicolon)
+    _ = self.match(.semicolon);
 
-    return self.ast.addNode(Node{
+    return .ok(self.ast.addNode(Node{
         .stmt = Stmt{
             .var_stmt = VarStmt{
                 .name = name,
@@ -1098,162 +1417,156 @@ fn parseVarStmt(self: *Parser, is_const: bool) ?NodeIndex {
                 .span = Span.init(start, self.tok.span.start),
             },
         },
-    })
+    }));
 }
 
-// Parse if statement.
-fn parseIfStmt(self: *Parser) ?NodeIndex {
-    var start = self.pos()
-    self.advance()  // consume 'if'
+/// Parse if statement.
+fn parseIfStmt(self: *Parser) ParseResult<NodeIndex> {
+    var start = self.pos();
+    self.advance();  // consume 'if'
 
-    var condition = self.parseExpr()
-    if condition == null {
-        return null
+    var condition = self.parseExpr()?;
+
+    // Optional capture for optional unwrapping
+    var capture: ?string = null;
+    if self.match(.pipe) {
+        if not self.check(.identifier) {
+            return .err(self.makeError(.expected_identifier, "expected capture variable"));
+        }
+        capture = self.tok.text;
+        self.advance();
+        self.expect(.pipe)?;
     }
 
     if not self.check(.lbrace) {
-        self.err.errorWithCode(self.pos(), .E204, "expected '{' after if condition")
-        return null
+        return .err(self.makeError(.expected_block, "expected '{' after if condition"));
     }
-    var then_branch = self.parseBlockStmt()
-    if then_branch == null {
-        return null
-    }
+    var then_branch = self.parseBlockStmt()?;
 
-    var else_branch: ?NodeIndex = null
+    var else_branch: ?NodeIndex = null;
     if self.match(.kw_else) {
         if self.check(.kw_if) {
-            else_branch = self.parseIfStmt()
+            else_branch = self.parseIfStmt()?;
         } else if self.check(.lbrace) {
-            else_branch = self.parseBlockStmt()
+            else_branch = self.parseBlockStmt()?;
         } else {
-            self.syntaxError("expected '{' or 'if' after 'else'")
-            return null
+            return .err(self.makeError(.expected_block, "expected '{' or 'if' after 'else'"));
         }
     }
 
-    return self.ast.addNode(Node{
+    return .ok(self.ast.addNode(Node{
         .stmt = Stmt{
             .if_stmt = IfStmt{
-                .condition = condition.?,
-                .then_branch = then_branch.?,
+                .condition = condition,
+                .capture = capture,
+                .then_branch = then_branch,
                 .else_branch = else_branch,
                 .span = Span.init(start, self.tok.span.start),
             },
         },
-    })
+    }));
 }
 
-// Parse while statement.
-fn parseWhileStmt(self: *Parser) ?NodeIndex {
-    var start = self.pos()
-    self.advance()  // consume 'while'
+/// Parse while statement.
+fn parseWhileStmt(self: *Parser) ParseResult<NodeIndex> {
+    var start = self.pos();
+    self.advance();  // consume 'while'
 
-    var condition = self.parseExpr()
-    if condition == null {
-        return null
-    }
+    var condition = self.parseExpr()?;
 
     if not self.check(.lbrace) {
-        self.err.errorWithCode(self.pos(), .E204, "expected '{' after while condition")
-        return null
+        return .err(self.makeError(.expected_block, "expected '{' after while condition"));
     }
-    var body = self.parseBlockStmt()
-    if body == null {
-        return null
-    }
+    var body = self.parseBlockStmt()?;
 
-    return self.ast.addNode(Node{
+    return .ok(self.ast.addNode(Node{
         .stmt = Stmt{
             .while_stmt = WhileStmt{
-                .condition = condition.?,
-                .body = body.?,
+                .condition = condition,
+                .body = body,
                 .span = Span.init(start, self.tok.span.start),
             },
         },
-    })
+    }));
 }
 
-// Parse for statement: for x in iter { body }
-fn parseForStmt(self: *Parser) ?NodeIndex {
-    var start = self.pos()
-    self.advance()  // consume 'for'
+/// Parse for statement: for x in iter { body } or for x, i in iter { body }
+fn parseForStmt(self: *Parser) ParseResult<NodeIndex> {
+    var start = self.pos();
+    self.advance();  // consume 'for'
 
     if not self.check(.identifier) {
-        self.err.errorWithCode(self.pos(), .E203, "expected loop variable")
-        return null
+        return .err(self.makeError(.expected_identifier, "expected loop variable"));
     }
-    var binding = self.tok.text
-    self.advance()
+    var binding = self.tok.text;
+    self.advance();
 
-    if not self.expect(.kw_in) {
-        self.syntaxError("expected 'in' in for loop")
-        return null
+    // Check for indexed iteration: for item, index in array
+    var index_binding: ?string = null;
+    if self.match(.comma) {
+        if not self.check(.identifier) {
+            return .err(self.makeError(.expected_identifier, "expected index variable"));
+        }
+        index_binding = self.tok.text;
+        self.advance();
     }
 
-    var iterable = self.parseExpr()
-    if iterable == null {
-        return null
+    if not self.match(.kw_in) {
+        return .err(self.makeError(.unexpected_token, "expected 'in' in for loop"));
     }
+
+    var iterable = self.parseExpr()?;
 
     if not self.check(.lbrace) {
-        self.err.errorWithCode(self.pos(), .E204, "expected '{' after for clause")
-        return null
+        return .err(self.makeError(.expected_block, "expected '{' after for clause"));
     }
-    var body = self.parseBlockStmt()
-    if body == null {
-        return null
-    }
+    var body = self.parseBlockStmt()?;
 
-    return self.ast.addNode(Node{
+    return .ok(self.ast.addNode(Node{
         .stmt = Stmt{
             .for_stmt = ForStmt{
                 .binding = binding,
-                .iterable = iterable.?,
-                .body = body.?,
+                .index_binding = index_binding,
+                .iterable = iterable,
+                .body = body,
                 .span = Span.init(start, self.tok.span.start),
             },
         },
-    })
+    }));
 }
 
-// Parse block as statement.
-fn parseBlockStmt(self: *Parser) ?NodeIndex {
-    var start = self.pos()
-    if not self.expect(.lbrace) {
-        return null
-    }
+/// Parse block as statement.
+fn parseBlockStmt(self: *Parser) ParseResult<NodeIndex> {
+    var start = self.pos();
+    self.expect(.lbrace)?;
 
-    var stmts = new List<NodeIndex>
+    var stmts = new List<NodeIndex>();
 
     while not self.check(.rbrace) and not self.check(.eof) {
-        if self.parseStmt() |stmt_idx| {
-            stmts.push(stmt_idx)
-        } else {
-            self.advance()
+        switch self.parseStmt() {
+            .ok |stmt_idx| => stmts.push(stmt_idx),
+            .err => self.advance(),
         }
     }
 
-    var end = self.tok.span.end
-    if not self.expect(.rbrace) {
-        return null
-    }
+    var end = self.tok.span.end;
+    self.expect(.rbrace)?;
 
-    return self.ast.addNode(Node{
+    return .ok(self.ast.addNode(Node{
         .stmt = Stmt{
             .block_stmt = BlockStmt{
                 .stmts = stmts.toSlice(),
                 .span = Span.init(start, end),
             },
         },
-    })
+    }));
 }
 
 // ========================================================================
 // Helper functions
 // ========================================================================
 
-// Check if token is a type keyword (int, string, etc.)
+/// Check if token is a type keyword (int, string, etc.)
 fn isTypeKeyword(t: Token) bool {
     return switch t {
         .kw_int, .kw_float, .kw_bool, .kw_string, .kw_byte => true,
@@ -1261,15 +1574,51 @@ fn isTypeKeyword(t: Token) bool {
         .kw_i8, .kw_i16, .kw_i32, .kw_i64 => true,
         .kw_u8, .kw_u16, .kw_u32, .kw_u64 => true,
         .kw_f32, .kw_f64 => true,
+        .kw_void => true,
         else => false,
-    }
+    };
 }
 
-// Check if token is a compound assignment operator.
+/// Check if token is a compound assignment operator.
 fn isCompoundAssign(t: Token) bool {
     return switch t {
         .plus_equal, .minus_equal, .star_equal, .slash_equal, .percent_equal => true,
         .ampersand_equal, .pipe_equal, .caret_equal => true,
+        .plus_plus => true,  // String concat assignment
         else => false,
-    }
+    };
+}
+
+/// Get the precedence of a binary operator.
+fn binaryPrecedence(t: Token) Precedence {
+    return switch t {
+        .kw_or => .or_prec,
+        .kw_and => .and_prec,
+        .equal_equal, .bang_equal => .equality,
+        .less, .less_equal, .greater, .greater_equal => .comparison,
+        .pipe => .bitor,
+        .caret => .bitxor,
+        .ampersand => .bitand,
+        .less_less, .greater_greater => .shift,
+        .plus, .minus, .plus_plus => .additive,  // ++ for string concat
+        .star, .slash, .percent => .multiplicative,
+        .question_question => .null_coalesce,  // ?? operator
+        else => .none,
+    };
+}
+
+/// Operator precedence levels.
+enum Precedence: u8 {
+    none,
+    null_coalesce,  // ??
+    or_prec,        // or
+    and_prec,       // and
+    equality,       // == !=
+    comparison,     // < <= > >=
+    bitor,          // |
+    bitxor,         // ^
+    bitand,         // &
+    shift,          // << >>
+    additive,       // + - ++
+    multiplicative, // * / %
 }

@@ -6,34 +6,39 @@
 // - struct.go (Struct types)
 // - signature.go (Function types)
 
+module types;
+
 // =============================================================================
-// LANGUAGE FEATURES USED:
+// LANGUAGE FEATURES USED (Phase 1-7):
 // =============================================================================
-// 1. Tagged unions (union Type { basic: BasicKind, ... })
-// 2. Enums with backing type (BasicKind: u8)
-// 3. Switch expressions with payload capture
-// 4. Optional types (?TypeIndex)
-// 5. Type aliases (type TypeIndex = u32)
-// 6. Methods on enums (fn name(self: BasicKind))
-// 7. Struct literals
-// 8. @intCast builtin
-// 9. List<T> generic
+// 1. Module declaration and pub visibility (Phase 6)
+// 2. Tagged unions (union Type { basic: BasicKind, ... })
+// 3. Enums with backing type (BasicKind: u8)
+// 4. Switch expressions with payload capture
+// 5. Optional types (?TypeIndex)
+// 6. Type aliases (type TypeIndex = u32)
+// 7. Methods on enums (fn name(self: BasicKind))
+// 8. Struct literals
+// 9. @intCast builtin
+// 10. List<T> generic
+// 11. Indexed iteration (for t, idx in types) (Phase 4)
+// 12. User-defined generics (Phase 7)
 // =============================================================================
 
 // ============================================================================
 // Type Index
 // ============================================================================
 
-// Index into type pool. Using indices allows type interning and comparison.
-type TypeIndex = u32
-const invalid_type: TypeIndex = @maxInt(u32)
+/// Index into type pool. Using indices allows type interning and comparison.
+pub type TypeIndex = u32;
+pub const invalid_type: TypeIndex = @maxInt(u32);
 
 // ============================================================================
 // Basic Types
 // ============================================================================
 
-// Kind of basic type (maps to Go's BasicKind).
-enum BasicKind: u8 {
+/// Kind of basic type (maps to Go's BasicKind).
+pub enum BasicKind: u8 {
     // Invalid type
     invalid,
 
@@ -70,8 +75,8 @@ enum BasicKind: u8 {
     untyped_null,
 }
 
-// Get the name of this basic type.
-fn name(self: BasicKind) string {
+/// Get the name of this basic type.
+pub fn name(self: BasicKind) string {
     return switch self {
         .invalid => "invalid",
         .bool_type => "bool",
@@ -92,50 +97,50 @@ fn name(self: BasicKind) string {
         .untyped_bool => "untyped bool",
         .untyped_string => "untyped string",
         .untyped_null => "untyped null",
-    }
+    };
 }
 
-// Check if this is a numeric type.
-fn isNumeric(self: BasicKind) bool {
-    return self.isInteger() or self.isFloat()
+/// Check if this is a numeric type.
+pub fn isNumeric(self: BasicKind) bool {
+    return self.isInteger() or self.isFloat();
 }
 
-// Check if this is an integer type.
-fn isInteger(self: BasicKind) bool {
+/// Check if this is an integer type.
+pub fn isInteger(self: BasicKind) bool {
     return switch self {
         .i8_type, .i16_type, .i32_type, .i64_type => true,
         .u8_type, .u16_type, .u32_type, .u64_type => true,
         .untyped_int => true,
         else => false,
-    }
+    };
 }
 
-// Check if this is a signed integer type.
-fn isSigned(self: BasicKind) bool {
+/// Check if this is a signed integer type.
+pub fn isSigned(self: BasicKind) bool {
     return switch self {
         .i8_type, .i16_type, .i32_type, .i64_type => true,
         else => false,
-    }
+    };
 }
 
-// Check if this is a floating point type.
-fn isFloat(self: BasicKind) bool {
+/// Check if this is a floating point type.
+pub fn isFloat(self: BasicKind) bool {
     return switch self {
         .f32_type, .f64_type, .untyped_float => true,
         else => false,
-    }
+    };
 }
 
-// Check if this is an untyped type.
-fn isUntyped(self: BasicKind) bool {
+/// Check if this is an untyped type.
+pub fn isUntyped(self: BasicKind) bool {
     return switch self {
         .untyped_int, .untyped_float, .untyped_bool, .untyped_string, .untyped_null => true,
         else => false,
-    }
+    };
 }
 
-// Get the size in bytes (0 for unsized types).
-fn size(self: BasicKind) u8 {
+/// Get the size in bytes (0 for unsized types).
+pub fn size(self: BasicKind) u8 {
     return switch self {
         .bool_type => 1,
         .i8_type, .u8_type => 1,
@@ -143,20 +148,20 @@ fn size(self: BasicKind) u8 {
         .i32_type, .u32_type, .f32_type => 4,
         .i64_type, .u64_type, .f64_type => 8,
         else => 0,  // string, void, untyped
-    }
+    };
 }
 
 // ============================================================================
 // Fixed Types (for DBL compatibility)
 // ============================================================================
 
-// Alpha type: fixed-length string (like DBL's a30)
-struct AlphaType {
+/// Alpha type: fixed-length string (like DBL's a30)
+pub struct AlphaType {
     length: u32,  // number of characters
 }
 
-// Decimal type: fixed-point decimal (like DBL's d10 or d8.2)
-struct DecimalType {
+/// Decimal type: fixed-point decimal (like DBL's d10 or d8.2)
+pub struct DecimalType {
     precision: u8,  // total digits
     scale: u8,      // digits after decimal point (0 for integer decimal)
 }
@@ -165,66 +170,91 @@ struct DecimalType {
 // Composite Types
 // ============================================================================
 
-// Pointer type: *T
-struct PointerType {
+/// Pointer type: *T
+pub struct PointerType {
     elem: TypeIndex,
 }
 
-// Optional type: ?T
-struct OptionalType {
+/// Optional type: ?T
+pub struct OptionalType {
     elem: TypeIndex,
 }
 
-// Slice type: []T
-struct SliceType {
+/// Slice type: []T
+pub struct SliceType {
     elem: TypeIndex,
 }
 
-// Array type: [N]T
-struct ArrayType {
+/// Array type: [N]T
+pub struct ArrayType {
     elem: TypeIndex,
     length: u64,
 }
 
-// Struct field
-struct StructField {
+/// Struct field
+pub struct StructField {
     name: string,
     type_idx: TypeIndex,
     offset: u32,  // byte offset in struct (computed during type checking)
 }
 
-// Struct type
-struct StructType {
+/// Struct type
+pub struct StructType {
     name: string,           // empty for anonymous structs
     fields: []StructField,
     size: u32,              // total size in bytes (computed during type checking)
     alignment: u8,          // alignment requirement
 }
 
-// Function parameter
-struct FuncParam {
+/// Function parameter
+pub struct FuncParam {
     name: string,
     type_idx: TypeIndex,
 }
 
-// Function type
-struct FuncType {
+/// Function type
+pub struct FuncType {
     params: []FuncParam,
     return_type: TypeIndex,  // invalid_type for void
 }
 
-// Named type (user-defined type alias or struct)
-struct NamedType {
+/// Named type (user-defined type alias or struct)
+pub struct NamedType {
     name: string,
     underlying: TypeIndex,
+}
+
+/// Enum variant for TypeRegistry enum types
+pub struct EnumVariant {
+    name: string,
+    value: i64,
+}
+
+/// Enum type
+pub struct EnumType {
+    name: string,
+    variants: []EnumVariant,
+    backing_type: TypeIndex,
+}
+
+/// Union variant for TypeRegistry union types
+pub struct UnionVariant {
+    name: string,
+    type_idx: ?TypeIndex,  // null for unit variants
+}
+
+/// Union type (tagged)
+pub struct UnionType {
+    name: string,
+    variants: []UnionVariant,
 }
 
 // ============================================================================
 // Type Union
 // ============================================================================
 
-// A type in cot.
-union Type {
+/// A type in cot.
+pub union Type {
     basic: BasicKind,
     alpha: AlphaType,
     decimal: DecimalType,
@@ -233,6 +263,8 @@ union Type {
     slice: SliceType,
     array: ArrayType,
     struct_type: StructType,
+    enum_type: EnumType,
+    union_type: UnionType,
     func: FuncType,
     named: NamedType,
 }
@@ -241,69 +273,69 @@ union Type {
 // Type Registry (interning)
 // ============================================================================
 
-// Type registry for interning types.
-// Ensures each unique type has a single TypeIndex.
-struct TypeRegistry {
+/// Type registry for interning types.
+/// Ensures each unique type has a single TypeIndex.
+pub struct TypeRegistry {
     types: List<Type>,
-
-    // Pre-allocated indices for basic types
-    const INVALID: TypeIndex = 0
-    const BOOL: TypeIndex = 1
-    const I8: TypeIndex = 2
-    const I16: TypeIndex = 3
-    const I32: TypeIndex = 4
-    const I64: TypeIndex = 5
-    const U8: TypeIndex = 6
-    const U16: TypeIndex = 7
-    const U32: TypeIndex = 8
-    const U64: TypeIndex = 9
-    const F32: TypeIndex = 10
-    const F64: TypeIndex = 11
-    const STRING: TypeIndex = 12
-    const VOID: TypeIndex = 13
-
-    // Type aliases (cot's friendly names)
-    const INT: TypeIndex = I64     // int = i64
-    const FLOAT: TypeIndex = F64   // float = f64
-    const BYTE: TypeIndex = U8     // byte = u8
 }
 
-// Initialize a type registry with all basic types pre-registered.
-fn init() TypeRegistry {
+/// Pre-allocated indices for basic types (must match initialization order).
+pub const INVALID: TypeIndex = 0;
+pub const BOOL: TypeIndex = 1;
+pub const I8: TypeIndex = 2;
+pub const I16: TypeIndex = 3;
+pub const I32: TypeIndex = 4;
+pub const I64: TypeIndex = 5;
+pub const U8: TypeIndex = 6;
+pub const U16: TypeIndex = 7;
+pub const U32: TypeIndex = 8;
+pub const U64: TypeIndex = 9;
+pub const F32: TypeIndex = 10;
+pub const F64: TypeIndex = 11;
+pub const STRING: TypeIndex = 12;
+pub const VOID: TypeIndex = 13;
+
+/// Type aliases (cot's friendly names)
+pub const INT: TypeIndex = I64;     // int = i64
+pub const FLOAT: TypeIndex = F64;   // float = f64
+pub const BYTE: TypeIndex = U8;     // byte = u8
+
+/// Initialize a type registry with all basic types pre-registered.
+pub fn init() TypeRegistry {
     var reg = TypeRegistry{
-        .types = new List<Type>,
-    }
+        .types = new List<Type>(),
+    };
 
     // Pre-register basic types in order
-    reg.types.push(Type{ .basic = .invalid })      // 0
-    reg.types.push(Type{ .basic = .bool_type })    // 1
-    reg.types.push(Type{ .basic = .i8_type })      // 2
-    reg.types.push(Type{ .basic = .i16_type })     // 3
-    reg.types.push(Type{ .basic = .i32_type })     // 4
-    reg.types.push(Type{ .basic = .i64_type })     // 5
-    reg.types.push(Type{ .basic = .u8_type })      // 6
-    reg.types.push(Type{ .basic = .u16_type })     // 7
-    reg.types.push(Type{ .basic = .u32_type })     // 8
-    reg.types.push(Type{ .basic = .u64_type })     // 9
-    reg.types.push(Type{ .basic = .f32_type })     // 10
-    reg.types.push(Type{ .basic = .f64_type })     // 11
-    reg.types.push(Type{ .basic = .string_type })  // 12
-    reg.types.push(Type{ .basic = .void_type })    // 13
+    reg.types.push(Type{ .basic = .invalid });      // 0
+    reg.types.push(Type{ .basic = .bool_type });    // 1
+    reg.types.push(Type{ .basic = .i8_type });      // 2
+    reg.types.push(Type{ .basic = .i16_type });     // 3
+    reg.types.push(Type{ .basic = .i32_type });     // 4
+    reg.types.push(Type{ .basic = .i64_type });     // 5
+    reg.types.push(Type{ .basic = .u8_type });      // 6
+    reg.types.push(Type{ .basic = .u16_type });     // 7
+    reg.types.push(Type{ .basic = .u32_type });     // 8
+    reg.types.push(Type{ .basic = .u64_type });     // 9
+    reg.types.push(Type{ .basic = .f32_type });     // 10
+    reg.types.push(Type{ .basic = .f64_type });     // 11
+    reg.types.push(Type{ .basic = .string_type });  // 12
+    reg.types.push(Type{ .basic = .void_type });    // 13
 
-    return reg
+    return reg;
 }
 
-// Get a type by index.
-fn get(self: *TypeRegistry, idx: TypeIndex) Type {
+/// Get a type by index.
+pub fn get(self: *TypeRegistry, idx: TypeIndex) Type {
     if idx >= len(self.types) {
-        return Type{ .basic = .invalid }
+        return Type{ .basic = .invalid };
     }
-    return self.types[idx]
+    return self.types[idx];
 }
 
-// Get the size of a type in bytes.
-fn sizeOf(self: *TypeRegistry, idx: TypeIndex) u32 {
-    var t = self.get(idx)
+/// Get the size of a type in bytes.
+pub fn sizeOf(self: *TypeRegistry, idx: TypeIndex) u32 {
+    var t = self.get(idx);
     return switch t {
         .basic |b| => switch b {
             .i8_type, .u8_type, .bool_type => 1,
@@ -318,87 +350,84 @@ fn sizeOf(self: *TypeRegistry, idx: TypeIndex) u32 {
         .optional |o| => self.sizeOf(o.elem) + 8,  // value + flag
         .slice => 16,  // ptr + len
         .array |a| => self.sizeOf(a.elem) * @intCast(u32, a.length),
-        .struct_type |s| => {
-            var size: u32 = 0
-            for field in s.fields {
-                size += self.sizeOf(field.type_idx)
-            }
-            return size
-        },
+        .struct_type |s| => s.size,
+        .enum_type |e| => self.sizeOf(e.backing_type),
+        .union_type => 16,  // tag + max variant size (simplified)
         else => 8,  // Default to 8 bytes
-    }
+    };
 }
 
-// Add a new type and return its index.
-fn add(self: *TypeRegistry, t: Type) TypeIndex {
-    var idx = @intCast(TypeIndex, len(self.types))
-    self.types.push(t)
-    return idx
+/// Add a new type and return its index.
+pub fn add(self: *TypeRegistry, t: Type) TypeIndex {
+    var idx = @intCast(TypeIndex, len(self.types));
+    self.types.push(t);
+    return idx;
 }
 
-// Create a pointer type.
-fn makePointer(self: *TypeRegistry, elem: TypeIndex) TypeIndex {
-    return self.add(Type{ .pointer = PointerType{ .elem = elem } })
+/// Create a pointer type.
+pub fn makePointer(self: *TypeRegistry, elem: TypeIndex) TypeIndex {
+    return self.add(Type{ .pointer = PointerType{ .elem = elem } });
 }
 
-// Create an optional type.
-fn makeOptional(self: *TypeRegistry, elem: TypeIndex) TypeIndex {
-    return self.add(Type{ .optional = OptionalType{ .elem = elem } })
+/// Create an optional type.
+pub fn makeOptional(self: *TypeRegistry, elem: TypeIndex) TypeIndex {
+    return self.add(Type{ .optional = OptionalType{ .elem = elem } });
 }
 
-// Create a slice type.
-fn makeSlice(self: *TypeRegistry, elem: TypeIndex) TypeIndex {
-    return self.add(Type{ .slice = SliceType{ .elem = elem } })
+/// Create a slice type.
+pub fn makeSlice(self: *TypeRegistry, elem: TypeIndex) TypeIndex {
+    return self.add(Type{ .slice = SliceType{ .elem = elem } });
 }
 
-// Create an array type.
-fn makeArray(self: *TypeRegistry, elem: TypeIndex, length: u64) TypeIndex {
-    return self.add(Type{ .array = ArrayType{ .elem = elem, .length = length } })
+/// Create an array type.
+pub fn makeArray(self: *TypeRegistry, elem: TypeIndex, length: u64) TypeIndex {
+    return self.add(Type{ .array = ArrayType{ .elem = elem, .length = length } });
 }
 
-// Create an alpha type.
-fn makeAlpha(self: *TypeRegistry, length: u32) TypeIndex {
-    return self.add(Type{ .alpha = AlphaType{ .length = length } })
+/// Create an alpha type.
+pub fn makeAlpha(self: *TypeRegistry, length: u32) TypeIndex {
+    return self.add(Type{ .alpha = AlphaType{ .length = length } });
 }
 
-// Create a decimal type.
-fn makeDecimal(self: *TypeRegistry, precision: u8, scale: u8) TypeIndex {
-    return self.add(Type{ .decimal = DecimalType{ .precision = precision, .scale = scale } })
+/// Create a decimal type.
+pub fn makeDecimal(self: *TypeRegistry, precision: u8, scale: u8) TypeIndex {
+    return self.add(Type{ .decimal = DecimalType{ .precision = precision, .scale = scale } });
 }
 
-// Look up a basic type name and return its index.
-fn lookupBasic(self: *TypeRegistry, name: string) ?TypeIndex {
+/// Look up a basic type name and return its index.
+/// Uses compile-time map pattern (will be cleaner with real maps).
+pub fn lookupBasic(self: *TypeRegistry, name: string) ?TypeIndex {
     // Built-in type names
-    if name == "bool" { return TypeRegistry.BOOL }
-    if name == "i8" { return TypeRegistry.I8 }
-    if name == "i16" { return TypeRegistry.I16 }
-    if name == "i32" { return TypeRegistry.I32 }
-    if name == "i64" { return TypeRegistry.I64 }
-    if name == "u8" { return TypeRegistry.U8 }
-    if name == "u16" { return TypeRegistry.U16 }
-    if name == "u32" { return TypeRegistry.U32 }
-    if name == "u64" { return TypeRegistry.U64 }
-    if name == "f32" { return TypeRegistry.F32 }
-    if name == "f64" { return TypeRegistry.F64 }
-    if name == "string" { return TypeRegistry.STRING }
-    if name == "void" { return TypeRegistry.VOID }
+    if name == "bool" { return BOOL; }
+    if name == "i8" { return I8; }
+    if name == "i16" { return I16; }
+    if name == "i32" { return I32; }
+    if name == "i64" { return I64; }
+    if name == "u8" { return U8; }
+    if name == "u16" { return U16; }
+    if name == "u32" { return U32; }
+    if name == "u64" { return U64; }
+    if name == "f32" { return F32; }
+    if name == "f64" { return F64; }
+    if name == "string" { return STRING; }
+    if name == "void" { return VOID; }
 
     // Aliases
-    if name == "int" { return TypeRegistry.INT }
-    if name == "float" { return TypeRegistry.FLOAT }
-    if name == "byte" { return TypeRegistry.BYTE }
+    if name == "int" { return INT; }
+    if name == "float" { return FLOAT; }
+    if name == "byte" { return BYTE; }
 
-    return null
+    return null;
 }
 
-// Check if two types are equal.
-fn equal(self: *TypeRegistry, a: TypeIndex, b: TypeIndex) bool {
+/// Check if two types are equal.
+pub fn equal(self: *TypeRegistry, a: TypeIndex, b: TypeIndex) bool {
     if a == b {
-        return true
+        return true;
     }
 
-    var ta = self.get(a)
-    var tb = self.get(b)
+    var ta = self.get(a);
+    var tb = self.get(b);
 
     return switch ta {
         .basic |ka| => switch tb {
@@ -422,47 +451,76 @@ fn equal(self: *TypeRegistry, a: TypeIndex, b: TypeIndex) bool {
             else => false,
         },
         else => false,  // struct, func, named need more complex comparison
-    }
+    };
 }
 
-// Look up a type by name (for struct types).
-fn lookupByName(self: *TypeRegistry, name: string) ?TypeIndex {
+/// Look up a type by name (for struct types).
+/// Uses indexed iteration (Phase 4).
+pub fn lookupByName(self: *TypeRegistry, name: string) ?TypeIndex {
     for t, idx in self.types {
         switch t {
             .struct_type |st| => {
                 if st.name == name {
-                    return @intCast(TypeIndex, idx)
+                    return @intCast(TypeIndex, idx);
+                }
+            },
+            .enum_type |et| => {
+                if et.name == name {
+                    return @intCast(TypeIndex, idx);
+                }
+            },
+            .union_type |ut| => {
+                if ut.name == name {
+                    return @intCast(TypeIndex, idx);
                 }
             },
             else => {},
         }
     }
-    return null
+    return null;
 }
 
-// Check if a type is assignable to another.
-// (e.g., untyped int can be assigned to any integer type)
-fn isAssignable(self: *TypeRegistry, from: TypeIndex, to: TypeIndex) bool {
+/// Check if a type is assignable to another.
+/// (e.g., untyped int can be assigned to any integer type)
+pub fn isAssignable(self: *TypeRegistry, from: TypeIndex, to: TypeIndex) bool {
     if self.equal(from, to) {
-        return true
+        return true;
     }
 
-    var tf = self.get(from)
-    var tt = self.get(to)
+    var tf = self.get(from);
+    var tt = self.get(to);
 
     // Handle untyped -> typed conversions
     return switch tf {
         .basic |kf| => switch tt {
             .basic |kt| => {
-                if kf == .untyped_int and kt.isInteger() { return true }
-                if kf == .untyped_float and kt.isFloat() { return true }
-                if kf == .untyped_bool and kt == .bool_type { return true }
-                if kf == .untyped_string and kt == .string_type { return true }
-                return false
+                if kf == .untyped_int and kt.isInteger() { return true; }
+                if kf == .untyped_float and kt.isFloat() { return true; }
+                if kf == .untyped_bool and kt == .bool_type { return true; }
+                if kf == .untyped_string and kt == .string_type { return true; }
+                return false;
             },
             .optional => true,  // null is assignable to any optional
             else => false,
         },
         else => false,
-    }
+    };
+}
+
+/// Format a type as a string (for error messages).
+pub fn format(self: *TypeRegistry, idx: TypeIndex) string {
+    var t = self.get(idx);
+    return switch t {
+        .basic |k| => k.name(),
+        .pointer |p| => "*" ++ self.format(p.elem),
+        .optional |o| => "?" ++ self.format(o.elem),
+        .slice |s| => "[]" ++ self.format(s.elem),
+        .array |a| => "[${a.length}]" ++ self.format(a.elem),
+        .struct_type |st| => st.name,
+        .enum_type |et| => et.name,
+        .union_type |ut| => ut.name,
+        .func => "fn",
+        .named |n| => n.name,
+        else => "<unknown>",
+    };
 }

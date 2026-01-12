@@ -7,39 +7,78 @@
 // - expr.go (expression type checking)
 // - stmt.go (statement checking)
 
+module checker;
+
 // =============================================================================
-// LANGUAGE FEATURES USED:
+// LANGUAGE FEATURES USED (Phase 1-7):
 // =============================================================================
-// 1. Enums (SymbolKind)
-// 2. Structs with optional fields
-// 3. Methods on structs (fn init(self: ...) ...)
-// 4. Switch expressions with payload capture
-// 5. Optional types and if-capture (if x |val| {})
-// 6. Map<K, V> for symbol tables
-// 7. String interpolation
-// 8. Error handling (!void, try)
+// 1. Module declaration and pub visibility (Phase 6)
+// 2. Imports (Phase 6)
+// 3. Result<T, E> for error handling (Phase 2)
+// 4. ? propagation operator (Phase 2)
+// 5. Enums (SymbolKind)
+// 6. Structs with optional fields
+// 7. Methods on structs (fn init(self: ...) ...)
+// 8. Switch expressions with payload capture
+// 9. Optional types and if-capture (if x |val| {})
+// 10. Map<K, V> for symbol tables
+// 11. String interpolation and concatenation ++ (Phase 3)
+// 12. Indexed iteration (Phase 4)
+// 13. Optional chaining .? (Phase 5)
+// 14. User-defined generics (Phase 7)
 // =============================================================================
 
-import "ast"
-import "types"
-import "errors"
-import "source"
+import ast;
+import types;
+import errors;
+import source;
+
+// ============================================================================
+// Check Error Types
+// ============================================================================
+
+/// Specific type check error codes.
+pub enum CheckErrorKind: u8 {
+    undefined_identifier,
+    redefined_identifier,
+    type_mismatch,
+    invalid_operation,
+    wrong_argument_count,
+    not_callable,
+    not_indexable,
+    not_iterable,
+    invalid_assignment,
+    break_outside_loop,
+    continue_outside_loop,
+    return_type_mismatch,
+}
+
+/// A type check error with location and details.
+pub struct CheckError {
+    kind: CheckErrorKind,
+    message: string,
+    span: Span,
+}
+
+/// Result type for type checking operations.
+pub type CheckResult<T> = Result<T, CheckError>;
 
 // ============================================================================
 // Symbol
 // ============================================================================
 
-// What kind of symbol this is.
-enum SymbolKind: u8 {
+/// What kind of symbol this is.
+pub enum SymbolKind: u8 {
     variable,
     constant,
     function,
     type_name,
     parameter,
+    module_name,
 }
 
-// A symbol in a scope (variable, function, type, etc.)
-struct Symbol {
+/// A symbol in a scope (variable, function, type, etc.)
+pub struct Symbol {
     name: string,
     kind: SymbolKind,
     type_idx: TypeIndex,
@@ -47,66 +86,74 @@ struct Symbol {
     mutable: bool,          // Is this symbol mutable? (var vs const)
 }
 
-fn init(name: string, kind: SymbolKind, type_idx: TypeIndex, node: NodeIndex, mutable: bool) Symbol {
+pub fn initSymbol(name: string, kind: SymbolKind, type_idx: TypeIndex, node: NodeIndex, mutable: bool) Symbol {
     return Symbol{
         .name = name,
         .kind = kind,
         .type_idx = type_idx,
         .node = node,
         .mutable = mutable,
-    }
+    };
 }
 
 // ============================================================================
 // Scope
 // ============================================================================
 
-// Lexical scope for name resolution.
-// Scopes form a tree with parent pointers.
-struct Scope {
+/// Lexical scope for name resolution.
+/// Scopes form a tree with parent pointers.
+pub struct Scope {
     parent: ?*Scope,
     symbols: Map<string, Symbol>,
 }
 
-fn init(parent: ?*Scope) Scope {
+pub fn initScope(parent: ?*Scope) Scope {
     return Scope{
         .parent = parent,
-        .symbols = new Map<string, Symbol>,
+        .symbols = new Map<string, Symbol>(),
+    };
+}
+
+/// Define a symbol in this scope.
+pub fn define(self: *Scope, sym: Symbol) CheckResult<void> {
+    if self.symbols.has(sym.name) {
+        return .err(CheckError{
+            .kind = .redefined_identifier,
+            .message = "identifier '" ++ sym.name ++ "' already defined",
+            .span = Span.zero,
+        });
     }
+    self.symbols.set(sym.name, sym);
+    return .ok(void{});
 }
 
-// Define a symbol in this scope.
-fn define(self: *Scope, sym: Symbol) !void {
-    self.symbols.set(sym.name, sym)
+/// Look up a symbol in this scope only.
+pub fn lookupLocal(self: *Scope, name: string) ?Symbol {
+    return self.symbols.get(name);
 }
 
-// Look up a symbol in this scope only.
-fn lookupLocal(self: *Scope, name: string) ?Symbol {
-    return self.symbols.get(name)
-}
-
-// Look up a symbol in this scope or any parent scope.
-fn lookup(self: *Scope, name: string) ?Symbol {
+/// Look up a symbol in this scope or any parent scope.
+pub fn lookup(self: *Scope, name: string) ?Symbol {
     if self.symbols.get(name) |sym| {
-        return sym
+        return sym;
     }
     if self.parent |p| {
-        return p.lookup(name)
+        return p.lookup(name);
     }
-    return null
+    return null;
 }
 
-// Check if a name is already defined in this scope (not parent).
-fn isDefined(self: *Scope, name: string) bool {
-    return self.symbols.has(name)
+/// Check if a name is already defined in this scope (not parent).
+pub fn isDefined(self: *Scope, name: string) bool {
+    return self.symbols.has(name);
 }
 
 // ============================================================================
 // Checker
 // ============================================================================
 
-// Type checker state.
-struct Checker {
+/// Type checker state.
+pub struct Checker {
     types: *TypeRegistry,       // Type registry for type interning and lookup
     scope: *Scope,              // Current scope
     err: *ErrorReporter,        // Error reporter
@@ -116,940 +163,1228 @@ struct Checker {
     in_loop: bool,              // Are we inside a loop? (for break/continue)
 }
 
-fn init(tree: *Ast, type_reg: *TypeRegistry, reporter: *ErrorReporter, global_scope: *Scope) Checker {
+pub fn initChecker(tree: *Ast, type_reg: *TypeRegistry, reporter: *ErrorReporter, global_scope: *Scope) Checker {
     return Checker{
         .types = type_reg,
         .scope = global_scope,
         .err = reporter,
         .tree = tree,
-        .expr_types = new Map<NodeIndex, TypeIndex>,
-        .current_return_type = TypeRegistry.VOID,
+        .expr_types = new Map<NodeIndex, TypeIndex>(),
+        .current_return_type = types.VOID,
         .in_loop = false,
-    }
+    };
 }
 
 // ========================================================================
 // File checking
 // ========================================================================
 
-// Type check an entire file.
-fn checkFile(self: *Checker) !void {
-    var file = self.tree.file ?? return
+/// Type check an entire file.
+pub fn checkFile(self: *Checker) CheckResult<void> {
+    var file = self.tree.file ?? return .ok(void{});
 
     // First pass: collect all top-level declarations
     for decl_idx in file.decls {
-        try self.collectDecl(decl_idx)
+        self.collectDecl(decl_idx)?;
     }
 
     // Second pass: check all declarations
     for decl_idx in file.decls {
-        try self.checkDecl(decl_idx)
+        self.checkDecl(decl_idx)?;
     }
+
+    return .ok(void{});
 }
 
-// Collect a declaration (add to scope without checking body).
-fn collectDecl(self: *Checker, idx: NodeIndex) !void {
-    var decl = self.tree.getDecl(idx) ?? return
+/// Collect a declaration (add to scope without checking body).
+fn collectDecl(self: *Checker, idx: NodeIndex) CheckResult<void> {
+    var decl = self.tree.getDecl(idx) ?? return .ok(void{});
 
     switch decl {
         .fn_decl |f| => {
             if self.scope.isDefined(f.name) {
-                self.errRedefined(f.span.start, f.name)
-                return
+                return .err(self.makeError(.redefined_identifier, f.span, "function '" ++ f.name ++ "' already defined"));
             }
             // Build function type
-            var func_type = try self.buildFuncType(f.params, f.return_type)
-            try self.scope.define(Symbol.init(
+            var func_type = self.buildFuncType(f.params, f.return_type)?;
+            self.scope.define(initSymbol(
                 f.name,
                 .function,
                 func_type,
                 idx,
                 false,
-            ))
+            ))?;
         },
         .var_decl |v| => {
             if self.scope.isDefined(v.name) {
-                self.errRedefined(v.span.start, v.name)
-                return
+                return .err(self.makeError(.redefined_identifier, v.span, "variable '" ++ v.name ++ "' already defined"));
             }
             // Type will be determined in checkDecl
-            try self.scope.define(Symbol.init(
+            self.scope.define(initSymbol(
                 v.name,
                 .variable,
-                invalid_type,
+                types.invalid_type,
                 idx,
                 true,
-            ))
+            ))?;
         },
         .const_decl |c| => {
             if self.scope.isDefined(c.name) {
-                self.errRedefined(c.span.start, c.name)
-                return
+                return .err(self.makeError(.redefined_identifier, c.span, "constant '" ++ c.name ++ "' already defined"));
             }
-            try self.scope.define(Symbol.init(
+            self.scope.define(initSymbol(
                 c.name,
                 .constant,
-                invalid_type,
+                types.invalid_type,
                 idx,
                 false,
-            ))
+            ))?;
         },
         .struct_decl |s| => {
             if self.scope.isDefined(s.name) {
-                self.errRedefined(s.span.start, s.name)
-                return
+                return .err(self.makeError(.redefined_identifier, s.span, "struct '" ++ s.name ++ "' already defined"));
             }
             // Build struct type
-            var struct_type = try self.buildStructType(s.name, s.fields)
-            try self.scope.define(Symbol.init(
+            var struct_type = self.buildStructType(s.name, s.fields)?;
+            self.scope.define(initSymbol(
                 s.name,
                 .type_name,
                 struct_type,
                 idx,
                 false,
-            ))
+            ))?;
         },
         .enum_decl |e| => {
             if self.scope.isDefined(e.name) {
-                self.errRedefined(e.span.start, e.name)
-                return
+                return .err(self.makeError(.redefined_identifier, e.span, "enum '" ++ e.name ++ "' already defined"));
             }
-            // TODO: build enum type
-            try self.scope.define(Symbol.init(
+            var enum_type = self.buildEnumType(e)?;
+            self.scope.define(initSymbol(
                 e.name,
                 .type_name,
-                invalid_type,
+                enum_type,
                 idx,
                 false,
-            ))
+            ))?;
+        },
+        .union_decl |u| => {
+            if self.scope.isDefined(u.name) {
+                return .err(self.makeError(.redefined_identifier, u.span, "union '" ++ u.name ++ "' already defined"));
+            }
+            var union_type = self.buildUnionType(u)?;
+            self.scope.define(initSymbol(
+                u.name,
+                .type_name,
+                union_type,
+                idx,
+                false,
+            ))?;
+        },
+        .type_alias |ta| => {
+            if self.scope.isDefined(ta.name) {
+                return .err(self.makeError(.redefined_identifier, ta.span, "type '" ++ ta.name ++ "' already defined"));
+            }
+            var underlying = self.resolveTypeExpr(ta.underlying)?;
+            self.scope.define(initSymbol(
+                ta.name,
+                .type_name,
+                underlying,
+                idx,
+                false,
+            ))?;
+        },
+        .module_decl |m| => {
+            // Module declarations are informational
+            self.scope.define(initSymbol(
+                m.name,
+                .module_name,
+                types.VOID,
+                idx,
+                false,
+            ))?;
+        },
+        .import_decl => {
+            // Import declarations handled separately
         },
         .bad_decl => {},
     }
+
+    return .ok(void{});
 }
 
 // ========================================================================
 // Declaration checking
 // ========================================================================
 
-// Check a declaration.
-fn checkDecl(self: *Checker, idx: NodeIndex) !void {
-    var decl = self.tree.getDecl(idx) ?? return
+/// Check a declaration.
+pub fn checkDecl(self: *Checker, idx: NodeIndex) CheckResult<void> {
+    var decl = self.tree.getDecl(idx) ?? return .ok(void{});
 
     switch decl {
-        .fn_decl |f| => try self.checkFnDecl(f, idx),
-        .var_decl |v| => try self.checkVarDecl(v, idx),
-        .const_decl |c| => try self.checkConstDecl(c, idx),
+        .fn_decl |f| => self.checkFnDecl(f, idx)?,
+        .var_decl |v| => self.checkVarDecl(v, idx)?,
+        .const_decl |c| => self.checkConstDecl(c, idx)?,
         .struct_decl => {},  // Already processed in collectDecl
-        .enum_decl => {},    // TODO
+        .enum_decl => {},    // Already processed in collectDecl
+        .union_decl => {},   // Already processed in collectDecl
+        .type_alias => {},   // Already processed in collectDecl
+        .module_decl => {},  // Informational only
+        .import_decl => {},  // Handled separately
         .bad_decl => {},
     }
+
+    return .ok(void{});
 }
 
-// Check function declaration.
-fn checkFnDecl(self: *Checker, f: FnDecl, idx: NodeIndex) !void {
+/// Check function declaration.
+fn checkFnDecl(self: *Checker, f: FnDecl, idx: NodeIndex) CheckResult<void> {
     // Get the function type we built earlier
-    var sym = self.scope.lookup(f.name) ?? return
-    var func_type = self.types.get(sym.type_idx)
+    var sym = self.scope.lookup(f.name) ?? return .ok(void{});
+    var func_type = self.types.get(sym.type_idx);
     var return_type = switch func_type {
         .func |ft| => ft.return_type,
-        else => TypeRegistry.VOID,
-    }
+        else => types.VOID,
+    };
 
     // Create new scope for function body
-    var func_scope = Scope.init(self.scope)
+    var func_scope = initScope(self.scope);
 
     // Add parameters to function scope
-    for param in f.params {
-        var param_type = try self.resolveTypeExpr(param.type_expr)
-        try func_scope.define(Symbol.init(
+    for param, i in f.params {
+        var param_type = self.resolveTypeExpr(param.type_expr)?;
+        func_scope.define(initSymbol(
             param.name,
             .parameter,
             param_type,
             idx,
             false,  // parameters are immutable by default
-        ))
+        ))?;
     }
 
     // Save state
-    var old_scope = self.scope
-    var old_return = self.current_return_type
+    var old_scope = self.scope;
+    var old_return = self.current_return_type;
 
     // Set up for function body
-    self.scope = &func_scope
-    self.current_return_type = return_type
+    self.scope = &func_scope;
+    self.current_return_type = return_type;
 
     // Check body if present
     if f.body |body_idx| {
-        try self.checkBlockExpr(body_idx)
+        self.checkBlockExpr(body_idx)?;
     }
 
     // Restore state
-    self.scope = old_scope
-    self.current_return_type = old_return
+    self.scope = old_scope;
+    self.current_return_type = old_return;
+
+    return .ok(void{});
 }
 
-// Check variable declaration.
-fn checkVarDecl(self: *Checker, v: VarDecl, idx: NodeIndex) !void {
-    var var_type: TypeIndex = invalid_type
+/// Check variable declaration.
+fn checkVarDecl(self: *Checker, v: VarDecl, idx: NodeIndex) CheckResult<void> {
+    var var_type: TypeIndex = types.invalid_type;
 
     // Get explicit type if present
     if v.type_expr |type_idx| {
-        var_type = try self.resolveTypeExpr(type_idx)
+        var_type = self.resolveTypeExpr(type_idx)?;
     }
 
     // Check initializer if present
     if v.value |val_idx| {
-        var val_type = try self.checkExpr(val_idx)
+        var val_type = self.checkExpr(val_idx)?;
 
-        if var_type == invalid_type {
+        if var_type == types.invalid_type {
             // Infer type from initializer
-            var_type = self.materializeType(val_type)
+            var_type = self.materializeType(val_type);
         } else {
             // Check that value is assignable to declared type
             if not self.isAssignable(val_type, var_type) {
-                self.errTypeMismatch(v.span.start, var_type, val_type)
+                return .err(self.makeTypeMismatchError(v.span, var_type, val_type));
             }
         }
     }
 
     // Update symbol with resolved type
     if self.scope.lookupLocal(v.name) |_| {
-        try self.scope.define(Symbol.init(
+        self.scope.define(initSymbol(
             v.name,
             .variable,
             var_type,
             idx,
             true,
-        ))
+        ))?;
     }
+
+    return .ok(void{});
 }
 
-// Check const declaration.
-fn checkConstDecl(self: *Checker, c: ConstDecl, idx: NodeIndex) !void {
-    var const_type: TypeIndex = invalid_type
+/// Check const declaration.
+fn checkConstDecl(self: *Checker, c: ConstDecl, idx: NodeIndex) CheckResult<void> {
+    var const_type: TypeIndex = types.invalid_type;
 
     // Get explicit type if present
     if c.type_expr |type_idx| {
-        const_type = try self.resolveTypeExpr(type_idx)
+        const_type = self.resolveTypeExpr(type_idx)?;
     }
 
     // Check initializer (required for const)
-    var val_type = try self.checkExpr(c.value)
+    var val_type = self.checkExpr(c.value)?;
 
-    if const_type == invalid_type {
-        const_type = self.materializeType(val_type)
+    if const_type == types.invalid_type {
+        const_type = self.materializeType(val_type);
     } else {
         if not self.isAssignable(val_type, const_type) {
-            self.errTypeMismatch(c.span.start, const_type, val_type)
+            return .err(self.makeTypeMismatchError(c.span, const_type, val_type));
         }
     }
 
     // Update symbol with resolved type
     if self.scope.lookupLocal(c.name) |_| {
-        try self.scope.define(Symbol.init(
+        self.scope.define(initSymbol(
             c.name,
             .constant,
             const_type,
             idx,
             false,
-        ))
+        ))?;
     }
+
+    return .ok(void{});
 }
 
 // ========================================================================
 // Expression checking
 // ========================================================================
 
-// Check an expression and return its type.
-fn checkExpr(self: *Checker, idx: NodeIndex) !TypeIndex {
+/// Check an expression and return its type.
+pub fn checkExpr(self: *Checker, idx: NodeIndex) CheckResult<TypeIndex> {
     // Check cache first
     if self.expr_types.get(idx) |t| {
-        return t
+        return .ok(t);
     }
 
-    var result = try self.checkExprInner(idx)
-    self.expr_types.set(idx, result)
-    return result
+    var result = self.checkExprInner(idx)?;
+    self.expr_types.set(idx, result);
+    return .ok(result);
 }
 
-fn checkExprInner(self: *Checker, idx: NodeIndex) !TypeIndex {
-    var expr = self.tree.getExpr(idx) ?? return invalid_type
+fn checkExprInner(self: *Checker, idx: NodeIndex) CheckResult<TypeIndex> {
+    var expr = self.tree.getExpr(idx) ?? return .ok(types.invalid_type);
 
     return switch expr {
         .identifier |id| => self.checkIdentifier(id),
-        .literal |lit| => self.checkLiteral(lit),
-        .binary |bin| => try self.checkBinary(bin),
-        .unary |un| => try self.checkUnary(un),
-        .call |c| => try self.checkCall(c),
-        .index |i| => try self.checkIndex(i),
-        .field_access |f| => try self.checkFieldAccess(f),
-        .array_literal |al| => try self.checkArrayLiteral(al),
-        .paren |p| => try self.checkExpr(p.inner),
-        .if_expr |ie| => try self.checkIfExpr(ie),
-        .block |b| => try self.checkBlock(b),
-        .struct_init |si| => try self.checkStructInit(si),
-        .type_expr => invalid_type,  // Types are not values
-        .bad_expr => invalid_type,
-    }
+        .literal |lit| => .ok(self.checkLiteral(lit)),
+        .binary |bin| => self.checkBinary(bin),
+        .unary |un| => self.checkUnary(un),
+        .call |c| => self.checkCall(c),
+        .index |i| => self.checkIndex(i),
+        .field_access |f| => self.checkFieldAccess(f),
+        .optional_chain |oc| => self.checkOptionalChain(oc),
+        .array_literal |al| => self.checkArrayLiteral(al),
+        .paren |p| => self.checkExpr(p.inner),
+        .if_expr |ie| => self.checkIfExpr(ie),
+        .switch_expr |se| => self.checkSwitchExpr(se),
+        .block |b| => self.checkBlock(b),
+        .struct_init |si| => self.checkStructInit(si),
+        .enum_literal |el| => self.checkEnumLiteral(el),
+        .range |r| => self.checkRange(r),
+        .type_expr => .ok(types.invalid_type),  // Types are not values
+        .bad_expr => .ok(types.invalid_type),
+    };
 }
 
-// Check identifier expression.
-fn checkIdentifier(self: *Checker, id: Identifier) TypeIndex {
+/// Check identifier expression.
+fn checkIdentifier(self: *Checker, id: Identifier) CheckResult<TypeIndex> {
     if self.scope.lookup(id.name) |sym| {
-        return sym.type_idx
+        return .ok(sym.type_idx);
     }
-    self.errUndefined(id.span.start, id.name)
-    return invalid_type
+    return .err(self.makeError(.undefined_identifier, id.span, "undefined: '" ++ id.name ++ "'"));
 }
 
-// Check literal expression.
+/// Check literal expression.
 fn checkLiteral(self: *Checker, lit: Literal) TypeIndex {
     return switch lit.kind {
-        .int => TypeRegistry.INT,
-        .float => TypeRegistry.FLOAT,
-        .string => TypeRegistry.STRING,
-        .char => TypeRegistry.U8,  // char is u8
-        .true_lit, .false_lit => TypeRegistry.BOOL,
-        .null_lit => invalid_type,  // null needs context
-    }
+        .int => types.INT,
+        .float => types.FLOAT,
+        .string => types.STRING,
+        .char => types.U8,  // char is u8
+        .true_lit, .false_lit => types.BOOL,
+        .null_lit => types.invalid_type,  // null needs context
+    };
 }
 
-// Check binary expression.
-fn checkBinary(self: *Checker, bin: Binary) !TypeIndex {
-    var left_type = try self.checkExpr(bin.left)
-    var right_type = try self.checkExpr(bin.right)
+/// Check binary expression.
+fn checkBinary(self: *Checker, bin: Binary) CheckResult<TypeIndex> {
+    var left_type = self.checkExpr(bin.left)?;
+    var right_type = self.checkExpr(bin.right)?;
 
-    var left = self.types.get(left_type)
-    var right = self.types.get(right_type)
+    var left = self.types.get(left_type);
+    var right = self.types.get(right_type);
+
+    // String concatenation: ++
+    if bin.op == .plus_plus {
+        if isString(left) and isString(right) {
+            return .ok(types.STRING);
+        }
+        return .err(self.makeError(.invalid_operation, bin.span, "++ requires string operands"));
+    }
+
+    // Null coalescing: ??
+    if bin.op == .question_question {
+        // Left must be optional, right must match element type
+        switch left {
+            .optional |o| => {
+                if self.isAssignable(right_type, o.elem) {
+                    return .ok(o.elem);
+                }
+            },
+            else => {},
+        }
+        return .err(self.makeError(.invalid_operation, bin.span, "?? requires optional left operand"));
+    }
 
     // Arithmetic operators: +, -, *, /, %
     switch bin.op {
         .plus, .minus, .star, .slash, .percent => {
             // Both operands must be numeric
             if not isNumeric(left) or not isNumeric(right) {
-                self.errInvalidOp(bin.span.start, "arithmetic", left_type, right_type)
-                return invalid_type
+                return .err(self.makeError(.invalid_operation, bin.span, "arithmetic requires numeric operands"));
             }
             // Result is the common type (simplified: use left type)
-            return left_type
+            return .ok(left_type);
         },
         // Comparison operators: ==, !=, <, <=, >, >=
         .equal_equal, .bang_equal, .less, .less_equal, .greater, .greater_equal => {
             // Both operands must be comparable
             if not self.isComparable(left_type, right_type) {
-                self.errInvalidOp(bin.span.start, "comparison", left_type, right_type)
-                return invalid_type
+                return .err(self.makeError(.invalid_operation, bin.span, "cannot compare these types"));
             }
-            return TypeRegistry.BOOL
+            return .ok(types.BOOL);
         },
         // Logical operators: and, or
         .kw_and, .kw_or => {
             // Both operands must be bool
             if not isBool(left) or not isBool(right) {
-                self.errInvalidOp(bin.span.start, "logical", left_type, right_type)
-                return invalid_type
+                return .err(self.makeError(.invalid_operation, bin.span, "logical operators require bool operands"));
             }
-            return TypeRegistry.BOOL
+            return .ok(types.BOOL);
         },
         // Bitwise operators: &, |, ^
         .ampersand, .pipe, .caret => {
             // Both operands must be integer
             if not isInteger(left) or not isInteger(right) {
-                self.errInvalidOp(bin.span.start, "bitwise", left_type, right_type)
-                return invalid_type
+                return .err(self.makeError(.invalid_operation, bin.span, "bitwise operators require integer operands"));
             }
-            return left_type
+            return .ok(left_type);
         },
-        else => return invalid_type,
+        else => return .ok(types.invalid_type),
     }
 }
 
-// Check unary expression.
-fn checkUnary(self: *Checker, un: Unary) !TypeIndex {
-    var operand_type = try self.checkExpr(un.operand)
-    var operand = self.types.get(operand_type)
+/// Check unary expression.
+fn checkUnary(self: *Checker, un: Unary) CheckResult<TypeIndex> {
+    var operand_type = self.checkExpr(un.operand)?;
+    var operand = self.types.get(operand_type);
 
     switch un.op {
         .minus => {
             if not isNumeric(operand) {
-                self.err.errorWithCode(un.span.start, .E303, "unary '-' requires numeric operand")
-                return invalid_type
+                return .err(self.makeError(.invalid_operation, un.span, "unary '-' requires numeric operand"));
             }
-            return operand_type
+            return .ok(operand_type);
         },
         .bang, .kw_not => {
             if not isBool(operand) {
-                self.err.errorWithCode(un.span.start, .E303, "unary '!' requires bool operand")
-                return invalid_type
+                return .err(self.makeError(.invalid_operation, un.span, "unary '!' requires bool operand"));
             }
-            return TypeRegistry.BOOL
+            return .ok(types.BOOL);
         },
-        else => return invalid_type,
+        .ampersand => {
+            // Address-of operator: &x -> *T
+            return .ok(self.types.makePointer(operand_type));
+        },
+        else => return .ok(types.invalid_type),
     }
 }
 
-// Check function call.
-fn checkCall(self: *Checker, c: Call) !TypeIndex {
+/// Check function call.
+fn checkCall(self: *Checker, c: Call) CheckResult<TypeIndex> {
     // Check for builtin functions first
     if self.tree.getExpr(c.callee) |callee_expr| {
-        if callee_expr == .identifier {
-            var name = callee_expr.identifier.name
-            if name == "len" {
-                return self.checkBuiltinLen(c)
-            }
+        switch callee_expr {
+            .identifier |id| => {
+                if id.name == "len" {
+                    return self.checkBuiltinLen(c);
+                }
+                if id.name == "print" or id.name == "println" {
+                    // Print functions accept any arguments and return void
+                    for arg_idx in c.args {
+                        _ = self.checkExpr(arg_idx)?;
+                    }
+                    return .ok(types.VOID);
+                }
+            },
+            else => {},
         }
     }
 
-    var callee_type = try self.checkExpr(c.callee)
-    var callee = self.types.get(callee_type)
+    var callee_type = self.checkExpr(c.callee)?;
+    var callee = self.types.get(callee_type);
 
     switch callee {
         .func |ft| => {
             // Check argument count
             if len(c.args) != len(ft.params) {
-                self.err.errorWithCode(c.span.start, .E300, "wrong number of arguments")
-                return invalid_type
+                return .err(self.makeError(.wrong_argument_count, c.span,
+                    "expected " ++ @toString(len(ft.params)) ++ " arguments, got " ++ @toString(len(c.args))));
             }
 
             // Check argument types
-            var i: u32 = 0
-            for arg_idx in c.args {
-                var arg_type = try self.checkExpr(arg_idx)
-                var param_type = ft.params[i].type_idx
+            for arg_idx, i in c.args {
+                var arg_type = self.checkExpr(arg_idx)?;
+                var param_type = ft.params[i].type_idx;
                 if not self.isAssignable(arg_type, param_type) {
-                    self.errTypeMismatch(c.span.start, param_type, arg_type)
+                    return .err(self.makeTypeMismatchError(c.span, param_type, arg_type));
                 }
-                i += 1
             }
 
-            return ft.return_type
+            return .ok(ft.return_type);
         },
         else => {
-            self.err.errorWithCode(c.span.start, .E303, "cannot call non-function")
-            return invalid_type
+            return .err(self.makeError(.not_callable, c.span, "cannot call non-function"));
         },
     }
 }
 
-// Check builtin len() function.
-fn checkBuiltinLen(self: *Checker, c: Call) !TypeIndex {
+/// Check builtin len() function.
+fn checkBuiltinLen(self: *Checker, c: Call) CheckResult<TypeIndex> {
     // len() takes exactly one argument
     if len(c.args) != 1 {
-        self.err.errorWithCode(c.span.start, .E300, "len() expects exactly one argument")
-        return invalid_type
+        return .err(self.makeError(.wrong_argument_count, c.span, "len() expects exactly one argument"));
     }
 
-    var arg_type = try self.checkExpr(c.args[0])
-    var arg = self.types.get(arg_type)
+    var arg_type = self.checkExpr(c.args[0])?;
+    var arg = self.types.get(arg_type);
 
     // len() works on strings, arrays, and slices
     switch arg {
         .basic |k| => {
             if k == .string_type {
-                return TypeRegistry.INT
+                return .ok(types.INT);
             }
         },
         .array, .slice => {
-            return TypeRegistry.INT
+            return .ok(types.INT);
         },
         else => {},
     }
 
-    self.err.errorWithCode(c.span.start, .E300, "len() argument must be string, array, or slice")
-    return invalid_type
+    return .err(self.makeError(.invalid_operation, c.span, "len() argument must be string, array, or slice"));
 }
 
-// Check index expression.
-fn checkIndex(self: *Checker, i: Index) !TypeIndex {
-    var base_type = try self.checkExpr(i.base)
-    var index_type = try self.checkExpr(i.index)
-    var base = self.types.get(base_type)
+/// Check index expression.
+fn checkIndex(self: *Checker, i: Index) CheckResult<TypeIndex> {
+    var base_type = self.checkExpr(i.base)?;
+    var index_type = self.checkExpr(i.index)?;
+    var base = self.types.get(base_type);
 
     // Index must be integer
-    var index = self.types.get(index_type)
+    var index = self.types.get(index_type);
     if not isInteger(index) {
-        self.err.errorWithCode(i.span.start, .E300, "index must be integer")
-        return invalid_type
+        return .err(self.makeError(.invalid_operation, i.span, "index must be integer"));
     }
 
     // Check indexable types
     return switch base {
-        .array |a| => a.elem,
-        .slice |s| => s.elem,
-        .basic |k| => if k == .string_type { TypeRegistry.U8 } else { invalid_type },
-        else => {
-            self.err.errorWithCode(i.span.start, .E303, "cannot index this type")
-            return invalid_type
-        },
-    }
+        .array |a| => .ok(a.elem),
+        .slice |s| => .ok(s.elem),
+        .basic |k| => if k == .string_type { .ok(types.U8) } else { .err(self.makeError(.not_indexable, i.span, "cannot index this type")) },
+        else => .err(self.makeError(.not_indexable, i.span, "cannot index this type")),
+    };
 }
 
-// Check field access.
-fn checkFieldAccess(self: *Checker, f: FieldAccess) !TypeIndex {
-    var base_type = try self.checkExpr(f.base)
-    var base = self.types.get(base_type)
+/// Check field access.
+fn checkFieldAccess(self: *Checker, f: FieldAccess) CheckResult<TypeIndex> {
+    var base_type = self.checkExpr(f.base)?;
+    var base = self.types.get(base_type);
 
     // Handle struct field access
     switch base {
         .struct_type |st| => {
             for field in st.fields {
                 if field.name == f.field {
-                    return field.type_idx
+                    return .ok(field.type_idx);
                 }
             }
-            self.errUndefined(f.span.start, f.field)
-            return invalid_type
+            return .err(self.makeError(.undefined_identifier, f.span, "no field '" ++ f.field ++ "' in struct"));
         },
         .pointer |ptr| => {
             // Auto-deref for field access
-            var elem = self.types.get(ptr.elem)
+            var elem = self.types.get(ptr.elem);
             switch elem {
                 .struct_type |st| => {
                     for field in st.fields {
                         if field.name == f.field {
-                            return field.type_idx
+                            return .ok(field.type_idx);
                         }
                     }
-                    self.errUndefined(f.span.start, f.field)
-                    return invalid_type
+                    return .err(self.makeError(.undefined_identifier, f.span, "no field '" ++ f.field ++ "' in struct"));
                 },
                 else => {},
             }
-            self.err.errorWithCode(f.span.start, .E303, "cannot access field on this type")
-            return invalid_type
+            return .err(self.makeError(.invalid_operation, f.span, "cannot access field on this type"));
+        },
+        .enum_type |et| => {
+            // Enum variant access
+            for variant in et.variants {
+                if variant.name == f.field {
+                    return .ok(base_type);
+                }
+            }
+            return .err(self.makeError(.undefined_identifier, f.span, "no variant '" ++ f.field ++ "' in enum"));
         },
         else => {
-            self.err.errorWithCode(f.span.start, .E303, "cannot access field on this type")
-            return invalid_type
+            return .err(self.makeError(.invalid_operation, f.span, "cannot access field on this type"));
         },
     }
 }
 
-// Check struct initialization: Point{ .x = 10, .y = 20 }
-fn checkStructInit(self: *Checker, si: StructInit) !TypeIndex {
+/// Check optional chaining: x?.field
+fn checkOptionalChain(self: *Checker, oc: OptionalChain) CheckResult<TypeIndex> {
+    var base_type = self.checkExpr(oc.base)?;
+    var base = self.types.get(base_type);
+
+    switch base {
+        .optional |opt| => {
+            // Get the inner type and check field access
+            var inner = self.types.get(opt.elem);
+            switch inner {
+                .struct_type |st| => {
+                    for field in st.fields {
+                        if field.name == oc.field {
+                            // Return optional of field type
+                            return .ok(self.types.makeOptional(field.type_idx));
+                        }
+                    }
+                    return .err(self.makeError(.undefined_identifier, oc.span, "no field '" ++ oc.field ++ "' in struct"));
+                },
+                else => return .err(self.makeError(.invalid_operation, oc.span, "?. requires struct type inside optional")),
+            }
+        },
+        else => return .err(self.makeError(.invalid_operation, oc.span, "?. requires optional type")),
+    }
+}
+
+/// Check struct initialization: Point{ .x = 10, .y = 20 }
+fn checkStructInit(self: *Checker, si: StructInit) CheckResult<TypeIndex> {
     // Look up the struct type
     var sym = self.scope.lookup(si.type_name) ?? {
-        self.errUndefined(si.span.start, si.type_name)
-        return invalid_type
-    }
+        return .err(self.makeError(.undefined_identifier, si.span, "undefined type: '" ++ si.type_name ++ "'"));
+    };
 
-    var struct_type = self.types.get(sym.type_idx)
+    var struct_type = self.types.get(sym.type_idx);
     switch struct_type {
         .struct_type |st| => {
             // Check each field initializer
             for field_init in si.fields {
                 // Find the field in the struct type
-                var found = false
+                var found = false;
                 for struct_field in st.fields {
                     if struct_field.name == field_init.name {
-                        found = true
+                        found = true;
                         // Check the value type matches the field type
-                        var value_type = try self.checkExpr(field_init.value)
-                        if not self.types.equal(value_type, struct_field.type_idx) {
-                            self.err.errorWithCode(field_init.span.start, .E300, "type mismatch in field initializer")
+                        var value_type = self.checkExpr(field_init.value)?;
+                        if not self.isAssignable(value_type, struct_field.type_idx) {
+                            return .err(self.makeTypeMismatchError(field_init.span, struct_field.type_idx, value_type));
                         }
-                        break
+                        break;
                     }
                 }
                 if not found {
-                    self.err.errorWithCode(field_init.span.start, .E301, "unknown field in struct initializer")
+                    return .err(self.makeError(.undefined_identifier, field_init.span, "unknown field '" ++ field_init.name ++ "'"));
                 }
             }
-            return sym.type_idx
+            return .ok(sym.type_idx);
         },
         else => {
-            self.err.errorWithCode(si.span.start, .E300, "not a struct type")
-            return invalid_type
+            return .err(self.makeError(.invalid_operation, si.span, "'" ++ si.type_name ++ "' is not a struct type"));
         },
     }
 }
 
-// Check array literal: [1, 2, 3]
-fn checkArrayLiteral(self: *Checker, al: ArrayLiteral) !TypeIndex {
+/// Check enum literal: .variant
+fn checkEnumLiteral(self: *Checker, el: EnumLiteral) CheckResult<TypeIndex> {
+    // Enum literals need context to resolve the type
+    // For now, return invalid_type and let context resolve it
+    return .ok(types.invalid_type);
+}
+
+/// Check range expression: 0..10 or 0..=10
+fn checkRange(self: *Checker, r: RangeExpr) CheckResult<TypeIndex> {
+    var start_type = self.checkExpr(r.start)?;
+    var end_type = self.checkExpr(r.end)?;
+
+    if not isInteger(self.types.get(start_type)) or not isInteger(self.types.get(end_type)) {
+        return .err(self.makeError(.invalid_operation, r.span, "range bounds must be integers"));
+    }
+
+    // Ranges are iterable but their "type" is a special range type
+    // For simplicity, return INT to indicate integer range
+    return .ok(types.INT);
+}
+
+/// Check array literal: [1, 2, 3]
+fn checkArrayLiteral(self: *Checker, al: ArrayLiteral) CheckResult<TypeIndex> {
     if len(al.elements) == 0 {
-        self.err.errorWithCode(al.span.start, .E300, "cannot infer type of empty array literal")
-        return invalid_type
+        return .err(self.makeError(.invalid_operation, al.span, "cannot infer type of empty array literal"));
     }
 
     // Get type of first element
-    var first_type = try self.checkExpr(al.elements[0])
-    if first_type == invalid_type {
-        return invalid_type
+    var first_type = self.checkExpr(al.elements[0])?;
+    if first_type == types.invalid_type {
+        return .ok(types.invalid_type);
     }
 
     // Check all other elements have the same type
-    var i: u32 = 1
-    while i < len(al.elements) {
-        var elem_type = try self.checkExpr(al.elements[i])
+    for elem_idx, i in al.elements {
+        if i == 0 { continue; }  // Skip first element
+        var elem_type = self.checkExpr(elem_idx)?;
         if not self.types.equal(first_type, elem_type) {
-            self.err.errorWithCode(al.span.start, .E300, "array elements must have same type")
-            return invalid_type
+            return .err(self.makeError(.type_mismatch, al.span, "array elements must have same type"));
         }
-        i += 1
     }
 
     // Create array type with inferred element type and length
-    return self.types.makeArray(first_type, len(al.elements))
+    return .ok(self.types.makeArray(first_type, len(al.elements)));
 }
 
-// Check if expression.
-fn checkIfExpr(self: *Checker, ie: IfExpr) !TypeIndex {
-    var cond_type = try self.checkExpr(ie.condition)
-    var cond = self.types.get(cond_type)
+/// Check if expression.
+fn checkIfExpr(self: *Checker, ie: IfExpr) CheckResult<TypeIndex> {
+    var cond_type = self.checkExpr(ie.condition)?;
+    var cond = self.types.get(cond_type);
 
-    if not isBool(cond) {
-        self.err.errorWithCode(ie.span.start, .E300, "condition must be bool")
+    // Handle optional unwrapping: if opt |value| { }
+    if ie.capture |capture_name| {
+        switch cond {
+            .optional |opt| => {
+                // Create scope with captured value
+                var if_scope = initScope(self.scope);
+                if_scope.define(initSymbol(capture_name, .variable, opt.elem, null_node, false))?;
+
+                var old_scope = self.scope;
+                self.scope = &if_scope;
+                var then_type = self.checkExpr(ie.then_branch)?;
+                self.scope = old_scope;
+
+                if ie.else_branch |else_idx| {
+                    var else_type = self.checkExpr(else_idx)?;
+                    if not self.types.equal(then_type, else_type) {
+                        return .err(self.makeError(.type_mismatch, ie.span, "if branches have different types"));
+                    }
+                    return .ok(then_type);
+                }
+                return .ok(types.VOID);
+            },
+            else => return .err(self.makeError(.invalid_operation, ie.span, "cannot capture from non-optional")),
+        }
     }
 
-    var then_type = try self.checkExpr(ie.then_branch)
+    if not isBool(cond) {
+        return .err(self.makeError(.type_mismatch, ie.span, "condition must be bool"));
+    }
+
+    var then_type = self.checkExpr(ie.then_branch)?;
 
     if ie.else_branch |else_idx| {
-        var else_type = try self.checkExpr(else_idx)
+        var else_type = self.checkExpr(else_idx)?;
         // Both branches must have same type
         if not self.types.equal(then_type, else_type) {
-            self.err.errorWithCode(ie.span.start, .E300, "if branches have different types")
-            return invalid_type
+            return .err(self.makeError(.type_mismatch, ie.span, "if branches have different types"));
         }
-        return then_type
+        return .ok(then_type);
     }
 
     // If without else has void type
-    return TypeRegistry.VOID
+    return .ok(types.VOID);
 }
 
-// Check block expression.
-fn checkBlock(self: *Checker, b: Block) !TypeIndex {
-    // Create new scope for block
-    var block_scope = Scope.init(self.scope)
+/// Check switch expression.
+fn checkSwitchExpr(self: *Checker, se: SwitchExpr) CheckResult<TypeIndex> {
+    var target_type = self.checkExpr(se.target)?;
+    var target = self.types.get(target_type);
 
-    var old_scope = self.scope
-    self.scope = &block_scope
+    var result_type: TypeIndex = types.invalid_type;
+
+    for case in se.cases {
+        // Check pattern if present
+        if case.pattern |pat_idx| {
+            _ = self.checkExpr(pat_idx)?;
+        }
+
+        // Create scope for capture if present
+        var case_scope = initScope(self.scope);
+        if case.capture |capture_name| {
+            // For union payload capture, determine the payload type
+            switch target {
+                .union_type |ut| => {
+                    // Find matching variant
+                    if case.pattern |pat_idx| {
+                        var pat = self.tree.getExpr(pat_idx);
+                        switch pat {
+                            .enum_literal |el| => {
+                                for variant in ut.variants {
+                                    if variant.name == el.variant {
+                                        if variant.type_idx |payload_type| {
+                                            case_scope.define(initSymbol(capture_name, .variable, payload_type, null_node, false))?;
+                                        }
+                                        break;
+                                    }
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        var old_scope = self.scope;
+        self.scope = &case_scope;
+        var case_type = self.checkExpr(case.body)?;
+        self.scope = old_scope;
+
+        if result_type == types.invalid_type {
+            result_type = case_type;
+        } else if not self.types.equal(result_type, case_type) {
+            return .err(self.makeError(.type_mismatch, se.span, "switch arms have different types"));
+        }
+    }
+
+    return .ok(result_type);
+}
+
+/// Check block expression.
+fn checkBlock(self: *Checker, b: Block) CheckResult<TypeIndex> {
+    // Create new scope for block
+    var block_scope = initScope(self.scope);
+
+    var old_scope = self.scope;
+    self.scope = &block_scope;
 
     // Check statements
     for stmt_idx in b.stmts {
-        try self.checkStmt(stmt_idx)
+        self.checkStmt(stmt_idx)?;
     }
 
-    self.scope = old_scope
+    self.scope = old_scope;
 
     // Block value is the final expression, or void
     if b.expr != null_node {
-        return try self.checkExpr(b.expr)
+        return self.checkExpr(b.expr);
     }
-    return TypeRegistry.VOID
+    return .ok(types.VOID);
 }
 
-// Check block expression (from function body).
-fn checkBlockExpr(self: *Checker, idx: NodeIndex) !void {
-    var node = self.tree.getNode(idx)
+/// Check block expression (from function body).
+fn checkBlockExpr(self: *Checker, idx: NodeIndex) CheckResult<void> {
+    var node = self.tree.getNode(idx);
     switch node {
         .expr |e| => switch e {
             .block |b| => {
-                _ = try self.checkBlock(b)
+                _ = self.checkBlock(b)?;
             },
             else => {},
         },
         else => {},
     }
+    return .ok(void{});
 }
 
 // ========================================================================
 // Statement checking
 // ========================================================================
 
-// Check a statement.
-fn checkStmt(self: *Checker, idx: NodeIndex) !void {
-    var stmt = self.tree.getStmt(idx) ?? return
+/// Check a statement.
+pub fn checkStmt(self: *Checker, idx: NodeIndex) CheckResult<void> {
+    var stmt = self.tree.getStmt(idx) ?? return .ok(void{});
 
     switch stmt {
         .expr_stmt |es| => {
-            _ = try self.checkExpr(es.expr)
+            _ = self.checkExpr(es.expr)?;
         },
-        .return_stmt |rs| => try self.checkReturn(rs),
-        .var_stmt |vs| => try self.checkVarStmt(vs, idx),
-        .assign_stmt |as_stmt| => try self.checkAssign(as_stmt),
-        .if_stmt |is| => try self.checkIfStmt(is),
-        .while_stmt |ws| => try self.checkWhileStmt(ws),
-        .for_stmt |fs| => try self.checkForStmt(fs),
-        .block_stmt |bs| => try self.checkBlockStmt(bs),
+        .return_stmt |rs| => self.checkReturn(rs)?,
+        .var_stmt |vs| => self.checkVarStmt(vs, idx)?,
+        .assign_stmt |as_stmt| => self.checkAssign(as_stmt)?,
+        .if_stmt |is| => self.checkIfStmt(is)?,
+        .while_stmt |ws| => self.checkWhileStmt(ws)?,
+        .for_stmt |fs| => self.checkForStmt(fs)?,
+        .block_stmt |bs| => self.checkBlockStmt(bs)?,
         .break_stmt |bs| => {
             if not self.in_loop {
-                self.err.errorWithCode(bs.span.start, .E303, "break outside of loop")
+                return .err(self.makeError(.break_outside_loop, bs.span, "break outside of loop"));
             }
         },
         .continue_stmt |cs| => {
             if not self.in_loop {
-                self.err.errorWithCode(cs.span.start, .E303, "continue outside of loop")
+                return .err(self.makeError(.continue_outside_loop, cs.span, "continue outside of loop"));
             }
         },
         .bad_stmt => {},
     }
+
+    return .ok(void{});
 }
 
-// Check return statement.
-fn checkReturn(self: *Checker, rs: ReturnStmt) !void {
+/// Check return statement.
+fn checkReturn(self: *Checker, rs: ReturnStmt) CheckResult<void> {
     if rs.value |val_idx| {
-        var val_type = try self.checkExpr(val_idx)
-        if self.current_return_type == TypeRegistry.VOID {
-            self.err.errorWithCode(rs.span.start, .E300, "void function should not return a value")
+        var val_type = self.checkExpr(val_idx)?;
+        if self.current_return_type == types.VOID {
+            return .err(self.makeError(.return_type_mismatch, rs.span, "void function should not return a value"));
         } else if not self.isAssignable(val_type, self.current_return_type) {
-            self.errTypeMismatch(rs.span.start, self.current_return_type, val_type)
+            return .err(self.makeTypeMismatchError(rs.span, self.current_return_type, val_type));
         }
     } else {
-        if self.current_return_type != TypeRegistry.VOID {
-            self.err.errorWithCode(rs.span.start, .E300, "non-void function must return a value")
+        if self.current_return_type != types.VOID {
+            return .err(self.makeError(.return_type_mismatch, rs.span, "non-void function must return a value"));
         }
     }
+    return .ok(void{});
 }
 
-// Check var statement (local variable).
-fn checkVarStmt(self: *Checker, vs: VarStmt, idx: NodeIndex) !void {
+/// Check var statement (local variable).
+fn checkVarStmt(self: *Checker, vs: VarStmt, idx: NodeIndex) CheckResult<void> {
     if self.scope.isDefined(vs.name) {
-        self.errRedefined(vs.span.start, vs.name)
-        return
+        return .err(self.makeError(.redefined_identifier, vs.span, "variable '" ++ vs.name ++ "' already defined"));
     }
 
-    var var_type: TypeIndex = invalid_type
+    var var_type: TypeIndex = types.invalid_type;
 
     if vs.type_expr |type_idx| {
-        var_type = try self.resolveTypeExpr(type_idx)
+        var_type = self.resolveTypeExpr(type_idx)?;
     }
 
     if vs.value |val_idx| {
-        var val_type = try self.checkExpr(val_idx)
-        if var_type == invalid_type {
-            var_type = self.materializeType(val_type)
+        var val_type = self.checkExpr(val_idx)?;
+        if var_type == types.invalid_type {
+            var_type = self.materializeType(val_type);
         } else if not self.isAssignable(val_type, var_type) {
-            self.errTypeMismatch(vs.span.start, var_type, val_type)
+            return .err(self.makeTypeMismatchError(vs.span, var_type, val_type));
         }
     }
 
-    try self.scope.define(Symbol.init(
+    self.scope.define(initSymbol(
         vs.name,
         if vs.is_const { .constant } else { .variable },
         var_type,
         idx,
         not vs.is_const,
-    ))
+    ))?;
+
+    return .ok(void{});
 }
 
-// Check assignment statement.
-fn checkAssign(self: *Checker, as_stmt: AssignStmt) !void {
-    var target_type = try self.checkExpr(as_stmt.target)
-    var value_type = try self.checkExpr(as_stmt.value)
+/// Check assignment statement.
+fn checkAssign(self: *Checker, as_stmt: AssignStmt) CheckResult<void> {
+    var target_type = self.checkExpr(as_stmt.target)?;
+    var value_type = self.checkExpr(as_stmt.value)?;
 
     // Check target is assignable (lvalue)
-    var target = self.tree.getExpr(as_stmt.target) ?? return
+    var target = self.tree.getExpr(as_stmt.target) ?? return .ok(void{});
     switch target {
         .identifier |id| => {
             if self.scope.lookup(id.name) |sym| {
                 if not sym.mutable {
-                    self.err.errorWithCode(as_stmt.span.start, .E303, "cannot assign to constant")
-                    return
+                    return .err(self.makeError(.invalid_assignment, as_stmt.span, "cannot assign to constant '" ++ id.name ++ "'"));
                 }
             }
         },
         .index, .field_access => {},  // These are valid lvalues
         else => {
-            self.err.errorWithCode(as_stmt.span.start, .E303, "invalid assignment target")
-            return
+            return .err(self.makeError(.invalid_assignment, as_stmt.span, "invalid assignment target"));
         },
     }
 
     if not self.isAssignable(value_type, target_type) {
-        self.errTypeMismatch(as_stmt.span.start, target_type, value_type)
+        return .err(self.makeTypeMismatchError(as_stmt.span, target_type, value_type));
     }
+
+    return .ok(void{});
 }
 
-// Check if statement.
-fn checkIfStmt(self: *Checker, is: IfStmt) !void {
-    var cond_type = try self.checkExpr(is.condition)
-    var cond = self.types.get(cond_type)
+/// Check if statement.
+fn checkIfStmt(self: *Checker, is: IfStmt) CheckResult<void> {
+    var cond_type = self.checkExpr(is.condition)?;
+    var cond = self.types.get(cond_type);
 
-    if not isBool(cond) {
-        self.err.errorWithCode(is.span.start, .E300, "condition must be bool")
+    // Handle optional unwrapping with capture
+    if is.capture |capture_name| {
+        switch cond {
+            .optional |opt| => {
+                var if_scope = initScope(self.scope);
+                if_scope.define(initSymbol(capture_name, .variable, opt.elem, null_node, false))?;
+
+                var old_scope = self.scope;
+                self.scope = &if_scope;
+                self.checkStmt(is.then_branch)?;
+                self.scope = old_scope;
+
+                if is.else_branch |else_idx| {
+                    self.checkStmt(else_idx)?;
+                }
+                return .ok(void{});
+            },
+            else => return .err(self.makeError(.invalid_operation, is.span, "cannot capture from non-optional")),
+        }
     }
 
-    try self.checkStmt(is.then_branch)
+    if not isBool(cond) {
+        return .err(self.makeError(.type_mismatch, is.span, "condition must be bool"));
+    }
+
+    self.checkStmt(is.then_branch)?;
 
     if is.else_branch |else_idx| {
-        try self.checkStmt(else_idx)
+        self.checkStmt(else_idx)?;
     }
+
+    return .ok(void{});
 }
 
-// Check while statement.
-fn checkWhileStmt(self: *Checker, ws: WhileStmt) !void {
-    var cond_type = try self.checkExpr(ws.condition)
-    var cond = self.types.get(cond_type)
+/// Check while statement.
+fn checkWhileStmt(self: *Checker, ws: WhileStmt) CheckResult<void> {
+    var cond_type = self.checkExpr(ws.condition)?;
+    var cond = self.types.get(cond_type);
 
     if not isBool(cond) {
-        self.err.errorWithCode(ws.span.start, .E300, "condition must be bool")
+        return .err(self.makeError(.type_mismatch, ws.span, "condition must be bool"));
     }
 
-    var old_in_loop = self.in_loop
-    self.in_loop = true
-    try self.checkStmt(ws.body)
-    self.in_loop = old_in_loop
+    var old_in_loop = self.in_loop;
+    self.in_loop = true;
+    self.checkStmt(ws.body)?;
+    self.in_loop = old_in_loop;
+
+    return .ok(void{});
 }
 
-// Check for statement.
-fn checkForStmt(self: *Checker, fs: ForStmt) !void {
-    var iter_type = try self.checkExpr(fs.iterable)
-    var iter = self.types.get(iter_type)
+/// Check for statement with support for indexed iteration.
+fn checkForStmt(self: *Checker, fs: ForStmt) CheckResult<void> {
+    var iter_type = self.checkExpr(fs.iterable)?;
+    var iter = self.types.get(iter_type);
 
     // Determine element type
     var elem_type: TypeIndex = switch iter {
         .array |a| => a.elem,
         .slice |s| => s.elem,
-        .basic |k| => if k == .string_type { TypeRegistry.U8 } else { invalid_type },
+        .basic |k| => if k == .string_type { types.U8 } else { types.invalid_type },
         else => {
-            self.err.errorWithCode(fs.span.start, .E303, "cannot iterate over this type")
-            return invalid_type
+            return .err(self.makeError(.not_iterable, fs.span, "cannot iterate over this type"));
         },
+    };
+
+    // Create scope with loop variable(s)
+    var loop_scope = initScope(self.scope);
+
+    loop_scope.define(initSymbol(fs.binding, .variable, elem_type, null_node, false))?;
+
+    // Add index variable if present (indexed iteration: for item, i in array)
+    if fs.index_binding |idx_name| {
+        loop_scope.define(initSymbol(idx_name, .variable, types.INT, null_node, false))?;
     }
 
-    // Create scope with loop variable
-    var loop_scope = Scope.init(self.scope)
+    var old_scope = self.scope;
+    var old_in_loop = self.in_loop;
+    self.scope = &loop_scope;
+    self.in_loop = true;
 
-    try loop_scope.define(Symbol.init(fs.binding, .variable, elem_type, null_node, false))
+    self.checkStmt(fs.body)?;
 
-    var old_scope = self.scope
-    var old_in_loop = self.in_loop
-    self.scope = &loop_scope
-    self.in_loop = true
+    self.scope = old_scope;
+    self.in_loop = old_in_loop;
 
-    try self.checkStmt(fs.body)
-
-    self.scope = old_scope
-    self.in_loop = old_in_loop
+    return .ok(void{});
 }
 
-// Check block statement.
-fn checkBlockStmt(self: *Checker, bs: BlockStmt) !void {
-    var block_scope = Scope.init(self.scope)
+/// Check block statement.
+fn checkBlockStmt(self: *Checker, bs: BlockStmt) CheckResult<void> {
+    var block_scope = initScope(self.scope);
 
-    var old_scope = self.scope
-    self.scope = &block_scope
+    var old_scope = self.scope;
+    self.scope = &block_scope;
 
     for stmt_idx in bs.stmts {
-        try self.checkStmt(stmt_idx)
+        self.checkStmt(stmt_idx)?;
     }
 
-    self.scope = old_scope
+    self.scope = old_scope;
+
+    return .ok(void{});
 }
 
 // ========================================================================
 // Type resolution
 // ========================================================================
 
-// Resolve a type expression to a TypeIndex.
-fn resolveTypeExpr(self: *Checker, idx: NodeIndex) !TypeIndex {
-    var node = self.tree.getNode(idx)
+/// Resolve a type expression to a TypeIndex.
+pub fn resolveTypeExpr(self: *Checker, idx: NodeIndex) CheckResult<TypeIndex> {
+    var node = self.tree.getNode(idx);
     switch node {
         .expr |e| => switch e {
             .type_expr |te| => return self.resolveType(te),
-            else => return invalid_type,
+            else => return .ok(types.invalid_type),
         },
-        else => return invalid_type,
+        else => return .ok(types.invalid_type),
     }
 }
 
-// Resolve a TypeExpr to TypeIndex.
-fn resolveType(self: *Checker, te: TypeExpr) !TypeIndex {
+/// Resolve a TypeExpr to TypeIndex.
+fn resolveType(self: *Checker, te: TypeExpr) CheckResult<TypeIndex> {
     return switch te.kind {
-        .named |name| => {
+        .named |n| => {
             // Check built-in types first
-            if self.types.lookupBasic(name) |idx| {
-                return idx
+            if self.types.lookupBasic(n.name) |idx| {
+                return .ok(idx);
             }
             // Check user-defined types
-            if self.scope.lookup(name) |sym| {
+            if self.scope.lookup(n.name) |sym| {
                 if sym.kind == .type_name {
-                    return sym.type_idx
+                    return .ok(sym.type_idx);
                 }
             }
-            self.errUndefined(te.span.start, name)
-            return invalid_type
+            return .err(self.makeError(.undefined_identifier, te.span, "undefined type: '" ++ n.name ++ "'"));
         },
         .pointer |elem_idx| => {
-            var elem = try self.resolveTypeExpr(elem_idx)
-            return self.types.makePointer(elem)
+            var elem = self.resolveTypeExpr(elem_idx)?;
+            return .ok(self.types.makePointer(elem));
         },
         .optional |elem_idx| => {
-            var elem = try self.resolveTypeExpr(elem_idx)
-            return self.types.makeOptional(elem)
+            var elem = self.resolveTypeExpr(elem_idx)?;
+            return .ok(self.types.makeOptional(elem));
         },
         .slice |elem_idx| => {
-            var elem = try self.resolveTypeExpr(elem_idx)
-            return self.types.makeSlice(elem)
+            var elem = self.resolveTypeExpr(elem_idx)?;
+            return .ok(self.types.makeSlice(elem));
         },
         .array |a| => {
-            var elem = try self.resolveTypeExpr(a.elem)
+            var elem = self.resolveTypeExpr(a.elem)?;
             // TODO: evaluate size expression as constant
-            return self.types.makeArray(elem, 0)
+            return .ok(self.types.makeArray(elem, 0));
         },
         .function => {
             // TODO: function types
-            return invalid_type
+            return .ok(types.invalid_type);
         },
-    }
+    };
 }
 
-// Build a function type from parameters and return type.
-fn buildFuncType(self: *Checker, params: []Field, return_type_idx: ?NodeIndex) !TypeIndex {
-    var func_params = new List<FuncParam>
+/// Build a function type from parameters and return type.
+fn buildFuncType(self: *Checker, params: []Field, return_type_idx: ?NodeIndex) CheckResult<TypeIndex> {
+    var func_params = new List<types.FuncParam>();
 
     for param in params {
-        var param_type = try self.resolveTypeExpr(param.type_expr)
-        func_params.push(FuncParam{
+        var param_type = self.resolveTypeExpr(param.type_expr)?;
+        func_params.push(types.FuncParam{
             .name = param.name,
             .type_idx = param_type,
-        })
+        });
     }
 
     var ret_type: TypeIndex = if return_type_idx |idx| {
-        try self.resolveTypeExpr(idx)
+        self.resolveTypeExpr(idx)?
     } else {
-        TypeRegistry.VOID
-    }
+        types.VOID
+    };
 
-    return self.types.add(Type{ .func = FuncType{
-        .params = func_params,
+    return .ok(self.types.add(types.Type{ .func = types.FuncType{
+        .params = func_params.toSlice(),
         .return_type = ret_type,
-    }})
+    }}));
 }
 
-// Build a struct type from fields.
-fn buildStructType(self: *Checker, name: string, fields: []Field) !TypeIndex {
-    var struct_fields = new List<StructField>
+/// Build a struct type from fields.
+fn buildStructType(self: *Checker, name: string, fields: []Field) CheckResult<TypeIndex> {
+    var struct_fields = new List<types.StructField>();
 
-    var offset: u32 = 0
+    var offset: u32 = 0;
     for field in fields {
-        var field_type = try self.resolveTypeExpr(field.type_expr)
-        var field_size = self.typeSize(field_type)
-        struct_fields.push(StructField{
+        var field_type = self.resolveTypeExpr(field.type_expr)?;
+        var field_size = self.typeSize(field_type);
+        struct_fields.push(types.StructField{
             .name = field.name,
             .type_idx = field_type,
             .offset = offset,
-        })
-        offset += field_size
+        });
+        offset += field_size;
     }
 
-    return self.types.add(Type{ .struct_type = StructType{
+    return .ok(self.types.add(types.Type{ .struct_type = types.StructType{
         .name = name,
-        .fields = struct_fields,
+        .fields = struct_fields.toSlice(),
         .size = offset,
         .alignment = 8,  // simplified: always 8-byte aligned
-    }})
+    }}));
+}
+
+/// Build an enum type from declaration.
+fn buildEnumType(self: *Checker, e: EnumDecl) CheckResult<TypeIndex> {
+    var variants = new List<types.EnumVariant>();
+
+    var value: i64 = 0;
+    for v in e.variants {
+        // TODO: evaluate explicit value expressions
+        variants.push(types.EnumVariant{
+            .name = v.name,
+            .value = value,
+        });
+        value += 1;
+    }
+
+    var backing = if e.backing_type |bt| {
+        self.resolveTypeExpr(bt)?
+    } else {
+        types.I32  // Default backing type
+    };
+
+    return .ok(self.types.add(types.Type{ .enum_type = types.EnumType{
+        .name = e.name,
+        .variants = variants.toSlice(),
+        .backing_type = backing,
+    }}));
+}
+
+/// Build a union type from declaration.
+fn buildUnionType(self: *Checker, u: UnionDecl) CheckResult<TypeIndex> {
+    var variants = new List<types.UnionVariant>();
+
+    for v in u.variants {
+        var var_type: ?TypeIndex = if v.type_expr |te| {
+            self.resolveTypeExpr(te)?
+        } else {
+            null
+        };
+
+        variants.push(types.UnionVariant{
+            .name = v.name,
+            .type_idx = var_type,
+        });
+    }
+
+    return .ok(self.types.add(types.Type{ .union_type = types.UnionType{
+        .name = u.name,
+        .variants = variants.toSlice(),
+    }}));
 }
 
 // ========================================================================
 // Type utilities
 // ========================================================================
 
-// Get the size of a type in bytes.
-fn typeSize(self: *Checker, idx: TypeIndex) u32 {
-    var t = self.types.get(idx)
+/// Get the size of a type in bytes.
+pub fn typeSize(self: *Checker, idx: TypeIndex) u32 {
+    var t = self.types.get(idx);
     return switch t {
         .basic |k| => @intCast(u32, k.size()),
         .pointer, .slice, .func => 8,  // pointer size
@@ -1057,102 +1392,102 @@ fn typeSize(self: *Checker, idx: TypeIndex) u32 {
         .array |a| => @intCast(u32, a.length) * self.typeSize(a.elem),
         .struct_type |s| => s.size,
         else => 0,
-    }
+    };
 }
 
-// Materialize an untyped type to a concrete type.
-fn materializeType(self: *Checker, idx: TypeIndex) TypeIndex {
-    var t = self.types.get(idx)
+/// Materialize an untyped type to a concrete type.
+pub fn materializeType(self: *Checker, idx: TypeIndex) TypeIndex {
+    var t = self.types.get(idx);
     return switch t {
         .basic |k| => switch k {
-            .untyped_int => TypeRegistry.INT,
-            .untyped_float => TypeRegistry.FLOAT,
-            .untyped_bool => TypeRegistry.BOOL,
-            .untyped_string => TypeRegistry.STRING,
+            .untyped_int => types.INT,
+            .untyped_float => types.FLOAT,
+            .untyped_bool => types.BOOL,
+            .untyped_string => types.STRING,
             else => idx,
         },
         else => idx,
-    }
+    };
 }
 
-// Check if a value of type `from` can be assigned to a variable of type `to`.
-fn isAssignable(self: *Checker, from: TypeIndex, to: TypeIndex) bool {
-    if from == invalid_type or to == invalid_type {
-        return true  // Skip for error recovery
+/// Check if a value of type `from` can be assigned to a variable of type `to`.
+pub fn isAssignable(self: *Checker, from: TypeIndex, to: TypeIndex) bool {
+    if from == types.invalid_type or to == types.invalid_type {
+        return true;  // Skip for error recovery
     }
-    return self.types.isAssignable(from, to)
+    return self.types.isAssignable(from, to);
 }
 
-// Check if two types are comparable.
-fn isComparable(self: *Checker, a: TypeIndex, b: TypeIndex) bool {
+/// Check if two types are comparable.
+pub fn isComparable(self: *Checker, a: TypeIndex, b: TypeIndex) bool {
     // Same types are comparable
     if self.types.equal(a, b) {
-        return true
+        return true;
     }
 
     // Numeric types are comparable to each other
-    var ta = self.types.get(a)
-    var tb = self.types.get(b)
+    var ta = self.types.get(a);
+    var tb = self.types.get(b);
     if isNumeric(ta) and isNumeric(tb) {
-        return true
+        return true;
     }
 
     // String types are comparable (for == and !=)
     if isString(ta) and isString(tb) {
-        return true
+        return true;
     }
 
-    return false
+    return false;
 }
 
 // ========================================================================
 // Error helpers
 // ========================================================================
 
-fn errUndefined(self: *Checker, pos: Pos, name: string) {
-    self.err.errorWithCode(pos, .E301, "undefined variable")
+fn makeError(self: *Checker, kind: CheckErrorKind, span: Span, message: string) CheckError {
+    // Also report to legacy error reporter for compatibility
+    self.err?.errorAt(span.start, message);
+
+    return CheckError{
+        .kind = kind,
+        .message = message,
+        .span = span,
+    };
 }
 
-fn errRedefined(self: *Checker, pos: Pos, name: string) {
-    self.err.errorWithCode(pos, .E302, "redefined identifier")
-}
-
-fn errTypeMismatch(self: *Checker, pos: Pos, expected: TypeIndex, got: TypeIndex) {
-    self.err.errorWithCode(pos, .E300, "type mismatch")
-}
-
-fn errInvalidOp(self: *Checker, pos: Pos, op_kind: string, left: TypeIndex, right: TypeIndex) {
-    self.err.errorWithCode(pos, .E303, "invalid operation")
+fn makeTypeMismatchError(self: *Checker, span: Span, expected: TypeIndex, got: TypeIndex) CheckError {
+    var msg = "type mismatch: expected " ++ self.types.format(expected) ++ ", got " ++ self.types.format(got);
+    return self.makeError(.type_mismatch, span, msg);
 }
 
 // ============================================================================
 // Type predicates
 // ============================================================================
 
-fn isNumeric(t: Type) bool {
+fn isNumeric(t: types.Type) bool {
     return switch t {
         .basic |k| => k.isNumeric(),
         else => false,
-    }
+    };
 }
 
-fn isInteger(t: Type) bool {
+fn isInteger(t: types.Type) bool {
     return switch t {
         .basic |k| => k.isInteger(),
         else => false,
-    }
+    };
 }
 
-fn isBool(t: Type) bool {
+fn isBool(t: types.Type) bool {
     return switch t {
         .basic |k| => k == .bool_type or k == .untyped_bool,
         else => false,
-    }
+    };
 }
 
-fn isString(t: Type) bool {
+fn isString(t: types.Type) bool {
     return switch t {
         .basic |k| => k == .string_type or k == .untyped_string,
         else => false,
-    }
+    };
 }

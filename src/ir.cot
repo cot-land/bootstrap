@@ -11,303 +11,473 @@
 // - Compound assignments desugared (a += b → a = a + b)
 // - Method calls become function calls with receiver
 
+module ir;
+
 // =============================================================================
-// LANGUAGE FEATURES USED:
+// LANGUAGE FEATURES USED (Phase 1-7):
 // =============================================================================
-// 1. Type aliases (type NodeIndex = u32)
-// 2. Enums with backing type (Op: u8)
-// 3. Methods on enums (fn isTerminator(self: Op) bool)
-// 4. Structs with default field values
-// 5. Optional types (?NodeIndex)
-// 6. Builder pattern (withArgs, withAux)
-// 7. List<T> generic
-// 8. @intCast and @maxInt builtins
+// 1. Module declaration and pub visibility (Phase 6)
+// 2. Imports (Phase 6)
+// 3. Type aliases (type NodeIndex = u32)
+// 4. Enums with backing type (Op: u8)
+// 5. Methods on enums (fn isTerminator(self: Op) bool)
+// 6. Structs with default field values
+// 7. Optional types (?NodeIndex)
+// 8. Builder pattern (withArgs, withAux)
+// 9. List<T> and Map<K,V> generics
+// 10. @intCast and @maxInt builtins
+// 11. String concatenation ++ (Phase 3)
+// 12. Indexed iteration (Phase 4)
 // =============================================================================
 
-import "types"
-import "source"
+import types;
+import source;
 
 // ============================================================================
 // Node Index
 // ============================================================================
 
-// Index into IR node pool.
-type NodeIndex = u32
-const null_node: NodeIndex = @maxInt(u32)
+/// Index into IR node pool.
+pub type NodeIndex = u32;
+pub const null_node: NodeIndex = @maxInt(u32);
 
-// Index into block pool.
-type BlockIndex = u32
-const null_block: BlockIndex = @maxInt(u32)
+/// Index into block pool.
+pub type BlockIndex = u32;
+pub const null_block: BlockIndex = @maxInt(u32);
 
 // ============================================================================
 // Operations
 // ============================================================================
 
-// IR operations (opcodes).
-// These are lower-level than AST nodes.
-enum Op: u8 {
+/// IR operations (opcodes).
+/// These are lower-level than AST nodes.
+pub enum Op: u8 {
     // ========== Constants ==========
-    // Integer constant. aux = value
+    /// Integer constant. aux = value
     const_int,
-    // Float constant. aux_float = value
+    /// Float constant. aux_float = value
     const_float,
-    // String constant. aux_str = value
+    /// String constant. aux_str = value
     const_string,
-    // Boolean constant. aux = 0 or 1
+    /// Boolean constant. aux = 0 or 1
     const_bool,
-    // Null constant.
+    /// Null constant.
     const_null,
 
     // ========== Variables ==========
-    // Local variable reference. aux = local index
+    /// Local variable reference. aux = local index
     local,
-    // Global variable reference. aux_str = name
+    /// Global variable reference. aux_str = name
     global,
-    // Parameter reference. aux = param index
+    /// Parameter reference. aux = param index
     param,
 
     // ========== Arithmetic ==========
-    // Add two values.
+    /// Add two values.
     add,
-    // Subtract two values.
+    /// Subtract two values.
     sub,
-    // Multiply two values.
+    /// Multiply two values.
     mul,
-    // Divide two values.
+    /// Divide two values.
     div,
-    // Modulo (remainder).
+    /// Modulo (remainder).
     mod,
-    // Negate value.
+    /// Negate value.
     neg,
 
     // ========== Comparison ==========
-    // Equal.
+    /// Equal.
     eq,
-    // Not equal.
+    /// Not equal.
     ne,
-    // Less than.
+    /// Less than.
     lt,
-    // Less than or equal.
+    /// Less than or equal.
     le,
-    // Greater than.
+    /// Greater than.
     gt,
-    // Greater than or equal.
+    /// Greater than or equal.
     ge,
 
     // ========== Logical ==========
-    // Logical AND.
+    /// Logical AND.
     and,
-    // Logical OR.
+    /// Logical OR.
     or,
-    // Logical NOT.
+    /// Logical NOT.
     not,
 
     // ========== Bitwise ==========
-    // Bitwise AND.
+    /// Bitwise AND.
     bit_and,
-    // Bitwise OR.
+    /// Bitwise OR.
     bit_or,
-    // Bitwise XOR.
+    /// Bitwise XOR.
     bit_xor,
-    // Bitwise NOT.
+    /// Bitwise NOT.
     bit_not,
-    // Shift left.
+    /// Shift left.
     shl,
-    // Shift right.
+    /// Shift right.
     shr,
 
+    // ========== String Operations (Phase 3) ==========
+    /// String concatenation (++)
+    str_concat,
+    /// String length
+    str_len,
+    /// String equality
+    str_eq,
+    /// String comparison
+    str_cmp,
+
     // ========== Memory ==========
-    // Load from address.
+    /// Load from address.
     load,
-    // Store to address. args[0] = addr, args[1] = value
+    /// Store to address. args[0] = addr, args[1] = value
     store,
-    // Get address of local. aux = local index
+    /// Get address of local. aux = local index
     addr_local,
-    // Get field address. aux = field offset, args[0] = struct addr
+    /// Get field address. aux = field offset, args[0] = struct addr
     addr_field,
-    // Get array element address. args[0] = array addr, args[1] = index
+    /// Get array element address. args[0] = array addr, args[1] = index
     addr_index,
 
     // ========== Struct/Array ==========
-    // Get struct field. aux = field index, args[0] = struct value
+    /// Get struct field. aux = field index, args[0] = struct value
     field,
-    // Get array/slice element. args[0] = array, args[1] = index
+    /// Get array/slice element. args[0] = array, args[1] = index
     index,
-    // Slice operation. args[0] = array, args[1] = start, args[2] = end
+    /// Slice operation. args[0] = array, args[1] = start, args[2] = end
     slice,
+    /// Struct initialization. aux_str = type name, args = field values
+    struct_init,
+    /// Array literal. args = element values
+    array_init,
+
+    // ========== Optional Operations (Phase 5) ==========
+    /// Wrap value in optional (Some). args[0] = value
+    opt_some,
+    /// Create null optional
+    opt_none,
+    /// Check if optional has value. args[0] = optional
+    opt_is_some,
+    /// Unwrap optional. args[0] = optional
+    opt_unwrap,
+    /// Optional chaining. args[0] = optional, aux = field offset
+    opt_chain,
+    /// Null coalescing. args[0] = optional, args[1] = default
+    null_coalesce,
+
+    // ========== Range Operations (Phase 4) ==========
+    /// Create range. args[0] = start, args[1] = end, aux = inclusive flag
+    range,
+    /// Get range iterator
+    range_iter,
+    /// Range iterator next
+    range_next,
 
     // ========== Control Flow ==========
-    // Function call. args[0] = func, args[1..] = arguments
+    /// Function call. args[0] = func, args[1..] = arguments
     call,
-    // Return from function. args[0] = value (optional)
+    /// Return from function. args[0] = value (optional)
     ret,
-    // Unconditional jump. aux = target block
+    /// Unconditional jump. aux = target block
     jump,
-    // Conditional branch. args[0] = cond, aux = true block, aux2 = false block
+    /// Conditional branch. args[0] = cond, aux = true block, aux2 = false block
     branch,
-    // Phi node (SSA). args = values from predecessors
+    /// Phi node (SSA). args = values from predecessors
     phi,
-    // Select (ternary). args[0] = cond, args[1] = true_val, args[2] = false_val
+    /// Select (ternary). args[0] = cond, args[1] = true_val, args[2] = false_val
     select,
+    /// Break from loop
+    break_loop,
+    /// Continue loop
+    continue_loop,
 
     // ========== Conversions ==========
-    // Convert between numeric types.
+    /// Convert between numeric types.
     convert,
-    // Pointer cast.
+    /// Pointer cast.
     ptr_cast,
 
     // ========== Misc ==========
-    // No operation (placeholder).
+    /// No operation (placeholder).
     nop,
 }
 
-// Check if this operation terminates a block.
-fn isTerminator(self: Op) bool {
+/// Check if this operation terminates a block.
+pub fn isTerminator(self: Op) bool {
     return switch self {
-        .ret, .jump, .branch => true,
+        .ret, .jump, .branch, .break_loop, .continue_loop => true,
         else => false,
-    }
+    };
 }
 
-// Check if this operation has side effects.
-fn hasSideEffects(self: Op) bool {
+/// Check if this operation has side effects.
+pub fn hasSideEffects(self: Op) bool {
     return switch self {
-        .store, .call, .ret, .jump, .branch => true,
+        .store, .call, .ret, .jump, .branch, .break_loop, .continue_loop => true,
         else => false,
-    }
+    };
+}
+
+/// Check if this operation is a comparison.
+pub fn isComparison(self: Op) bool {
+    return switch self {
+        .eq, .ne, .lt, .le, .gt, .ge, .str_eq, .str_cmp => true,
+        else => false,
+    };
+}
+
+/// Get a human-readable name for the operation.
+pub fn name(self: Op) string {
+    return switch self {
+        .const_int => "const_int",
+        .const_float => "const_float",
+        .const_string => "const_string",
+        .const_bool => "const_bool",
+        .const_null => "const_null",
+        .local => "local",
+        .global => "global",
+        .param => "param",
+        .add => "add",
+        .sub => "sub",
+        .mul => "mul",
+        .div => "div",
+        .mod => "mod",
+        .neg => "neg",
+        .eq => "eq",
+        .ne => "ne",
+        .lt => "lt",
+        .le => "le",
+        .gt => "gt",
+        .ge => "ge",
+        .and => "and",
+        .or => "or",
+        .not => "not",
+        .bit_and => "bit_and",
+        .bit_or => "bit_or",
+        .bit_xor => "bit_xor",
+        .bit_not => "bit_not",
+        .shl => "shl",
+        .shr => "shr",
+        .str_concat => "str_concat",
+        .str_len => "str_len",
+        .str_eq => "str_eq",
+        .str_cmp => "str_cmp",
+        .load => "load",
+        .store => "store",
+        .addr_local => "addr_local",
+        .addr_field => "addr_field",
+        .addr_index => "addr_index",
+        .field => "field",
+        .index => "index",
+        .slice => "slice",
+        .struct_init => "struct_init",
+        .array_init => "array_init",
+        .opt_some => "opt_some",
+        .opt_none => "opt_none",
+        .opt_is_some => "opt_is_some",
+        .opt_unwrap => "opt_unwrap",
+        .opt_chain => "opt_chain",
+        .null_coalesce => "null_coalesce",
+        .range => "range",
+        .range_iter => "range_iter",
+        .range_next => "range_next",
+        .call => "call",
+        .ret => "ret",
+        .jump => "jump",
+        .branch => "branch",
+        .phi => "phi",
+        .select => "select",
+        .break_loop => "break_loop",
+        .continue_loop => "continue_loop",
+        .convert => "convert",
+        .ptr_cast => "ptr_cast",
+        .nop => "nop",
+    };
 }
 
 // ============================================================================
 // IR Node
 // ============================================================================
 
-// An IR node represents a single operation.
-struct Node {
-    // Operation type.
+/// An IR node represents a single operation.
+pub struct Node {
+    /// Operation type.
     op: Op,
-    // Result type.
-    type_idx: TypeIndex,
-    // Inline storage for operand indices (most nodes have 0-3 args).
+    /// Result type.
+    type_idx: types.TypeIndex,
+    /// Inline storage for operand indices (most nodes have 0-3 args).
     args_storage: [4]NodeIndex,
-    // Number of valid args in args_storage.
+    /// Number of valid args in args_storage.
     args_len: u8,
-    // Auxiliary integer data (local index, field offset, etc.)
+    /// Auxiliary integer data (local index, field offset, etc.)
     aux: i64,
-    // Auxiliary string data (for names).
+    /// Secondary auxiliary integer (for branch false block, etc.)
+    aux2: i64,
+    /// Auxiliary string data (for names).
     aux_str: string,
-    // Source location for error messages.
-    span: Span,
-    // Block this node belongs to.
+    /// Source location for error messages.
+    span: source.Span,
+    /// Block this node belongs to.
     block: BlockIndex,
 }
 
-// Initialize a node with operation and type.
-fn init(op: Op, type_idx: TypeIndex, span: Span) Node {
+/// Initialize a node with operation and type.
+pub fn initNode(op: Op, type_idx: types.TypeIndex, span: source.Span) Node {
     return Node{
         .op = op,
         .type_idx = type_idx,
-        .args_storage = [0, 0, 0, 0],
+        .args_storage = [null_node, null_node, null_node, null_node],
         .args_len = 0,
         .aux = 0,
+        .aux2 = 0,
         .aux_str = "",
         .span = span,
         .block = null_block,
+    };
+}
+
+/// Get args as a slice.
+pub fn args(self: *Node) []NodeIndex {
+    return self.args_storage[0..self.args_len];
+}
+
+/// Create a copy with args set.
+pub fn withArgs(self: Node, arg_slice: []NodeIndex) Node {
+    var n = self;
+    for arg, i in arg_slice {
+        if i >= 4 { break; }
+        n.args_storage[i] = arg;
     }
+    n.args_len = @intCast(u8, @min(len(arg_slice), 4));
+    return n;
 }
 
-// Get args as a slice.
-fn args(self: *Node) []NodeIndex {
-    return self.args_storage[0..self.args_len]
+/// Create a copy with aux set.
+pub fn withAux(self: Node, aux: i64) Node {
+    var n = self;
+    n.aux = aux;
+    return n;
 }
 
-// Create a copy with args set.
-fn withArgs(self: Node, arg_slice: []NodeIndex) Node {
-    var n = self
-    var i: u32 = 0
-    while i < len(arg_slice) and i < 4 {
-        n.args_storage[i] = arg_slice[i]
-        i += 1
+/// Create a copy with aux2 set.
+pub fn withAux2(self: Node, aux2: i64) Node {
+    var n = self;
+    n.aux2 = aux2;
+    return n;
+}
+
+/// Create a copy with aux_str set.
+pub fn withAuxStr(self: Node, aux_str: string) Node {
+    var n = self;
+    n.aux_str = aux_str;
+    return n;
+}
+
+/// Create a copy with block set.
+pub fn withBlock(self: Node, block: BlockIndex) Node {
+    var n = self;
+    n.block = block;
+    return n;
+}
+
+/// Format node for debugging.
+pub fn format(self: *Node) string {
+    var result = self.op.name();
+    if self.args_len > 0 {
+        result = result ++ "(";
+        for arg, i in self.args() {
+            if i > 0 { result = result ++ ", "; }
+            result = result ++ @toString(arg);
+        }
+        result = result ++ ")";
     }
-    n.args_len = @intCast(u8, @min(len(arg_slice), 4))
-    return n
-}
-
-// Create a copy with aux set.
-fn withAux(self: Node, aux: i64) Node {
-    var n = self
-    n.aux = aux
-    return n
-}
-
-// Create a copy with aux_str set.
-fn withAuxStr(self: Node, aux_str: string) Node {
-    var n = self
-    n.aux_str = aux_str
-    return n
-}
-
-// Create a copy with block set.
-fn withBlock(self: Node, block: BlockIndex) Node {
-    var n = self
-    n.block = block
-    return n
+    if self.aux != 0 {
+        result = result ++ " aux=" ++ @toString(self.aux);
+    }
+    if len(self.aux_str) > 0 {
+        result = result ++ " \"" ++ self.aux_str ++ "\"";
+    }
+    return result;
 }
 
 // ============================================================================
 // Basic Block
 // ============================================================================
 
-// A basic block is a sequence of operations with single entry/exit.
-struct Block {
-    // Block index (for identification).
+/// A basic block is a sequence of operations with single entry/exit.
+pub struct Block {
+    /// Block index (for identification).
     index: BlockIndex,
-    // Predecessor blocks.
-    preds: []BlockIndex,
-    // Successor blocks.
-    succs: []BlockIndex,
-    // Nodes in this block (in order).
-    nodes: []NodeIndex,
-    // Optional label for debugging.
+    /// Predecessor blocks.
+    preds: List<BlockIndex>,
+    /// Successor blocks.
+    succs: List<BlockIndex>,
+    /// Nodes in this block (in order).
+    nodes: List<NodeIndex>,
+    /// Optional label for debugging.
     label: string,
+    /// Loop depth (for break/continue)
+    loop_depth: u32,
 }
 
-// Initialize a new block.
-fn init(index: BlockIndex) Block {
+/// Initialize a new block.
+pub fn initBlock(index: BlockIndex) Block {
     return Block{
         .index = index,
-        .preds = [],
-        .succs = [],
-        .nodes = [],
+        .preds = new List<BlockIndex>(),
+        .succs = new List<BlockIndex>(),
+        .nodes = new List<NodeIndex>(),
         .label = "",
-    }
+        .loop_depth = 0,
+    };
+}
+
+/// Add a predecessor to this block.
+pub fn addPred(self: *Block, pred: BlockIndex) void {
+    self.preds.push(pred);
+}
+
+/// Add a successor to this block.
+pub fn addSucc(self: *Block, succ: BlockIndex) void {
+    self.succs.push(succ);
+}
+
+/// Add a node to this block.
+pub fn addNode(self: *Block, node: NodeIndex) void {
+    self.nodes.push(node);
 }
 
 // ============================================================================
 // Local Variable
 // ============================================================================
 
-// A local variable in a function.
-struct Local {
-    // Variable name.
+/// A local variable in a function.
+pub struct Local {
+    /// Variable name.
     name: string,
-    // Variable type.
-    type_idx: TypeIndex,
-    // Stack slot index (deprecated, use offset instead).
+    /// Variable type.
+    type_idx: types.TypeIndex,
+    /// Stack slot index (deprecated, use offset instead).
     slot: u32,
-    // Is this variable mutable?
+    /// Is this variable mutable?
     mutable: bool,
-    // Is this a parameter?
+    /// Is this a parameter?
     is_param: bool,
-    // Parameter index (if is_param).
+    /// Parameter index (if is_param).
     param_idx: u32,
-    // Size in bytes (computed from type).
+    /// Size in bytes (computed from type).
     size: u32,
-    // Stack frame offset (negative from rbp on x86, positive from sp on arm64).
+    /// Stack frame offset (negative from rbp on x86, positive from sp on arm64).
     offset: i32,
 }
 
-// Initialize a local variable.
-fn init(name: string, type_idx: TypeIndex, slot: u32, mutable: bool) Local {
+/// Initialize a local variable.
+pub fn initLocal(name: string, type_idx: types.TypeIndex, slot: u32, mutable: bool) Local {
     return Local{
         .name = name,
         .type_idx = type_idx,
@@ -317,11 +487,11 @@ fn init(name: string, type_idx: TypeIndex, slot: u32, mutable: bool) Local {
         .param_idx = 0,
         .size = 8,    // Default to 8 bytes, computed from type
         .offset = 0,  // Computed during frame allocation
-    }
+    };
 }
 
-// Initialize a parameter.
-fn initParam(name: string, type_idx: TypeIndex, param_idx: u32) Local {
+/// Initialize a parameter.
+pub fn initParam(name: string, type_idx: types.TypeIndex, param_idx: u32) Local {
     return Local{
         .name = name,
         .type_idx = type_idx,
@@ -331,11 +501,11 @@ fn initParam(name: string, type_idx: TypeIndex, param_idx: u32) Local {
         .param_idx = param_idx,
         .size = 8,
         .offset = 0,
-    }
+    };
 }
 
-// Initialize a local with explicit size.
-fn initWithSize(name: string, type_idx: TypeIndex, slot: u32, mutable: bool, size: u32) Local {
+/// Initialize a local with explicit size.
+pub fn initLocalWithSize(name: string, type_idx: types.TypeIndex, slot: u32, mutable: bool, size: u32) Local {
     return Local{
         .name = name,
         .type_idx = type_idx,
@@ -345,39 +515,53 @@ fn initWithSize(name: string, type_idx: TypeIndex, slot: u32, mutable: bool, siz
         .param_idx = 0,
         .size = size,
         .offset = 0,
-    }
+    };
+}
+
+// ============================================================================
+// Loop Context (for break/continue)
+// ============================================================================
+
+/// Context for a loop (for break/continue handling).
+pub struct LoopContext {
+    /// Block to jump to for break
+    break_block: BlockIndex,
+    /// Block to jump to for continue
+    continue_block: BlockIndex,
+    /// Depth of this loop
+    depth: u32,
 }
 
 // ============================================================================
 // Function
 // ============================================================================
 
-// A function in the IR.
-struct Func {
-    // Function name.
+/// A function in the IR.
+pub struct Func {
+    /// Function name.
     name: string,
-    // Function type.
-    type_idx: TypeIndex,
-    // Return type.
-    return_type: TypeIndex,
-    // Parameters (subset of locals where is_param = true).
+    /// Function type.
+    type_idx: types.TypeIndex,
+    /// Return type.
+    return_type: types.TypeIndex,
+    /// Parameters (subset of locals where is_param = true).
     params: []Local,
-    // All local variables (including parameters).
+    /// All local variables (including parameters).
     locals: []Local,
-    // Basic blocks.
+    /// Basic blocks.
     blocks: []Block,
-    // Entry block index.
+    /// Entry block index.
     entry: BlockIndex,
-    // All nodes in this function.
+    /// All nodes in this function.
     nodes: []Node,
-    // Source span.
-    span: Span,
-    // Total stack frame size (computed from local sizes, aligned to 16 bytes).
+    /// Source span.
+    span: source.Span,
+    /// Total stack frame size (computed from local sizes, aligned to 16 bytes).
     frame_size: u32,
 }
 
-// Initialize a function.
-fn init(name: string, type_idx: TypeIndex, return_type: TypeIndex, span: Span) Func {
+/// Initialize a function.
+pub fn initFunc(name: string, type_idx: types.TypeIndex, return_type: types.TypeIndex, span: source.Span) Func {
     return Func{
         .name = name,
         .type_idx = type_idx,
@@ -389,157 +573,279 @@ fn init(name: string, type_idx: TypeIndex, return_type: TypeIndex, span: Span) F
         .nodes = [],
         .span = span,
         .frame_size = 0,
+    };
+}
+
+/// Get a local by name.
+pub fn getLocal(self: *Func, name: string) ?*Local {
+    for local in self.locals {
+        if local.name == name {
+            return &local;
+        }
     }
+    return null;
+}
+
+/// Get a block by index.
+pub fn getBlock(self: *Func, idx: BlockIndex) ?*Block {
+    if idx >= len(self.blocks) {
+        return null;
+    }
+    return &self.blocks[idx];
+}
+
+/// Get a node by index.
+pub fn getNode(self: *Func, idx: NodeIndex) ?*Node {
+    if idx >= len(self.nodes) {
+        return null;
+    }
+    return &self.nodes[idx];
 }
 
 // ============================================================================
 // Global
 // ============================================================================
 
-// A global variable or constant.
-struct Global {
-    // Name.
+/// A global variable or constant.
+pub struct Global {
+    /// Name.
     name: string,
-    // Type.
-    type_idx: TypeIndex,
-    // Initializer (optional).
+    /// Type.
+    type_idx: types.TypeIndex,
+    /// Initializer (optional).
     init_value: ?NodeIndex,
-    // Is this a constant?
+    /// Is this a constant?
     is_const: bool,
-    // Source span.
-    span: Span,
+    /// Source span.
+    span: source.Span,
 }
 
-// Initialize a global.
-fn init(name: string, type_idx: TypeIndex, is_const: bool, span: Span) Global {
+/// Initialize a global.
+pub fn initGlobal(name: string, type_idx: types.TypeIndex, is_const: bool, span: source.Span) Global {
     return Global{
         .name = name,
         .type_idx = type_idx,
         .init_value = null,
         .is_const = is_const,
         .span = span,
-    }
+    };
 }
 
 // ============================================================================
 // Struct Definition
 // ============================================================================
 
-// A struct type definition in IR.
-struct StructDef {
-    // Struct name.
+/// A struct type definition in IR.
+pub struct StructDef {
+    /// Struct name.
     name: string,
-    // Type index in registry.
-    type_idx: TypeIndex,
-    // Source span.
-    span: Span,
+    /// Type index in registry.
+    type_idx: types.TypeIndex,
+    /// Source span.
+    span: source.Span,
+}
+
+// ============================================================================
+// Enum Definition
+// ============================================================================
+
+/// An enum type definition in IR.
+pub struct EnumDef {
+    /// Enum name.
+    name: string,
+    /// Type index in registry.
+    type_idx: types.TypeIndex,
+    /// Backing type.
+    backing_type: types.TypeIndex,
+    /// Source span.
+    span: source.Span,
+}
+
+// ============================================================================
+// Union Definition
+// ============================================================================
+
+/// A union type definition in IR.
+pub struct UnionDef {
+    /// Union name.
+    name: string,
+    /// Type index in registry.
+    type_idx: types.TypeIndex,
+    /// Source span.
+    span: source.Span,
 }
 
 // ============================================================================
 // IR Program
 // ============================================================================
 
-// Complete IR for a program/module.
-struct IR {
-    // All functions.
-    funcs: []Func,
-    // All global variables/constants.
-    globals: []Global,
-    // All struct definitions.
-    structs: []StructDef,
-    // Type registry (shared with checker).
-    types: *TypeRegistry,
+/// Complete IR for a program/module.
+pub struct IR {
+    /// Module name (from module declaration).
+    module_name: string,
+    /// Imported modules.
+    imports: []string,
+    /// All functions.
+    funcs: List<Func>,
+    /// All global variables/constants.
+    globals: List<Global>,
+    /// All struct definitions.
+    structs: List<StructDef>,
+    /// All enum definitions.
+    enums: List<EnumDef>,
+    /// All union definitions.
+    unions: List<UnionDef>,
+    /// Type registry (shared with checker).
+    types: *types.TypeRegistry,
 }
 
-// Initialize an IR program.
-fn init(types: *TypeRegistry) IR {
+/// Initialize an IR program.
+pub fn initIR(type_reg: *types.TypeRegistry) IR {
     return IR{
-        .funcs = [],
-        .globals = [],
-        .structs = [],
-        .types = types,
-    }
+        .module_name = "",
+        .imports = [],
+        .funcs = new List<Func>(),
+        .globals = new List<Global>(),
+        .structs = new List<StructDef>(),
+        .enums = new List<EnumDef>(),
+        .unions = new List<UnionDef>(),
+        .types = type_reg,
+    };
 }
 
-// Get a function by name.
-fn getFunc(self: *IR, name: string) ?*Func {
-    for f in self.funcs {
-        if f.name == name {
-            return &f
+/// Get a function by name.
+pub fn getFunc(self: *IR, name: string) ?*Func {
+    for func in self.funcs.items() {
+        if func.name == name {
+            return &func;
         }
     }
-    return null
+    return null;
 }
 
-// Get a global by name.
-fn getGlobal(self: *IR, name: string) ?*Global {
-    for g in self.globals {
-        if g.name == name {
-            return &g
+/// Get a global by name.
+pub fn getGlobal(self: *IR, name: string) ?*Global {
+    for global in self.globals.items() {
+        if global.name == name {
+            return &global;
         }
     }
-    return null
+    return null;
+}
+
+/// Add a function to the IR.
+pub fn addFunc(self: *IR, f: Func) void {
+    self.funcs.push(f);
+}
+
+/// Add a global to the IR.
+pub fn addGlobal(self: *IR, g: Global) void {
+    self.globals.push(g);
+}
+
+/// Add a struct definition to the IR.
+pub fn addStruct(self: *IR, s: StructDef) void {
+    self.structs.push(s);
+}
+
+/// Add an enum definition to the IR.
+pub fn addEnum(self: *IR, e: EnumDef) void {
+    self.enums.push(e);
+}
+
+/// Add a union definition to the IR.
+pub fn addUnion(self: *IR, u: UnionDef) void {
+    self.unions.push(u);
 }
 
 // ============================================================================
 // IR Builder
 // ============================================================================
 
-// Helper for building IR from checked AST.
-struct Builder {
+/// Helper for building IR from checked AST.
+pub struct Builder {
     ir: IR,
-    current_func: ?FuncBuilder,
+    current_func: ?*FuncBuilder,
+    loop_stack: List<LoopContext>,  // Stack of loop contexts for break/continue
 }
 
-// Initialize a builder.
-fn init(types: *TypeRegistry) Builder {
+/// Initialize a builder.
+pub fn initBuilder(type_reg: *types.TypeRegistry) Builder {
     return Builder{
-        .ir = IR.init(types),
+        .ir = initIR(type_reg),
         .current_func = null,
+        .loop_stack = new List<LoopContext>(),
+    };
+}
+
+/// Set module name.
+pub fn setModuleName(self: *Builder, name: string) void {
+    self.ir.module_name = name;
+}
+
+/// Add an import.
+pub fn addImport(self: *Builder, module: string) void {
+    self.ir.imports = self.ir.imports ++ [module];
+}
+
+/// Start building a new function.
+pub fn startFunc(self: *Builder, name: string, type_idx: types.TypeIndex, return_type: types.TypeIndex, span: source.Span) *FuncBuilder {
+    var fb = new FuncBuilder();
+    fb.* = initFuncBuilder(name, type_idx, return_type, span);
+    self.current_func = fb;
+    return fb;
+}
+
+/// Finish the current function and add to IR.
+pub fn endFunc(self: *Builder) void {
+    if self.current_func |fb| {
+        var func = fb.build();
+        self.ir.addFunc(func);
+        self.current_func = null;
     }
 }
 
-// Start building a new function.
-fn startFunc(self: *Builder, name: string, type_idx: TypeIndex, return_type: TypeIndex, span: Span) {
-    self.current_func = FuncBuilder.init(name, type_idx, return_type, span)
+/// Push a loop context for break/continue handling.
+pub fn pushLoop(self: *Builder, break_block: BlockIndex, continue_block: BlockIndex) void {
+    self.loop_stack.push(LoopContext{
+        .break_block = break_block,
+        .continue_block = continue_block,
+        .depth = len(self.loop_stack),
+    });
 }
 
-// Finish the current function and add to IR.
-fn endFunc(self: *Builder) {
-    if self.current_func |*fb| {
-        var func = fb.build()
-        self.ir.funcs = self.ir.funcs ++ [func]
-        self.current_func = null
+/// Pop the current loop context.
+pub fn popLoop(self: *Builder) void {
+    if len(self.loop_stack) > 0 {
+        _ = self.loop_stack.pop();
     }
 }
 
-// Add a global variable.
-fn addGlobal(self: *Builder, g: Global) {
-    self.ir.globals = self.ir.globals ++ [g]
+/// Get the current loop context (for break/continue).
+pub fn currentLoop(self: *Builder) ?LoopContext {
+    if len(self.loop_stack) == 0 {
+        return null;
+    }
+    return self.loop_stack.items()[len(self.loop_stack) - 1];
 }
 
-// Add a struct definition.
-fn addStruct(self: *Builder, s: StructDef) {
-    self.ir.structs = self.ir.structs ++ [s]
-}
-
-// Get the built IR.
-fn getIR(self: *Builder) IR {
-    return self.ir
+/// Get the built IR.
+pub fn getIR(self: *Builder) IR {
+    return self.ir;
 }
 
 // ============================================================================
 // Function Builder
 // ============================================================================
 
-// Helper for building a single function.
-struct FuncBuilder {
+/// Helper for building a single function.
+pub struct FuncBuilder {
     name: string,
-    type_idx: TypeIndex,
-    return_type: TypeIndex,
-    span: Span,
+    type_idx: types.TypeIndex,
+    return_type: types.TypeIndex,
+    span: source.Span,
 
-    // Building state
+    /// Building state
     locals: List<Local>,
     blocks: List<Block>,
     nodes: List<Node>,
@@ -547,192 +853,265 @@ struct FuncBuilder {
     local_map: Map<string, u32>,  // name -> local index
 }
 
-// Initialize a function builder.
-fn init(name: string, type_idx: TypeIndex, return_type: TypeIndex, span: Span) FuncBuilder {
+/// Initialize a function builder.
+pub fn initFuncBuilder(name: string, type_idx: types.TypeIndex, return_type: types.TypeIndex, span: source.Span) FuncBuilder {
     var fb = FuncBuilder{
         .name = name,
         .type_idx = type_idx,
         .return_type = return_type,
         .span = span,
-        .locals = new List<Local>,
-        .blocks = new List<Block>,
-        .nodes = new List<Node>,
+        .locals = new List<Local>(),
+        .blocks = new List<Block>(),
+        .nodes = new List<Node>(),
         .current_block = 0,
-        .local_map = new Map<string, u32>,
-    }
+        .local_map = new Map<string, u32>(),
+    };
 
     // Create entry block
-    fb.blocks.push(Block.init(0))
+    fb.blocks.push(initBlock(0));
 
-    return fb
+    return fb;
 }
 
-// Add a parameter.
-fn addParam(self: *FuncBuilder, name: string, type_idx: TypeIndex) u32 {
-    var idx = @intCast(u32, len(self.locals))
-    var param_idx = idx  // params are first
-    self.locals.push(Local.initParam(name, type_idx, param_idx))
-    self.local_map.set(name, idx)
-    return idx
+/// Add a parameter.
+pub fn addParam(self: *FuncBuilder, name: string, type_idx: types.TypeIndex) u32 {
+    var idx = @intCast(u32, len(self.locals));
+    var param_idx = idx;  // params are first
+    self.locals.push(initParam(name, type_idx, param_idx));
+    self.local_map.set(name, idx);
+    return idx;
 }
 
-// Add a local variable.
-fn addLocal(self: *FuncBuilder, name: string, type_idx: TypeIndex, mutable: bool) u32 {
-    var idx = @intCast(u32, len(self.locals))
-    self.locals.push(Local.init(name, type_idx, idx, mutable))
-    self.local_map.set(name, idx)
-    return idx
+/// Add a local variable.
+pub fn addLocal(self: *FuncBuilder, name: string, type_idx: types.TypeIndex, mutable: bool) u32 {
+    var idx = @intCast(u32, len(self.locals));
+    self.locals.push(initLocal(name, type_idx, idx, mutable));
+    self.local_map.set(name, idx);
+    return idx;
 }
 
-// Add a local variable with explicit size.
-fn addLocalWithSize(self: *FuncBuilder, name: string, type_idx: TypeIndex, mutable: bool, size: u32) u32 {
-    var idx = @intCast(u32, len(self.locals))
-    self.locals.push(Local.initWithSize(name, type_idx, idx, mutable, size))
-    self.local_map.set(name, idx)
-    return idx
+/// Add a local variable with explicit size.
+pub fn addLocalWithSize(self: *FuncBuilder, name: string, type_idx: types.TypeIndex, mutable: bool, size: u32) u32 {
+    var idx = @intCast(u32, len(self.locals));
+    self.locals.push(initLocalWithSize(name, type_idx, idx, mutable, size));
+    self.local_map.set(name, idx);
+    return idx;
 }
 
-// Look up a local by name.
-fn lookupLocal(self: *FuncBuilder, name: string) ?u32 {
-    return self.local_map.get(name)
+/// Look up a local by name.
+pub fn lookupLocal(self: *FuncBuilder, name: string) ?u32 {
+    return self.local_map.get(name);
 }
 
-// Create a new basic block.
-fn newBlock(self: *FuncBuilder, label: string) BlockIndex {
-    var idx = @intCast(BlockIndex, len(self.blocks))
-    var block = Block.init(idx)
-    block.label = label
-    self.blocks.push(block)
-    return idx
+/// Create a new basic block.
+pub fn newBlock(self: *FuncBuilder, label: string) BlockIndex {
+    var idx = @intCast(BlockIndex, len(self.blocks));
+    var block = initBlock(idx);
+    block.label = label;
+    self.blocks.push(block);
+    return idx;
 }
 
-// Set current block for emitting nodes.
-fn setBlock(self: *FuncBuilder, block: BlockIndex) {
-    self.current_block = block
+/// Set current block for emitting nodes.
+pub fn setBlock(self: *FuncBuilder, block: BlockIndex) void {
+    self.current_block = block;
 }
 
-// Emit a node to the current block.
-fn emit(self: *FuncBuilder, node: Node) NodeIndex {
-    var idx = @intCast(NodeIndex, len(self.nodes))
-    var n = node.withBlock(self.current_block)
-    self.nodes.push(n)
+/// Get current block index.
+pub fn getCurrentBlock(self: *FuncBuilder) BlockIndex {
+    return self.current_block;
+}
+
+/// Emit a node to the current block.
+pub fn emit(self: *FuncBuilder, node: Node) NodeIndex {
+    var idx = @intCast(NodeIndex, len(self.nodes));
+    var n = node.withBlock(self.current_block);
+    self.nodes.push(n);
 
     // Add to current block's node list
-    var block = &self.blocks[self.current_block]
-    block.nodes = block.nodes ++ [idx]
+    if self.current_block < len(self.blocks) {
+        self.blocks.items()[self.current_block].addNode(idx);
+    }
 
-    return idx
+    return idx;
 }
 
-// Emit a constant integer.
-fn emitConstInt(self: *FuncBuilder, value: i64, type_idx: TypeIndex, span: Span) NodeIndex {
-    return self.emit(Node.init(.const_int, type_idx, span).withAux(value))
+/// Emit a constant integer.
+pub fn emitConstInt(self: *FuncBuilder, value: i64, type_idx: types.TypeIndex, span: source.Span) NodeIndex {
+    return self.emit(initNode(.const_int, type_idx, span).withAux(value));
 }
 
-// Emit a constant float.
-fn emitConstFloat(self: *FuncBuilder, value: f64, type_idx: TypeIndex, span: Span) NodeIndex {
+/// Emit a constant float.
+pub fn emitConstFloat(self: *FuncBuilder, value: f64, type_idx: types.TypeIndex, span: source.Span) NodeIndex {
     // TODO: store float in aux
-    return self.emit(Node.init(.const_float, type_idx, span))
+    return self.emit(initNode(.const_float, type_idx, span));
 }
 
-// Emit a constant string.
-fn emitConstString(self: *FuncBuilder, value: string, span: Span) NodeIndex {
-    return self.emit(Node.init(.const_string, TypeRegistry.STRING, span).withAuxStr(value))
+/// Emit a constant string.
+pub fn emitConstString(self: *FuncBuilder, value: string, span: source.Span) NodeIndex {
+    return self.emit(initNode(.const_string, types.STRING, span).withAuxStr(value));
 }
 
-// Emit a constant bool.
-fn emitConstBool(self: *FuncBuilder, value: bool, span: Span) NodeIndex {
-    var aux: i64 = 0
-    if value {
-        aux = 1
+/// Emit a constant bool.
+pub fn emitConstBool(self: *FuncBuilder, value: bool, span: source.Span) NodeIndex {
+    var aux: i64 = if value { 1 } else { 0 };
+    return self.emit(initNode(.const_bool, types.BOOL, span).withAux(aux));
+}
+
+/// Emit local variable load.
+pub fn emitLocalLoad(self: *FuncBuilder, local_idx: u32, type_idx: types.TypeIndex, span: source.Span) NodeIndex {
+    return self.emit(initNode(.local, type_idx, span).withAux(@intCast(i64, local_idx)));
+}
+
+/// Emit local variable store.
+pub fn emitLocalStore(self: *FuncBuilder, local_idx: u32, value: NodeIndex, type_idx: types.TypeIndex, span: source.Span) NodeIndex {
+    return self.emit(initNode(.store, type_idx, span).withArgs([value]).withAux(@intCast(i64, local_idx)));
+}
+
+/// Emit binary operation.
+pub fn emitBinary(self: *FuncBuilder, op: Op, left: NodeIndex, right: NodeIndex, type_idx: types.TypeIndex, span: source.Span) NodeIndex {
+    return self.emit(initNode(op, type_idx, span).withArgs([left, right]));
+}
+
+/// Emit unary operation.
+pub fn emitUnary(self: *FuncBuilder, op: Op, operand: NodeIndex, type_idx: types.TypeIndex, span: source.Span) NodeIndex {
+    return self.emit(initNode(op, type_idx, span).withArgs([operand]));
+}
+
+/// Emit string concatenation.
+pub fn emitStrConcat(self: *FuncBuilder, left: NodeIndex, right: NodeIndex, span: source.Span) NodeIndex {
+    return self.emit(initNode(.str_concat, types.STRING, span).withArgs([left, right]));
+}
+
+/// Emit null coalescing.
+pub fn emitNullCoalesce(self: *FuncBuilder, optional: NodeIndex, default_val: NodeIndex, type_idx: types.TypeIndex, span: source.Span) NodeIndex {
+    return self.emit(initNode(.null_coalesce, type_idx, span).withArgs([optional, default_val]));
+}
+
+/// Emit optional some (wrap value).
+pub fn emitOptSome(self: *FuncBuilder, value: NodeIndex, type_idx: types.TypeIndex, span: source.Span) NodeIndex {
+    return self.emit(initNode(.opt_some, type_idx, span).withArgs([value]));
+}
+
+/// Emit optional none.
+pub fn emitOptNone(self: *FuncBuilder, type_idx: types.TypeIndex, span: source.Span) NodeIndex {
+    return self.emit(initNode(.opt_none, type_idx, span));
+}
+
+/// Emit optional chain (x?.field).
+pub fn emitOptChain(self: *FuncBuilder, base: NodeIndex, field_offset: u32, type_idx: types.TypeIndex, span: source.Span) NodeIndex {
+    return self.emit(initNode(.opt_chain, type_idx, span).withArgs([base]).withAux(@intCast(i64, field_offset)));
+}
+
+/// Emit function call.
+pub fn emitCall(self: *FuncBuilder, callee: NodeIndex, call_args: []NodeIndex, return_type: types.TypeIndex, span: source.Span) NodeIndex {
+    var all_args = new List<NodeIndex>();
+    all_args.push(callee);
+    for arg in call_args {
+        all_args.push(arg);
     }
-    return self.emit(Node.init(.const_bool, TypeRegistry.BOOL, span).withAux(aux))
+    return self.emit(initNode(.call, return_type, span).withArgs(all_args.toSlice()));
 }
 
-// Emit local variable load.
-fn emitLocalLoad(self: *FuncBuilder, local_idx: u32, type_idx: TypeIndex, span: Span) NodeIndex {
-    return self.emit(Node.init(.local, type_idx, span).withAux(@intCast(i64, local_idx)))
-}
-
-// Emit local variable store.
-fn emitLocalStore(self: *FuncBuilder, local_idx: u32, value: NodeIndex, type_idx: TypeIndex, span: Span) NodeIndex {
-    return self.emit(Node.init(.store, type_idx, span).withArgs([value]).withAux(@intCast(i64, local_idx)))
-}
-
-// Emit binary operation.
-fn emitBinary(self: *FuncBuilder, op: Op, left: NodeIndex, right: NodeIndex, type_idx: TypeIndex, span: Span) NodeIndex {
-    return self.emit(Node.init(op, type_idx, span).withArgs([left, right]))
-}
-
-// Emit unary operation.
-fn emitUnary(self: *FuncBuilder, op: Op, operand: NodeIndex, type_idx: TypeIndex, span: Span) NodeIndex {
-    return self.emit(Node.init(op, type_idx, span).withArgs([operand]))
-}
-
-// Emit function call.
-fn emitCall(self: *FuncBuilder, callee: NodeIndex, call_args: []NodeIndex, return_type: TypeIndex, span: Span) NodeIndex {
-    var args = [callee] ++ call_args
-    return self.emit(Node.init(.call, return_type, span).withArgs(args))
-}
-
-// Emit return.
-fn emitReturn(self: *FuncBuilder, value: ?NodeIndex, span: Span) NodeIndex {
+/// Emit return.
+pub fn emitReturn(self: *FuncBuilder, value: ?NodeIndex, span: source.Span) NodeIndex {
     if value |v| {
-        return self.emit(Node.init(.ret, TypeRegistry.VOID, span).withArgs([v]))
+        return self.emit(initNode(.ret, types.VOID, span).withArgs([v]));
     } else {
-        return self.emit(Node.init(.ret, TypeRegistry.VOID, span))
+        return self.emit(initNode(.ret, types.VOID, span));
     }
 }
 
-// Emit unconditional jump.
-fn emitJump(self: *FuncBuilder, target: BlockIndex, span: Span) NodeIndex {
-    return self.emit(Node.init(.jump, TypeRegistry.VOID, span).withAux(@intCast(i64, target)))
+/// Emit unconditional jump.
+pub fn emitJump(self: *FuncBuilder, target: BlockIndex, span: source.Span) NodeIndex {
+    // Link blocks
+    if self.current_block < len(self.blocks) and target < len(self.blocks) {
+        self.blocks.items()[self.current_block].addSucc(target);
+        self.blocks.items()[target].addPred(self.current_block);
+    }
+    return self.emit(initNode(.jump, types.VOID, span).withAux(@intCast(i64, target)));
 }
 
-// Emit conditional branch.
-fn emitBranch(self: *FuncBuilder, cond: NodeIndex, true_block: BlockIndex, false_block: BlockIndex, span: Span) NodeIndex {
-    // Store true_block in aux, false_block encoded in aux_str
-    return self.emit(Node.init(.branch, TypeRegistry.VOID, span)
+/// Emit conditional branch.
+pub fn emitBranch(self: *FuncBuilder, cond: NodeIndex, true_block: BlockIndex, false_block: BlockIndex, span: source.Span) NodeIndex {
+    // Link blocks
+    if self.current_block < len(self.blocks) {
+        self.blocks.items()[self.current_block].addSucc(true_block);
+        self.blocks.items()[self.current_block].addSucc(false_block);
+        if true_block < len(self.blocks) {
+            self.blocks.items()[true_block].addPred(self.current_block);
+        }
+        if false_block < len(self.blocks) {
+            self.blocks.items()[false_block].addPred(self.current_block);
+        }
+    }
+    return self.emit(initNode(.branch, types.VOID, span)
         .withArgs([cond])
-        .withAux(@intCast(i64, true_block)))
-    // Note: false_block storage is simplified here
+        .withAux(@intCast(i64, true_block))
+        .withAux2(@intCast(i64, false_block)));
 }
 
-// Emit field access.
-fn emitField(self: *FuncBuilder, base: NodeIndex, field_idx: u32, type_idx: TypeIndex, span: Span) NodeIndex {
-    return self.emit(Node.init(.field, type_idx, span).withArgs([base]).withAux(@intCast(i64, field_idx)))
+/// Emit break from loop.
+pub fn emitBreak(self: *FuncBuilder, target: BlockIndex, span: source.Span) NodeIndex {
+    return self.emit(initNode(.break_loop, types.VOID, span).withAux(@intCast(i64, target)));
 }
 
-// Emit array/slice index.
-fn emitIndex(self: *FuncBuilder, base: NodeIndex, index: NodeIndex, type_idx: TypeIndex, span: Span) NodeIndex {
-    return self.emit(Node.init(.index, type_idx, span).withArgs([base, index]))
+/// Emit continue loop.
+pub fn emitContinue(self: *FuncBuilder, target: BlockIndex, span: source.Span) NodeIndex {
+    return self.emit(initNode(.continue_loop, types.VOID, span).withAux(@intCast(i64, target)));
 }
 
-// Build the final function.
-// Computes stack frame layout: assigns offsets to locals and calculates total frame size.
-fn build(self: *FuncBuilder) Func {
+/// Emit field access.
+pub fn emitField(self: *FuncBuilder, base: NodeIndex, field_idx: u32, type_idx: types.TypeIndex, span: source.Span) NodeIndex {
+    return self.emit(initNode(.field, type_idx, span).withArgs([base]).withAux(@intCast(i64, field_idx)));
+}
+
+/// Emit array/slice index.
+pub fn emitIndex(self: *FuncBuilder, base: NodeIndex, index_val: NodeIndex, type_idx: types.TypeIndex, span: source.Span) NodeIndex {
+    return self.emit(initNode(.index, type_idx, span).withArgs([base, index_val]));
+}
+
+/// Emit struct initialization.
+pub fn emitStructInit(self: *FuncBuilder, type_name: string, field_values: []NodeIndex, type_idx: types.TypeIndex, span: source.Span) NodeIndex {
+    return self.emit(initNode(.struct_init, type_idx, span).withArgs(field_values).withAuxStr(type_name));
+}
+
+/// Emit array initialization.
+pub fn emitArrayInit(self: *FuncBuilder, elements: []NodeIndex, type_idx: types.TypeIndex, span: source.Span) NodeIndex {
+    return self.emit(initNode(.array_init, type_idx, span).withArgs(elements));
+}
+
+/// Emit range creation.
+pub fn emitRange(self: *FuncBuilder, start: NodeIndex, end: NodeIndex, inclusive: bool, span: source.Span) NodeIndex {
+    var aux: i64 = if inclusive { 1 } else { 0 };
+    return self.emit(initNode(.range, types.INT, span).withArgs([start, end]).withAux(aux));
+}
+
+/// Build the final function.
+/// Computes stack frame layout: assigns offsets to locals and calculates total frame size.
+pub fn build(self: *FuncBuilder) Func {
     // Collect params from locals
-    var params = new List<Local>
-    for local in self.locals {
+    var params = new List<Local>();
+    for local in self.locals.items() {
         if local.is_param {
-            params.push(local)
+            params.push(local);
         }
     }
 
     // Compute stack frame layout (like Go's AllocFrame)
     // Assign sequential offsets to each local based on their sizes
-    var frame_offset: i32 = 0
-    for local in self.locals {
+    var frame_offset: i32 = 0;
+    for local, i in self.locals.items() {
         // Round up to 8-byte alignment
-        frame_offset = roundUp(frame_offset, 8)
+        frame_offset = roundUp(frame_offset, 8);
         // Assign offset (negative for x86/rbp-relative)
-        local.offset = -frame_offset - @intCast(i32, local.size)
+        self.locals.items()[i].offset = -frame_offset - @intCast(i32, local.size);
         // Advance by variable size
-        frame_offset += @intCast(i32, local.size)
+        frame_offset += @intCast(i32, local.size);
     }
 
     // Round total frame size to 16-byte alignment (ABI requirement)
-    var frame_size = @intCast(u32, roundUp(frame_offset, 16))
+    var frame_size = @intCast(u32, roundUp(frame_offset, 16));
 
     return Func{
         .name = self.name,
@@ -745,10 +1124,10 @@ fn build(self: *FuncBuilder) Func {
         .nodes = self.nodes.toSlice(),
         .span = self.span,
         .frame_size = frame_size,
-    }
+    };
 }
 
-// Round up to alignment (must be power of 2).
+/// Round up to alignment (must be power of 2).
 fn roundUp(offset: i32, alignment: i32) i32 {
-    return (offset + alignment - 1) & ~(alignment - 1)
+    return (offset + alignment - 1) & ~(alignment - 1);
 }

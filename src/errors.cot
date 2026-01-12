@@ -2,36 +2,146 @@
 //
 // Maps to Go's error pattern from cmd/compile/internal/syntax/syntax.go
 // This is the target implementation for self-hosting.
+//
+// Defines the Result<T, E> type and error propagation patterns.
+
+module errors;
+
+import source;
 
 // =============================================================================
-// LANGUAGE FEATURES USED:
+// LANGUAGE FEATURES USED (Phase 1-7):
 // =============================================================================
-// 1. Enums with explicit values (ErrorCode: u16 { E100 = 100 })
-// 2. Switch expressions
-// 3. Optional fields in structs (?ErrorCode)
-// 4. If capture syntax (if x |val| {})
-// 5. String interpolation ("${expr}")
-// 6. Function pointer types (fn(Error) void)
-// 7. Compound assignment (+=)
-// 8. Type aliases (type X = Y)
-// 9. @intFromEnum builtin
+// 1. Module declaration and pub visibility (Phase 6)
+// 2. Generic types - Result<T, E> (Phase 7)
+// 3. Enums with explicit values (ErrorCode: u16 { E100 = 100 })
+// 4. Switch expressions
+// 5. Optional fields in structs (?ErrorCode)
+// 6. If capture syntax (if x |val| {})
+// 7. String interpolation ("${expr}")
+// 8. Function types (fn(Error) void)
+// 9. Compound assignment (+=)
+// 10. Type aliases (type X = Y)
+// 11. @intFromEnum builtin
 // =============================================================================
 
-import "source"
+// ============================================================================
+// Result Type (Phase 2 - Error Handling)
+// ============================================================================
 
-// Compile-time trace flag for debug output.
-const trace: bool = false
+/// Generic Result type for operations that can fail.
+/// This is the foundation of cot's error handling.
+///
+/// Usage:
+///   fn readFile(path: string) Result<string, Error> { ... }
+///
+///   // Pattern 1: Explicit handling
+///   var result = readFile("config.json");
+///   switch result {
+///       .ok |content| => process(content),
+///       .err |e| => println("Error: ${e.msg}"),
+///   }
+///
+///   // Pattern 2: Propagation with ?
+///   fn loadConfig() Result<Config, Error> {
+///       var content = readFile("config.json")?;
+///       return .ok(parseConfig(content));
+///   }
+///
+///   // Pattern 3: Default on error
+///   var content = readFile("config.json") ?? "{}";
+pub union Result<T, E> {
+    ok: T,
+    err: E,
+}
 
-// An error at a specific source location.
-struct Error {
+/// Check if result is ok.
+pub fn isOk<T, E>(self: Result<T, E>) bool {
+    return switch self {
+        .ok => true,
+        .err => false,
+    };
+}
+
+/// Check if result is err.
+pub fn isErr<T, E>(self: Result<T, E>) bool {
+    return switch self {
+        .ok => false,
+        .err => true,
+    };
+}
+
+/// Unwrap the ok value, panics if err.
+pub fn unwrap<T, E>(self: Result<T, E>) T {
+    return switch self {
+        .ok |v| => v,
+        .err |e| => @panic("unwrap called on err"),
+    };
+}
+
+/// Unwrap the ok value or return a default.
+pub fn unwrapOr<T, E>(self: Result<T, E>, default: T) T {
+    return switch self {
+        .ok |v| => v,
+        .err => default,
+    };
+}
+
+/// Map the ok value with a function.
+pub fn map<T, E, U>(self: Result<T, E>, f: fn(T) U) Result<U, E> {
+    return switch self {
+        .ok |v| => Result<U, E>.ok(f(v)),
+        .err |e| => Result<U, E>.err(e),
+    };
+}
+
+/// Map the err value with a function.
+pub fn mapErr<T, E, F>(self: Result<T, E>, f: fn(E) F) Result<T, F> {
+    return switch self {
+        .ok |v| => Result<T, F>.ok(v),
+        .err |e| => Result<T, F>.err(f(e)),
+    };
+}
+
+// ============================================================================
+// Void Result (common case for operations that don't return a value)
+// ============================================================================
+
+/// Type alias for results that only carry error info.
+pub type VoidResult<E> = Result<void, E>;
+
+// ============================================================================
+// Error Types
+// ============================================================================
+
+/// An error at a specific source location.
+pub struct Error {
     span: Span,
     msg: string,
     code: ?ErrorCode,
 }
 
-// Error codes for categorizing errors.
-// Useful for tooling, IDE integration, and documentation references.
-enum ErrorCode: u16 {
+/// Create an error with a message.
+pub fn error(span: Span, msg: string) Error {
+    return Error{
+        .span = span,
+        .msg = msg,
+        .code = null,
+    };
+}
+
+/// Create an error with a code.
+pub fn errorWithCode(span: Span, code: ErrorCode, msg: string) Error {
+    return Error{
+        .span = span,
+        .msg = msg,
+        .code = code,
+    };
+}
+
+/// Error codes for categorizing errors.
+/// Useful for tooling, IDE integration, and documentation references.
+pub enum ErrorCode: u16 {
     // Scanner errors (1xx)
     E100 = 100,  // unterminated string literal
     E101 = 101,  // unterminated character literal
@@ -55,10 +165,14 @@ enum ErrorCode: u16 {
     E301 = 301,  // undefined identifier
     E302 = 302,  // redefined identifier
     E303 = 303,  // invalid operation
+
+    // Codegen errors (4xx)
+    E400 = 400,  // internal codegen error
+    E401 = 401,  // unsupported feature
 }
 
-// Get description for an error code.
-fn description(self: ErrorCode) string {
+/// Get description for an error code.
+pub fn description(self: ErrorCode) string {
     return switch self {
         .E100 => "unterminated string literal",
         .E101 => "unterminated character literal",
@@ -78,104 +192,181 @@ fn description(self: ErrorCode) string {
         .E301 => "undefined identifier",
         .E302 => "redefined identifier",
         .E303 => "invalid operation",
-    }
+        .E400 => "internal codegen error",
+        .E401 => "unsupported feature",
+    };
 }
 
-// Callback type for error handling.
-type ErrorHandler = fn(Error) void
+// ============================================================================
+// Compile-time trace flag
+// ============================================================================
 
-// Collects and reports errors during compilation.
-struct ErrorReporter {
+/// Compile-time trace flag for debug output.
+pub const trace: bool = false;
+
+// ============================================================================
+// Error Handler
+// ============================================================================
+
+/// Callback type for error handling.
+pub type ErrorHandler = fn(Error) void;
+
+/// Collects and reports errors during compilation.
+pub struct ErrorReporter {
     src: *Source,
     handler: ?ErrorHandler,
     first: ?Error,
     count: u32,
 }
 
-// Initialize an error reporter.
-fn init(src: *Source, handler: ?ErrorHandler) ErrorReporter {
+/// Initialize an error reporter.
+pub fn init(src: *Source, handler: ?ErrorHandler) ErrorReporter {
     return ErrorReporter{
         .src = src,
         .handler = handler,
         .first = null,
         .count = 0,
-    }
+    };
 }
 
-// Report an error at a position.
-fn errorAt(self: *ErrorReporter, pos: Pos, msg: string) {
-    self.errorAtSpan(Span.fromPos(pos), msg, null)
+/// Report an error at a position.
+pub fn errorAt(self: *ErrorReporter, pos: Pos, msg: string) {
+    self.errorAtSpan(Span.fromPos(pos), msg, null);
 }
 
-// Report an error with an error code.
-fn errorWithCode(self: *ErrorReporter, pos: Pos, code: ErrorCode, msg: string) {
-    self.errorAtSpan(Span.fromPos(pos), msg, code)
+/// Report an error with an error code at a position.
+pub fn errorAtWithCode(self: *ErrorReporter, pos: Pos, code: ErrorCode, msg: string) {
+    self.errorAtSpan(Span.fromPos(pos), msg, code);
 }
 
-// Report an error at a span.
-fn errorAtSpan(self: *ErrorReporter, span: Span, msg: string, code: ?ErrorCode) {
+/// Report an error at a span.
+pub fn errorAtSpan(self: *ErrorReporter, span: Span, msg: string, code: ?ErrorCode) {
     var err = Error{
         .span = span,
         .msg = msg,
         .code = code,
-    }
+    };
 
     if self.first == null {
-        self.first = err
+        self.first = err;
     }
-    self.count += 1
+    self.count += 1;
 
     if self.handler |h| {
-        h(err)
+        h(err);
     } else {
-        self.printError(err)
+        self.printError(err);
     }
 }
 
-// Print an error with source context.
-fn printError(self: *ErrorReporter, err: Error) {
-    var loc = self.src.location(err.span.start)
+/// Print an error with source context.
+pub fn printError(self: *ErrorReporter, err: Error) {
+    var loc = self.src.location(err.span.start);
 
+    // Format: file:line:column: error[E###]: message
     if err.code |code| {
-        println("${self.src.filename}:${loc.line}:${loc.column}: error[E${@intFromEnum(code)}]: ${err.msg}")
+        println("${self.src.filename}:${loc.line}:${loc.column}: error[E${@intFromEnum(code)}]: ${err.msg}");
     } else {
-        println("${self.src.filename}:${loc.line}:${loc.column}: error: ${err.msg}")
+        println("${self.src.filename}:${loc.line}:${loc.column}: error: ${err.msg}");
     }
 
     // Show the source line
-    var line = self.src.getLine(err.span.start)
-    println("    ${line}")
+    var line = self.src.getLine(err.span.start);
+    println("    ${line}");
 
     // Show the caret indicator
-    var col = loc.column
+    var col = loc.column;
     if col > 0 {
-        print("    ")
-        var i: u32 = 0
-        while i < col - 1 {
+        // Build the caret line
+        var caret = StringBuilder.init();
+        caret.append("    ");
+        for i in 0..col - 1 {
             if i < len(line) and line[i] == '\t' {
-                print("\t")
+                caret.append("\t");
             } else {
-                print(" ")
+                caret.append(" ");
             }
-            i += 1
         }
-        println("^")
+        caret.append("^");
+        println(caret.toString());
     }
 }
 
-// Check if any errors were reported.
-fn hasErrors(self: *ErrorReporter) bool {
-    return self.count > 0
+/// Check if any errors were reported.
+pub fn hasErrors(self: *ErrorReporter) bool {
+    return self.count > 0;
 }
 
-// Get the first error.
-fn firstError(self: *ErrorReporter) ?Error {
-    return self.first
+/// Get the first error.
+pub fn firstError(self: *ErrorReporter) ?Error {
+    return self.first;
 }
 
-// Print a trace message if trace mode is enabled.
-fn traceMsg(msg: string) {
+/// Get error count.
+pub fn errorCount(self: *ErrorReporter) u32 {
+    return self.count;
+}
+
+// ============================================================================
+// String Builder (Phase 3 - String Enhancement)
+// ============================================================================
+
+/// StringBuilder for efficient string construction.
+pub struct StringBuilder {
+    parts: List<string>,
+}
+
+/// Initialize an empty StringBuilder.
+pub fn init() StringBuilder {
+    return StringBuilder{
+        .parts = new List<string>(),
+    };
+}
+
+/// Append a string.
+pub fn append(self: *StringBuilder, s: string) {
+    self.parts.push(s);
+}
+
+/// Append a formatted integer.
+pub fn appendInt(self: *StringBuilder, n: i64) {
+    // TODO: proper int-to-string conversion
+    self.parts.push("${n}");
+}
+
+/// Build the final string.
+pub fn toString(self: *StringBuilder) string {
+    // Join all parts
+    var result = "";
+    for part in self.parts {
+        result = result ++ part;
+    }
+    return result;
+}
+
+/// Get current length estimate.
+pub fn length(self: *StringBuilder) int {
+    var total: int = 0;
+    for part in self.parts {
+        total += len(part);
+    }
+    return total;
+}
+
+// ============================================================================
+// Trace utilities
+// ============================================================================
+
+/// Print a trace message if trace mode is enabled.
+pub fn traceMsg(msg: string) {
     if trace {
-        println("[trace] ${msg}")
+        println("[trace] ${msg}");
+    }
+}
+
+/// Print a trace message with a value.
+pub fn traceValue<T>(msg: string, value: T) {
+    if trace {
+        println("[trace] ${msg}: ${value}");
     }
 }

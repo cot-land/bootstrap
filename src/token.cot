@@ -3,21 +3,24 @@
 // Maps to Go's cmd/compile/internal/syntax/tokens.go
 // This is the target implementation for self-hosting.
 
+module token;
+
 // =============================================================================
-// LANGUAGE FEATURES USED:
+// LANGUAGE FEATURES USED (Phase 1-7):
 // =============================================================================
-// 1. Enums with backing type (u8)
-// 2. Enums with explicit values
-// 3. Switch expressions
-// 4. @intFromEnum builtin
-// 5. Map<string, Token> for keyword lookup
-// 6. For-in iteration
+// 1. Module declaration and pub visibility (Phase 6)
+// 2. Enums with backing type (u8)
+// 3. Enums with explicit values
+// 4. Switch expressions
+// 5. @intFromEnum builtin
+// 6. Map<string, Token> for keyword lookup (compile-time)
 // 7. String equality (== on strings)
 // 8. Optional return type (?Token)
+// 9. impl blocks for methods (Phase 8 preview - kept for clarity)
 // =============================================================================
 
-// Token represents a lexical token in the cot language.
-enum Token: u8 {
+/// Token represents a lexical token in the cot language.
+pub enum Token: u8 {
     // Special tokens
     eof,
     invalid,
@@ -69,9 +72,10 @@ enum Token: u8 {
     dot_star,           // .*
     dot_question,       // .? (optional unwrap)
     question_question,  // ??
-    question_dot,       // ?.
+    question_dot,       // ?. (optional chaining)
     arrow,              // ->
     fat_arrow,          // =>
+    plus_plus,          // ++ (string concat)
 
     // Delimiters
     lparen,     // (
@@ -104,6 +108,8 @@ enum Token: u8 {
     kw_continue,
     kw_defer,
     kw_import,
+    kw_module,
+    kw_pub,
     kw_new,
     kw_null,
     kw_true,
@@ -120,6 +126,7 @@ enum Token: u8 {
     kw_bool,
     kw_string,
     kw_byte,
+    kw_void,
     kw_decimal,
     kw_alpha,
 
@@ -136,8 +143,8 @@ enum Token: u8 {
     kw_f64,
 }
 
-// Returns the string representation of a token.
-fn toString(self: Token) string {
+/// Returns the string representation of a token.
+pub fn toString(self: Token) string {
     return switch self {
         .eof => "EOF",
         .invalid => "invalid",
@@ -186,6 +193,7 @@ fn toString(self: Token) string {
         .question_dot => "?.",
         .arrow => "->",
         .fat_arrow => "=>",
+        .plus_plus => "++",
         .lparen => "(",
         .rparen => ")",
         .lbracket => "[",
@@ -214,6 +222,8 @@ fn toString(self: Token) string {
         .kw_continue => "continue",
         .kw_defer => "defer",
         .kw_import => "import",
+        .kw_module => "module",
+        .kw_pub => "pub",
         .kw_new => "new",
         .kw_null => "null",
         .kw_true => "true",
@@ -226,6 +236,7 @@ fn toString(self: Token) string {
         .kw_bool => "bool",
         .kw_string => "string",
         .kw_byte => "byte",
+        .kw_void => "void",
         .kw_decimal => "decimal",
         .kw_alpha => "alpha",
         .kw_i8 => "i8",
@@ -238,16 +249,39 @@ fn toString(self: Token) string {
         .kw_u64 => "u64",
         .kw_f32 => "f32",
         .kw_f64 => "f64",
-    }
+    };
 }
 
-// Returns true if this token is a keyword.
-fn isKeyword(self: Token) bool {
-    return @intFromEnum(self) >= @intFromEnum(Token.kw_fn)
+/// Returns true if this token is a keyword.
+pub fn isKeyword(self: Token) bool {
+    return @intFromEnum(self) >= @intFromEnum(Token.kw_fn);
+}
+
+/// Returns true if this token is a literal.
+pub fn isLiteral(self: Token) bool {
+    return switch self {
+        .int_literal, .float_literal, .string_literal, .char_literal => true,
+        .kw_true, .kw_false, .kw_null => true,
+        else => false,
+    };
+}
+
+/// Returns true if this token is an operator.
+pub fn isOperator(self: Token) bool {
+    return switch self {
+        .plus, .minus, .star, .slash, .percent => true,
+        .ampersand, .pipe, .caret, .tilde, .bang => true,
+        .equal, .less, .greater, .dot, .question => true,
+        .plus_equal, .minus_equal, .star_equal, .slash_equal => true,
+        .equal_equal, .bang_equal, .less_equal, .greater_equal => true,
+        .kw_and, .kw_or, .kw_not => true,
+        .question_question, .question_dot, .plus_plus => true,
+        else => false,
+    };
 }
 
 // Keyword lookup using compile-time map.
-const keywords: Map<string, Token> = {
+pub const keywords: Map<string, Token> = {
     "fn": .kw_fn,
     "var": .kw_var,
     "let": .kw_let,
@@ -267,6 +301,8 @@ const keywords: Map<string, Token> = {
     "continue": .kw_continue,
     "defer": .kw_defer,
     "import": .kw_import,
+    "module": .kw_module,
+    "pub": .kw_pub,
     "new": .kw_new,
     "null": .kw_null,
     "true": .kw_true,
@@ -279,6 +315,7 @@ const keywords: Map<string, Token> = {
     "bool": .kw_bool,
     "string": .kw_string,
     "byte": .kw_byte,
+    "void": .kw_void,
     "decimal": .kw_decimal,
     "alpha": .kw_alpha,
     "i8": .kw_i8,
@@ -291,35 +328,37 @@ const keywords: Map<string, Token> = {
     "u64": .kw_u64,
     "f32": .kw_f32,
     "f64": .kw_f64,
+};
+
+/// Look up a keyword by name.
+pub fn lookupKeyword(name: string) ?Token {
+    return keywords.get(name);
 }
 
-// Look up a keyword by name.
-fn lookupKeyword(name: string) ?Token {
-    return keywords.get(name)
-}
-
-// Operator precedence levels (higher = binds tighter).
-// Follows Go's precedence but with cot's keyword operators.
-enum Precedence: u8 {
+/// Operator precedence levels (higher = binds tighter).
+/// Follows Go's precedence but with cot's keyword operators.
+pub enum Precedence: u8 {
     none = 0,
     coalesce = 1,   // ?? (null coalescing, lowest binary op)
     or_prec = 2,    // or
     and_prec = 3,   // and
     compare = 4,    // == != < <= > >=
-    add = 5,        // + - | ^
-    mul = 6,        // * / % & << >>
-    unary = 7,      // not ! - ~ & *
+    concat = 5,     // ++ (string concatenation)
+    add = 6,        // + - | ^
+    mul = 7,        // * / % & << >>
+    unary = 8,      // not ! - ~ & *
 }
 
-// Returns the binary operator precedence for a token.
-fn binaryPrecedence(tok: Token) Precedence {
+/// Returns the binary operator precedence for a token.
+pub fn binaryPrecedence(tok: Token) Precedence {
     return switch tok {
         .question_question => .coalesce,
         .kw_or => .or_prec,
         .kw_and => .and_prec,
         .equal_equal, .bang_equal, .less, .less_equal, .greater, .greater_equal => .compare,
+        .plus_plus => .concat,
         .plus, .minus, .pipe, .caret => .add,
         .star, .slash, .percent, .ampersand, .less_less, .greater_greater => .mul,
         else => .none,
-    }
+    };
 }
