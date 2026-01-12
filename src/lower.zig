@@ -51,6 +51,14 @@ pub const Lowerer = struct {
     // String literals collected during lowering (for rodata section)
     string_literals: std.ArrayList([]const u8),
 
+    // Loop context stack for break/continue (cond_block, exit_block)
+    loop_stack: std.ArrayList(LoopContext),
+
+    const LoopContext = struct {
+        cond_block: u32, // Jump target for continue
+        exit_block: u32, // Jump target for break
+    };
+
     pub fn init(
         allocator: Allocator,
         tree: *const Ast,
@@ -67,6 +75,7 @@ pub const Lowerer = struct {
             .checker = chk,
             .type_ctx = type_context.TypeContext.init(tree, type_reg),
             .string_literals = .{ .items = &.{}, .capacity = 0 },
+            .loop_stack = .{ .items = &.{}, .capacity = 0 },
         };
     }
 
@@ -624,6 +633,12 @@ pub const Lowerer = struct {
         const body_block = try fb.newBlock("while.body");
         const exit_block = try fb.newBlock("while.exit");
 
+        // Push loop context for break/continue
+        try self.loop_stack.append(self.allocator, .{
+            .cond_block = cond_block,
+            .exit_block = exit_block,
+        });
+
         // Jump to condition block (target stored in aux)
         const jump_cond = ir.Node.init(.jump, TypeRegistry.VOID, Span.fromPos(Pos.zero))
             .withAux(@intCast(cond_block));
@@ -645,6 +660,9 @@ pub const Lowerer = struct {
                 .withAux(@intCast(cond_block));
             _ = try fb.emit(jump_back);
         }
+
+        // Pop loop context
+        _ = self.loop_stack.pop();
 
         // Continue in exit block
         fb.setBlock(exit_block);
@@ -706,10 +724,18 @@ pub const Lowerer = struct {
         const elem_size = self.type_reg.sizeOf(elem_type);
         const item_local = try fb.addLocalWithSize(for_stmt.binding, elem_type, true, elem_size);
 
-        // Create blocks for condition, body, and exit
+        // Create blocks for condition, body, increment, and exit
         const cond_block = try fb.newBlock("for.cond");
         const body_block = try fb.newBlock("for.body");
+        const incr_block = try fb.newBlock("for.incr");
         const exit_block = try fb.newBlock("for.exit");
+
+        // Push loop context for break/continue
+        // continue -> incr_block (not cond_block, so increment runs)
+        try self.loop_stack.append(self.allocator, .{
+            .cond_block = incr_block, // continue goes to increment
+            .exit_block = exit_block,
+        });
 
         // Jump to condition block
         const jump_cond = ir.Node.init(.jump, TypeRegistry.VOID, Span.fromPos(Pos.zero))
@@ -812,7 +838,17 @@ pub const Lowerer = struct {
         }
 
         // Execute body
-        _ = try self.lowerBlock(for_stmt.body);
+        const body_terminated = try self.lowerBlock(for_stmt.body);
+
+        // Jump to increment block if body didn't terminate
+        if (!body_terminated) {
+            const jump_incr = ir.Node.init(.jump, TypeRegistry.VOID, Span.fromPos(Pos.zero))
+                .withAux(@intCast(incr_block));
+            _ = try fb.emit(jump_incr);
+        }
+
+        // === Increment block ===
+        fb.setBlock(incr_block);
 
         // Increment index: __for_idx_N = __for_idx_N + 1
         const load_idx3 = ir.Node.init(.load, TypeRegistry.INT, Span.fromPos(Pos.zero))
@@ -836,21 +872,46 @@ pub const Lowerer = struct {
             .withAux(@intCast(cond_block));
         _ = try fb.emit(jump_back);
 
+        // Pop loop context
+        _ = self.loop_stack.pop();
+
         // === Exit block ===
         fb.setBlock(exit_block);
         log.debug("  for loop: binding={s}, elem_type={d}", .{ for_stmt.binding, elem_type });
     }
 
     fn lowerBreak(self: *Lowerer) Allocator.Error!void {
-        // TODO: Need to track loop exit blocks
-        _ = self;
-        log.debug("  break (TODO)", .{});
+        const fb = self.current_func orelse return;
+
+        // Get current loop context
+        if (self.loop_stack.items.len == 0) {
+            // Should have been caught by type checker
+            return;
+        }
+        const loop_ctx = self.loop_stack.items[self.loop_stack.items.len - 1];
+
+        // Emit jump to exit block
+        const jump = ir.Node.init(.jump, TypeRegistry.VOID, Span.fromPos(Pos.zero))
+            .withAux(@intCast(loop_ctx.exit_block));
+        _ = try fb.emit(jump);
+        log.debug("  break -> block {d}", .{loop_ctx.exit_block});
     }
 
     fn lowerContinue(self: *Lowerer) Allocator.Error!void {
-        // TODO: Need to track loop condition blocks
-        _ = self;
-        log.debug("  continue (TODO)", .{});
+        const fb = self.current_func orelse return;
+
+        // Get current loop context
+        if (self.loop_stack.items.len == 0) {
+            // Should have been caught by type checker
+            return;
+        }
+        const loop_ctx = self.loop_stack.items[self.loop_stack.items.len - 1];
+
+        // Emit jump to condition block
+        const jump = ir.Node.init(.jump, TypeRegistry.VOID, Span.fromPos(Pos.zero))
+            .withAux(@intCast(loop_ctx.cond_block));
+        _ = try fb.emit(jump);
+        log.debug("  continue -> block {d}", .{loop_ctx.cond_block});
     }
 
     // ========================================================================

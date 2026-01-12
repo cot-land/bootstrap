@@ -137,7 +137,6 @@ These features exist in wireframe .cot files but are NOT in Zig compiler yet:
 - `p.*` - explicit dereference
 - `!T` / `try` / `catch` - error handling
 - `fn(T) R` - function types as values
-- `break` / `continue` (parsing only, no codegen)
 - `import "module"` - module system
 - `defer` - deferred execution
 - `?.` - optional chaining
@@ -175,8 +174,6 @@ Only add features if they're absolutely required and can't be worked around:
 
 | Feature | Priority | Workaround Available? |
 |---------|----------|----------------------|
-| `break` codegen | High | Restructure loops |
-| `continue` codegen | High | Restructure loops |
 | For with index | Medium | Use counter variable |
 | Bitwise operators | Medium | Runtime FFI calls |
 | Address-of `&x` | Low | Pass by value, use indices |
@@ -238,7 +235,6 @@ After self-hosting, we can gradually migrate from bootstrap files to wireframe f
 
 | Blocker | Impact | Solution |
 |---------|--------|----------|
-| No `break`/`continue` codegen | Must restructure loops | Add codegen (< 1 day) |
 | No address-of `&x` | Can't take pointers | Use indices instead |
 | No error handling | Can't propagate errors | Return error codes |
 | No imports | Single file compilation | File concatenation |

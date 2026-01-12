@@ -113,8 +113,8 @@ zig build test                    # 135+ embedded tests
 | `switch` expression | Done | Returns value |
 | `switch` statement | Done | No return |
 | Multi-case | Done | `.a, .b => x` |
-| `break` | Partial | Parsing done |
-| `continue` | Partial | Parsing done |
+| `break` | Done | Exit loop early |
+| `continue` | Done | Skip to next iteration |
 | `return` | Done | Full support |
 
 ### Operators

@@ -1,0 +1,15 @@
+// Test break in while loop
+// expected: 42
+fn main() int {
+    var i = 0;
+    var sum = 0;
+    while (i < 100) {
+        if (i == 5) break;
+        sum = sum + i;
+        i = i + 1;
+    }
+    // sum should be 0 + 1 + 2 + 3 + 4 = 10
+    if (sum != 10) return 1;
+    if (i != 5) return 2;
+    return 42;
+}

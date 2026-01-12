@@ -1,0 +1,13 @@
+// Test continue in for loop
+// expected: 42
+fn main() int {
+    var arr = [10, 20, 30, 40, 50];
+    var sum = 0;
+    for item in arr {
+        if (item == 30) continue;  // skip 30
+        sum = sum + item;
+    }
+    // sum should be 10 + 20 + 40 + 50 = 120 (skipping 30)
+    if (sum != 120) return sum;
+    return 42;
+}

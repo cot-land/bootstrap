@@ -143,6 +143,10 @@ get_expected() {
         test_string_slice) echo 42 ;;
         test_bool_or) echo 42 ;;
         test_bool_and) echo 42 ;;
+        test_break) echo 42 ;;
+        test_continue) echo 42 ;;
+        test_break_for) echo 42 ;;
+        test_continue_for) echo 42 ;;
         *) echo "" ;;
     esac
 }

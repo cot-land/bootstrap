@@ -1,0 +1,13 @@
+// Test break in for loop
+// expected: 42
+fn main() int {
+    var arr = [10, 20, 30, 40, 50];
+    var sum = 0;
+    for item in arr {
+        if (item == 30) break;
+        sum = sum + item;
+    }
+    // sum should be 10 + 20 = 30
+    if (sum != 30) return sum;
+    return 42;
+}
