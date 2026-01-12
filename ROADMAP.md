@@ -51,7 +51,7 @@ Every Zig source file needs a corresponding bootstrap .cot file that uses only s
 | `src/source.zig` | `src/bootstrap/source_boot.cot` | **Done** | Source position tracking |
 | `src/scanner.zig` | `src/bootstrap/scanner_boot.cot` | **Done** | Lexer/tokenizer |
 | `src/ast.zig` | `src/bootstrap/ast_boot.cot` | **Done** | AST node types |
-| `src/types.zig` | `src/bootstrap/types_boot.cot` | TODO | Type registry |
+| `src/types.zig` | `src/bootstrap/types_boot.cot` | **Done** | Type registry with 14-variant union |
 | `src/parser.zig` | `src/bootstrap/parser_boot.cot` | TODO | Parser |
 | `src/check.zig` | `src/bootstrap/check_boot.cot` | TODO | Type checker |
 | `src/errors.zig` | `src/bootstrap/errors_boot.cot` | TODO | Error handling |
@@ -71,7 +71,7 @@ Every Zig source file needs a corresponding bootstrap .cot file that uses only s
 | `src/debug.zig` | `src/bootstrap/debug_boot.cot` | TODO | Debug output utilities |
 | `src/type_context.zig` | `src/bootstrap/type_context_boot.cot` | TODO | Type context for checker |
 
-**Progress: 4/22 files complete**
+**Progress: 5/22 files complete**
 
 ---
 
@@ -155,8 +155,8 @@ These features exist in wireframe .cot files but are NOT in Zig compiler yet:
 1. ✅ `token_boot.cot` - Token types (DONE)
 2. ✅ `source_boot.cot` - Source positions (DONE)
 3. ✅ `scanner_boot.cot` - Lexer (DONE)
-4. `ast_boot.cot` - AST nodes
-5. `types_boot.cot` - Type registry
+4. ✅ `ast_boot.cot` - AST nodes (DONE)
+5. ✅ `types_boot.cot` - Type registry (DONE)
 6. `errors_boot.cot` - Error types (simplified, no callbacks)
 7. `parser_boot.cot` - Parser
 8. `check_boot.cot` - Type checker
