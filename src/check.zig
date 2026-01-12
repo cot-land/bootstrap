@@ -1041,8 +1041,8 @@ pub const Checker = struct {
         return switch (base) {
             .array => |a| try self.types.makeSlice(a.elem),
             .slice => base_type, // Slicing a slice returns same slice type
-            .basic => |k| if (k == .string_type) TypeRegistry.STRING else blk: {
-                // Slicing a string returns string (substring is still a string)
+            .basic => |k| if (k == .string_type) try self.types.makeSlice(TypeRegistry.U8) else blk: {
+                // Slicing a string returns []u8 (a byte slice)
                 self.err.errorWithCode(se.span.start, .E303, "cannot slice this type");
                 break :blk invalid_type;
             },

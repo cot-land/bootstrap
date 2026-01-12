@@ -1413,10 +1413,11 @@ pub const CodeGen = struct {
         try self.setResult(value.id, .{ .register = .rax });
     }
 
-    /// Generate code for map_get: runtime call cot_map_get(handle, key_ptr, key_len)
+    /// Generate code for map_get: args[0]=handle, args[1]=key
+    /// Key is handled specially for const_string (need ptr + len)
     pub fn genMapGet(self: *CodeGen, value: *ssa.Value) !void {
         const args = value.args();
-        if (args.len < 3) return;
+        if (args.len < 2) return;
 
         // Spill caller-saved registers
         try self.spillCallerSaved();
@@ -1424,11 +1425,21 @@ pub const CodeGen = struct {
         const handle_mcv = self.getValue(args[0]);
         try self.loadToReg(.rdi, handle_mcv);
 
-        const key_ptr_mcv = self.getValue(args[1]);
-        try self.loadToReg(.rsi, key_ptr_mcv);
-
-        const key_len_mcv = self.getValue(args[2]);
-        try self.loadToReg(.rdx, key_len_mcv);
+        // Load key - special handling for const_string (need ptr + len)
+        const key_val = &self.func.values.items[args[1]];
+        if (key_val.op == .const_string) {
+            const str_content = key_val.aux_str;
+            const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
+                str_content[1 .. str_content.len - 1]
+            else
+                str_content;
+            const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
+            try x86.leaRipSymbol(self.buf, .rsi, sym_name);
+            try x86.movRegImm64(self.buf, .rdx, @intCast(stripped.len));
+        } else {
+            const key_mcv = self.getValue(args[1]);
+            try self.loadToReg(.rsi, key_mcv);
+        }
 
         try self.emitRuntimeCall("cot_map_get");
 
@@ -1467,10 +1478,11 @@ pub const CodeGen = struct {
         try self.setResult(value.id, .{ .register = .rax });
     }
 
-    /// Generate code for map_set: args[0]=handle, args[1]=key_ptr, args[2]=key_len, args[3]=value
+    /// Generate code for map_set: args[0]=handle, args[1]=key, args[2]=value
+    /// Key is handled specially for const_string (need ptr + len)
     pub fn genMapSet(self: *CodeGen, value: *ssa.Value) !void {
         const args = value.args();
-        if (args.len < 4) return;
+        if (args.len < 3) return;
 
         try self.spillCallerSaved();
 
@@ -1478,36 +1490,57 @@ pub const CodeGen = struct {
         const handle_mcv = self.getValue(args[0]);
         try self.loadToReg(.rdi, handle_mcv);
 
-        // Load key_ptr into rsi
-        const key_ptr_mcv = self.getValue(args[1]);
-        try self.loadToReg(.rsi, key_ptr_mcv);
-
-        // Load key_len into rdx
-        const key_len_mcv = self.getValue(args[2]);
-        try self.loadToReg(.rdx, key_len_mcv);
+        // Load key - special handling for const_string (need ptr + len)
+        const key_val = &self.func.values.items[args[1]];
+        if (key_val.op == .const_string) {
+            const str_content = key_val.aux_str;
+            const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
+                str_content[1 .. str_content.len - 1]
+            else
+                str_content;
+            const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
+            try x86.leaRipSymbol(self.buf, .rsi, sym_name);
+            try x86.movRegImm64(self.buf, .rdx, @intCast(stripped.len));
+        } else {
+            // For non-const strings, load ptr via MCValue
+            const key_mcv = self.getValue(args[1]);
+            try self.loadToReg(.rsi, key_mcv);
+            // TODO: handle string len properly for non-const strings
+        }
 
         // Load value into rcx
-        const val_mcv = self.getValue(args[3]);
+        const val_mcv = self.getValue(args[2]);
         try self.loadToReg(.rcx, val_mcv);
 
         try self.emitRuntimeCall("cot_map_set");
     }
 
-    /// Generate code for map_has: args[0]=handle, args[1]=key_ptr, args[2]=key_len
+    /// Generate code for map_has: args[0]=handle, args[1]=key
+    /// Key is handled specially for const_string (need ptr + len)
     pub fn genMapHas(self: *CodeGen, value: *ssa.Value) !void {
         const args = value.args();
-        if (args.len < 3) return;
+        if (args.len < 2) return;
 
         try self.spillCallerSaved();
 
         const handle_mcv = self.getValue(args[0]);
         try self.loadToReg(.rdi, handle_mcv);
 
-        const key_ptr_mcv = self.getValue(args[1]);
-        try self.loadToReg(.rsi, key_ptr_mcv);
-
-        const key_len_mcv = self.getValue(args[2]);
-        try self.loadToReg(.rdx, key_len_mcv);
+        // Load key - special handling for const_string (need ptr + len)
+        const key_val = &self.func.values.items[args[1]];
+        if (key_val.op == .const_string) {
+            const str_content = key_val.aux_str;
+            const stripped = if (str_content.len >= 2 and str_content[0] == '"' and str_content[str_content.len - 1] == '"')
+                str_content[1 .. str_content.len - 1]
+            else
+                str_content;
+            const sym_name = try std.fmt.allocPrint(self.allocator, "__str_{d}", .{@as(u32, @truncate(std.hash.Wyhash.hash(0, stripped)))});
+            try x86.leaRipSymbol(self.buf, .rsi, sym_name);
+            try x86.movRegImm64(self.buf, .rdx, @intCast(stripped.len));
+        } else {
+            const key_mcv = self.getValue(args[1]);
+            try self.loadToReg(.rsi, key_mcv);
+        }
 
         try self.emitRuntimeCall("cot_map_has");
         self.reg_manager.markUsed(.rax, value.id);
