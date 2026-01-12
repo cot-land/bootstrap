@@ -585,6 +585,11 @@ pub const TypeRegistry = struct {
         if (std.mem.eql(u8, name, "u64")) return U64;
         if (std.mem.eql(u8, name, "bool")) return BOOL;
         if (std.mem.eql(u8, name, "void")) return VOID;
+        // Type aliases
+        if (std.mem.eql(u8, name, "int")) return INT; // int = i64
+        if (std.mem.eql(u8, name, "float")) return FLOAT; // float = f64
+        if (std.mem.eql(u8, name, "byte")) return BYTE; // byte = u8
+        if (std.mem.eql(u8, name, "string")) return STRING;
 
         // Check user-defined types
         for (self.types.items, 0..) |t, idx| {
@@ -636,6 +641,11 @@ pub const TypeRegistry = struct {
                     }
                     if (kf.isUnsigned() and kt.isUnsigned()) {
                         return self.sizeOf(from) <= self.sizeOf(to);
+                    }
+                    // Unsigned -> larger signed (u32 fits in i64, etc.)
+                    // Unsigned N-bit fits in signed M-bit where M > N
+                    if (kf.isUnsigned() and kt.isSigned()) {
+                        return self.sizeOf(from) < self.sizeOf(to);
                     }
                     return false;
                 },

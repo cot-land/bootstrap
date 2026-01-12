@@ -79,7 +79,7 @@ pub const MCValue = union(enum) {
     dead,
     immediate: i64,
     register: aarch64.Reg,
-    stack: u12, // offset from sp (positive, ARM64 unsigned immediate)
+    stack: u32, // offset from sp (positive), may exceed u12 for large frames
     lea_symbol: struct {
         name: []const u8,
         len: usize,
@@ -96,7 +96,7 @@ pub const MCValue = union(enum) {
         };
     }
 
-    pub fn getStack(self: MCValue) ?u12 {
+    pub fn getStack(self: MCValue) ?u32 {
         return switch (self) {
             .stack => |s| s,
             else => null,
@@ -249,7 +249,7 @@ pub const CodeGen = struct {
     tracking: std.AutoHashMap(ssa.ValueID, InstTracking),
     reg_manager: RegisterManager,
     string_infos: []const be.StringInfo,
-    next_spill_offset: u12,
+    next_spill_offset: u32,
     stack_size: u32,
 
     // Liveness analysis for smart spill decisions
@@ -414,7 +414,7 @@ pub const CodeGen = struct {
 
         // ARM64: str reg, [sp, #offset]
         const offset = tracking.home.getStack().?;
-        try aarch64.strRegImm(self.buf, reg, .sp, offset);
+        try self.strSpOffset(reg, offset);
 
         tracking.current = tracking.home;
         self.reg_manager.markFree(reg);
@@ -435,7 +435,7 @@ pub const CodeGen = struct {
                 }
             },
             .stack => |offset| {
-                try aarch64.ldrRegImm(self.buf, dest, .sp, offset);
+                try self.ldrSpOffset(dest, offset);
             },
             .immediate => |imm| {
                 try aarch64.movRegImm64(self.buf, dest, imm);
@@ -444,6 +444,75 @@ pub const CodeGen = struct {
                 try aarch64.loadSymbolAddr(self.buf, dest, sym.name);
             },
             .none, .dead => {},
+        }
+    }
+
+    /// Load from [sp + offset] handling large offsets
+    /// For offsets > 4095, uses scratch register x16
+    fn ldrSpOffset(self: *CodeGen, dest: aarch64.Reg, offset: u32) !void {
+        if (offset <= 4095) {
+            try aarch64.ldrRegImm(self.buf, dest, .sp, @intCast(offset));
+        } else {
+            // Large offset: add x16, sp, #offset then ldr dest, [x16]
+            try aarch64.movRegImm64(self.buf, .x16, offset);
+            try aarch64.addRegReg(self.buf, .x16, .sp, .x16);
+            try aarch64.ldrRegImm(self.buf, dest, .x16, 0);
+        }
+    }
+
+    /// Store to [sp + offset] handling large offsets
+    /// For offsets > 4095, uses scratch register x16
+    fn strSpOffset(self: *CodeGen, src: aarch64.Reg, offset: u32) !void {
+        if (offset <= 4095) {
+            try aarch64.strRegImm(self.buf, src, .sp, @intCast(offset));
+        } else {
+            // Large offset: add x16, sp, #offset then str src, [x16]
+            try aarch64.movRegImm64(self.buf, .x16, offset);
+            try aarch64.addRegReg(self.buf, .x16, .sp, .x16);
+            try aarch64.strRegImm(self.buf, src, .x16, 0);
+        }
+    }
+
+    /// Load byte from [sp + offset] handling large offsets
+    fn ldrbSpOffset(self: *CodeGen, dest: aarch64.Reg, offset: u32) !void {
+        if (offset <= 4095) {
+            try aarch64.ldrbRegImm(self.buf, dest, .sp, @intCast(offset));
+        } else {
+            try aarch64.movRegImm64(self.buf, .x16, offset);
+            try aarch64.addRegReg(self.buf, .x16, .sp, .x16);
+            try aarch64.ldrbRegImm(self.buf, dest, .x16, 0);
+        }
+    }
+
+    /// Load signed byte from [sp + offset] handling large offsets
+    fn ldrsbSpOffset(self: *CodeGen, dest: aarch64.Reg, offset: u32) !void {
+        if (offset <= 4095) {
+            try aarch64.ldrsbRegImm(self.buf, dest, .sp, @intCast(offset));
+        } else {
+            try aarch64.movRegImm64(self.buf, .x16, offset);
+            try aarch64.addRegReg(self.buf, .x16, .sp, .x16);
+            try aarch64.ldrsbRegImm(self.buf, dest, .x16, 0);
+        }
+    }
+
+    /// Store byte to [sp + offset] handling large offsets
+    fn strbSpOffset(self: *CodeGen, src: aarch64.Reg, offset: u32) !void {
+        if (offset <= 4095) {
+            try aarch64.strbRegImm(self.buf, src, .sp, @intCast(offset));
+        } else {
+            try aarch64.movRegImm64(self.buf, .x16, offset);
+            try aarch64.addRegReg(self.buf, .x16, .sp, .x16);
+            try aarch64.strbRegImm(self.buf, src, .x16, 0);
+        }
+    }
+
+    /// Compute dest = sp + offset, handling large offsets
+    fn addSpOffset(self: *CodeGen, dest: aarch64.Reg, offset: u32) !void {
+        if (offset <= 4095) {
+            try aarch64.addRegImm12(self.buf, dest, .sp, @intCast(offset));
+        } else {
+            try aarch64.movRegImm64(self.buf, .x16, offset);
+            try aarch64.addRegReg(self.buf, dest, .sp, .x16);
         }
     }
 
@@ -607,7 +676,7 @@ pub const CodeGen = struct {
                     }
                 },
                 .stack => |offset| {
-                    try aarch64.ldrRegImm(self.buf, .x9, .sp, offset);
+                    try self.ldrSpOffset(.x9, offset);
                     try aarch64.addRegReg(self.buf, .x0, .x0, .x9);
                 },
                 else => {},
@@ -647,7 +716,7 @@ pub const CodeGen = struct {
                     }
                 },
                 .stack => |offset| {
-                    try aarch64.ldrRegImm(self.buf, .x9, .sp, offset);
+                    try self.ldrSpOffset(.x9, offset);
                     try aarch64.subRegReg(self.buf, .x0, .x0, .x9);
                 },
                 else => {},
@@ -677,7 +746,7 @@ pub const CodeGen = struct {
                     try aarch64.mulRegReg(self.buf, .x0, .x0, src);
                 },
                 .stack => |offset| {
-                    try aarch64.ldrRegImm(self.buf, .x9, .sp, offset);
+                    try self.ldrSpOffset(.x9, offset);
                     try aarch64.mulRegReg(self.buf, .x0, .x0, .x9);
                 },
                 .immediate => |imm| {
@@ -770,12 +839,12 @@ pub const CodeGen = struct {
             1 => {
                 // Use sign-extending load for signed types (i8)
                 if (self.type_reg.isSigned(value.type_idx)) {
-                    try aarch64.ldrsbRegImm(self.buf, dest, .sp, sp_offset);
+                    try self.ldrsbSpOffset(dest, sp_offset);
                 } else {
-                    try aarch64.ldrbRegImm(self.buf, dest, .sp, sp_offset);
+                    try self.ldrbSpOffset(dest, sp_offset);
                 }
             },
-            else => try aarch64.ldrRegImm(self.buf, dest, .sp, sp_offset),
+            else => try self.ldrSpOffset(dest, sp_offset),
         }
 
         try self.setResult(value.id, .{ .register = dest });
@@ -805,9 +874,9 @@ pub const CodeGen = struct {
             src_value.op == .slice_make or src_value.op == .str_concat)
         {
             // Store 16-byte value: ptr/tag at offset, len/payload at offset+8
-            try aarch64.strRegImm(self.buf, .x0, .sp, sp_offset);
+            try self.strSpOffset(.x0, sp_offset);
             const sp_offset_plus8 = convertOffset(total_offset + 8, self.stack_size);
-            try aarch64.strRegImm(self.buf, .x1, .sp, sp_offset_plus8);
+            try self.strSpOffset(.x1, sp_offset_plus8);
             return;
         }
 
@@ -821,22 +890,22 @@ pub const CodeGen = struct {
                     // Load length to x1
                     try aarch64.movRegImm64(self.buf, .x1, @intCast(sym.len));
                     // Store both
-                    try aarch64.strRegImm(self.buf, .x0, .sp, sp_offset);
+                    try self.strSpOffset(.x0, sp_offset);
                     const sp_offset_plus8 = convertOffset(total_offset + 8, self.stack_size);
-                    try aarch64.strRegImm(self.buf, .x1, .sp, sp_offset_plus8);
+                    try self.strSpOffset(.x1, sp_offset_plus8);
                 },
                 .stack => |offset| {
                     // Slice on stack (from call or select) - copy both parts
-                    try aarch64.ldrRegImm(self.buf, .x0, .sp, offset);
-                    try aarch64.ldrRegImm(self.buf, .x1, .sp, offset + 8);
-                    try aarch64.strRegImm(self.buf, .x0, .sp, sp_offset);
+                    try self.ldrSpOffset(.x0, offset);
+                    try self.ldrSpOffset(.x1, offset + 8);
+                    try self.strSpOffset(.x0, sp_offset);
                     const sp_offset_plus8 = convertOffset(total_offset + 8, self.stack_size);
-                    try aarch64.strRegImm(self.buf, .x1, .sp, sp_offset_plus8);
+                    try self.strSpOffset(.x1, sp_offset_plus8);
                 },
                 else => {
                     // Fallback - shouldn't happen but handle it
                     try self.loadToReg(.x0, src_mcv);
-                    try aarch64.strRegImm(self.buf, .x0, .sp, sp_offset);
+                    try self.strSpOffset(.x0, sp_offset);
                 },
             }
             return;
@@ -851,18 +920,18 @@ pub const CodeGen = struct {
                 // Large union on stack - copy to destination
                 var copied: u32 = 0;
                 while (copied < union_size) {
-                    const src_off = src_mcv.stack + @as(u12, @intCast(copied));
+                    const src_off = src_mcv.stack + copied;
                     const dst_off = convertOffset(total_offset + @as(i32, @intCast(copied)), self.stack_size);
-                    try aarch64.ldrRegImm(self.buf, scratch0, .sp, src_off);
-                    try aarch64.strRegImm(self.buf, scratch0, .sp, dst_off);
+                    try self.ldrSpOffset(scratch0, src_off);
+                    try self.strSpOffset(scratch0, dst_off);
                     copied += 8;
                 }
                 return;
             } else {
                 // Small union in registers (x0=tag, x1=payload)
-                try aarch64.strRegImm(self.buf, .x0, .sp, sp_offset);
+                try self.strSpOffset(.x0, sp_offset);
                 const sp_offset_plus8 = convertOffset(total_offset + 8, self.stack_size);
-                try aarch64.strRegImm(self.buf, .x1, .sp, sp_offset_plus8);
+                try self.strSpOffset(.x1, sp_offset_plus8);
                 return;
             }
         }
@@ -880,10 +949,10 @@ pub const CodeGen = struct {
                     var copied: u32 = 0;
                     while (copied < ret_size) {
                         // Load from result location
-                        try aarch64.ldrRegImm(self.buf, scratch0, .sp, src_stack_offset + @as(u12, @intCast(copied)));
+                        try self.ldrSpOffset(scratch0, src_stack_offset + copied);
                         // Store to destination local
                         const dst_offset = convertOffset(total_offset + @as(i32, @intCast(copied)), self.stack_size);
-                        try aarch64.strRegImm(self.buf, scratch0, .sp, dst_offset);
+                        try self.strSpOffset(scratch0, dst_offset);
                         copied += 8;
                     }
                     return;
@@ -902,10 +971,10 @@ pub const CodeGen = struct {
                     var copied: u32 = 0;
                     while (copied < elem_size) {
                         // Load from spill location
-                        try aarch64.ldrRegImm(self.buf, scratch0, .sp, src_stack_offset + @as(u12, @intCast(copied)));
+                        try self.ldrSpOffset(scratch0, src_stack_offset + copied);
                         // Store to destination local
                         const dst_offset = convertOffset(total_offset + @as(i32, @intCast(copied)), self.stack_size);
-                        try aarch64.strRegImm(self.buf, scratch0, .sp, dst_offset);
+                        try self.strSpOffset(scratch0, dst_offset);
                         copied += 8;
                     }
                     return;
@@ -928,16 +997,16 @@ pub const CodeGen = struct {
             .register => |reg| {
                 // Value is in a register - store it
                 switch (size) {
-                    1 => try aarch64.strbRegImm(self.buf, reg, .sp, sp_offset),
-                    else => try aarch64.strRegImm(self.buf, reg, .sp, sp_offset),
+                    1 => try self.strbSpOffset(reg, sp_offset),
+                    else => try self.strSpOffset(reg, sp_offset),
                 }
             },
             .immediate => |imm| {
                 // Value is an immediate - load to scratch then store
                 try aarch64.movRegImm64(self.buf, scratch0, imm);
                 switch (size) {
-                    1 => try aarch64.strbRegImm(self.buf, scratch0, .sp, sp_offset),
-                    else => try aarch64.strRegImm(self.buf, scratch0, .sp, sp_offset),
+                    1 => try self.strbSpOffset(scratch0, sp_offset),
+                    else => try self.strSpOffset(scratch0, sp_offset),
                 }
             },
             .stack => |src_stack_offset| {
@@ -946,18 +1015,18 @@ pub const CodeGen = struct {
                     // Large value: copy all bytes (8 bytes at a time)
                     var copied: u32 = 0;
                     while (copied < size) {
-                        const src_off = src_stack_offset + @as(u12, @intCast(copied));
+                        const src_off = src_stack_offset + copied;
                         const dst_off = convertOffset(total_offset + @as(i32, @intCast(copied)), self.stack_size);
-                        try aarch64.ldrRegImm(self.buf, scratch0, .sp, src_off);
-                        try aarch64.strRegImm(self.buf, scratch0, .sp, dst_off);
+                        try self.ldrSpOffset(scratch0, src_off);
+                        try self.strSpOffset(scratch0, dst_off);
                         copied += 8;
                     }
                 } else {
                     // Small value: single load/store
-                    try aarch64.ldrRegImm(self.buf, scratch0, .sp, src_stack_offset);
+                    try self.ldrSpOffset(scratch0, src_stack_offset);
                     switch (size) {
-                        1 => try aarch64.strbRegImm(self.buf, scratch0, .sp, sp_offset),
-                        else => try aarch64.strRegImm(self.buf, scratch0, .sp, sp_offset),
+                        1 => try self.strbSpOffset(scratch0, sp_offset),
+                        else => try self.strSpOffset(scratch0, sp_offset),
                     }
                 }
             },
@@ -965,8 +1034,8 @@ pub const CodeGen = struct {
                 // No tracked value - operation may have left result in x0
                 // This is the fallback for ops that don't set MCValue
                 switch (size) {
-                    1 => try aarch64.strbRegImm(self.buf, .x0, .sp, sp_offset),
-                    else => try aarch64.strRegImm(self.buf, .x0, .sp, sp_offset),
+                    1 => try self.strbSpOffset(.x0, sp_offset),
+                    else => try self.strSpOffset(.x0, sp_offset),
                 }
             },
             else => {},
@@ -1065,8 +1134,8 @@ pub const CodeGen = struct {
             const mcv = self.getValue(val.id);
             if (mcv == .stack) {
                 const offset = mcv.stack;
-                try aarch64.ldrRegImm(self.buf, ptr_reg, .sp, @intCast(offset));
-                try aarch64.ldrRegImm(self.buf, len_reg, .sp, @intCast(offset + 8));
+                try self.ldrSpOffset(ptr_reg, offset);
+                try self.ldrSpOffset(len_reg, offset + 8);
                 return;
             }
         }
@@ -1079,8 +1148,8 @@ pub const CodeGen = struct {
                 const local = self.func.locals[local_idx];
                 const sp_offset = convertOffset(local.offset, self.stack_size);
                 // Slice on stack: ptr at offset, len at offset+8
-                try aarch64.ldrRegImm(self.buf, ptr_reg, .sp, sp_offset);
-                try aarch64.ldrRegImm(self.buf, len_reg, .sp, sp_offset + 8);
+                try self.ldrSpOffset(ptr_reg, sp_offset);
+                try self.ldrSpOffset(len_reg, sp_offset + 8);
                 return;
             }
         }
@@ -1097,8 +1166,8 @@ pub const CodeGen = struct {
                 try aarch64.movRegImm64(self.buf, len_reg, 0);
             },
             .stack => |offset| {
-                try aarch64.ldrRegImm(self.buf, ptr_reg, .sp, @intCast(offset));
-                try aarch64.ldrRegImm(self.buf, len_reg, .sp, @intCast(offset + 8));
+                try self.ldrSpOffset(ptr_reg, offset);
+                try self.ldrSpOffset(len_reg, offset + 8);
             },
             else => {
                 try aarch64.movRegImm64(self.buf, ptr_reg, 0);
@@ -1117,11 +1186,11 @@ pub const CodeGen = struct {
         const ret_class = classifyType(self.type_reg, value.type_idx);
 
         // If large return (by_pointer), allocate temp space and set x8
-        var large_result_offset: u12 = 0;
+        var large_result_offset: u32 = 0;
         if (ret_class == .by_pointer) {
             const ret_size = self.type_reg.sizeOf(value.type_idx);
             large_result_offset = self.next_spill_offset;
-            try aarch64.addRegImm12(self.buf, .x8, .sp, large_result_offset);
+            try self.addSpOffset(.x8, large_result_offset);
             self.next_spill_offset += @intCast(alignTo(ret_size, 8));
         }
 
@@ -1156,7 +1225,7 @@ pub const CodeGen = struct {
                 // This argument is in x0 but should go to a later register
                 // Save x0 to stack before we clobber it with arg0
                 if (!saved_x0) {
-                    try aarch64.strRegImm(self.buf, .x0, .sp, saved_x0_offset);
+                    try self.strSpOffset(.x0, saved_x0_offset);
                     self.next_spill_offset += 8;
                     saved_x0 = true;
                 }
@@ -1180,7 +1249,7 @@ pub const CodeGen = struct {
                     const arg_mcv = self.getValue(arg_id);
                     if (arg_mcv == .stack) {
                         // Value is on spill stack - pass pointer to that location
-                        try aarch64.addRegImm12(self.buf, arg_regs[reg_idx], .sp, arg_mcv.stack);
+                        try self.addSpOffset(arg_regs[reg_idx], arg_mcv.stack);
                     } else {
                         // Fallback: try to pass pointer to local
                         const arg_val_args = arg_val.args();
@@ -1188,7 +1257,7 @@ pub const CodeGen = struct {
                             const local_idx: u32 = @intCast(arg_val_args[0]);
                             const local = self.func.locals[local_idx];
                             const sp_offset = convertOffset(local.offset, self.stack_size);
-                            try aarch64.addRegImm12(self.buf, arg_regs[reg_idx], .sp, sp_offset);
+                            try self.addSpOffset(arg_regs[reg_idx], sp_offset);
                         }
                     }
                     reg_idx += 1;
@@ -1197,8 +1266,8 @@ pub const CodeGen = struct {
                     // Medium type: pass in 2 registers
                     const arg_mcv = self.getValue(arg_id);
                     if (arg_mcv == .stack) {
-                        try aarch64.ldrRegImm(self.buf, arg_regs[reg_idx], .sp, arg_mcv.stack);
-                        try aarch64.ldrRegImm(self.buf, arg_regs[reg_idx + 1], .sp, arg_mcv.stack + 8);
+                        try self.ldrSpOffset(arg_regs[reg_idx], arg_mcv.stack);
+                        try self.ldrSpOffset(arg_regs[reg_idx + 1], arg_mcv.stack + 8);
                     } else {
                         try self.loadToReg(arg_regs[reg_idx], arg_mcv);
                     }
@@ -1234,8 +1303,8 @@ pub const CodeGen = struct {
                 // Medium struct returned in x0+x1 - spill to stack
                 const ret_size = self.type_reg.sizeOf(value.type_idx);
                 const result_offset = self.next_spill_offset;
-                try aarch64.strRegImm(self.buf, .x0, .sp, result_offset);
-                try aarch64.strRegImm(self.buf, .x1, .sp, result_offset + 8);
+                try self.strSpOffset(.x0, result_offset);
+                try self.strSpOffset(.x1, result_offset + 8);
                 self.next_spill_offset += @intCast(alignTo(ret_size, 8));
                 try self.setResult(value.id, .{ .stack = result_offset });
             },
@@ -1246,8 +1315,8 @@ pub const CodeGen = struct {
             .slice => {
                 // Slice returned in x0+x1 - spill to stack so both parts are tracked
                 const result_offset = self.next_spill_offset;
-                try aarch64.strRegImm(self.buf, .x0, .sp, result_offset);
-                try aarch64.strRegImm(self.buf, .x1, .sp, result_offset + 8);
+                try self.strSpOffset(.x0, result_offset);
+                try self.strSpOffset(.x1, result_offset + 8);
                 self.next_spill_offset += 16;
                 try self.setResult(value.id, .{ .stack = result_offset });
             },
@@ -1278,9 +1347,9 @@ pub const CodeGen = struct {
         const dest: aarch64.Reg = .x0;
 
         if (size == 1) {
-            try aarch64.ldrbRegImm(self.buf, dest, .sp, sp_offset);
+            try self.ldrbSpOffset(dest, sp_offset);
         } else {
-            try aarch64.ldrRegImm(self.buf, dest, .sp, sp_offset);
+            try self.ldrSpOffset(dest, sp_offset);
         }
 
         self.reg_manager.markUsed(.x0, value.id);
@@ -1314,7 +1383,7 @@ pub const CodeGen = struct {
             },
             .stack => |stack_offset| {
                 // Base is on stack - load address first, then load field
-                try aarch64.ldrRegImm(self.buf, .x8, .sp, stack_offset);
+                try self.ldrSpOffset(.x8, stack_offset);
                 const field_scaled: u12 = @intCast(@divExact(@as(u32, @intCast(field_offset)), 8));
                 if (size == 1) {
                     try aarch64.ldrbRegImm(self.buf, dest, .x8, @intCast(field_offset));
@@ -1407,8 +1476,8 @@ pub const CodeGen = struct {
             switch (true_mcv) {
                 .stack => |offset| {
                     // Offset is already sp-relative (from spill slots)
-                    try aarch64.ldrRegImm(self.buf, .x16, .sp, offset);
-                    try aarch64.ldrRegImm(self.buf, .x17, .sp, offset + 8);
+                    try self.ldrSpOffset(.x16, offset);
+                    try self.ldrSpOffset(.x17, offset + 8);
                 },
                 .lea_symbol => |sym| {
                     try aarch64.loadSymbolAddr(self.buf, .x16, sym.name);
@@ -1424,8 +1493,8 @@ pub const CodeGen = struct {
             switch (false_mcv) {
                 .stack => |offset| {
                     // Offset is already sp-relative (from spill slots)
-                    try aarch64.ldrRegImm(self.buf, .x10, .sp, offset);
-                    try aarch64.ldrRegImm(self.buf, .x11, .sp, offset + 8);
+                    try self.ldrSpOffset(.x10, offset);
+                    try self.ldrSpOffset(.x11, offset + 8);
                 },
                 .lea_symbol => |sym| {
                     try aarch64.loadSymbolAddr(self.buf, .x10, sym.name);
@@ -1445,8 +1514,8 @@ pub const CodeGen = struct {
             try aarch64.csel(self.buf, .x17, .x17, .x11, .ne);
 
             // Store result to stack
-            try aarch64.strRegImm(self.buf, .x16, .sp, result_offset);
-            try aarch64.strRegImm(self.buf, .x17, .sp, result_offset + 8);
+            try self.strSpOffset(.x16, result_offset);
+            try self.strSpOffset(.x17, result_offset + 8);
 
             self.freeDeadOperands(value);
             try self.setResult(value.id, .{ .stack = result_offset });
@@ -1533,7 +1602,7 @@ pub const CodeGen = struct {
             .stack => |stack_offset| {
                 // Slice is on stack: ptr at stack_offset, len at stack_offset+8
                 // Load ptr into x8
-                try aarch64.ldrRegImm(self.buf, .x8, .sp, stack_offset);
+                try self.ldrSpOffset(.x8, stack_offset);
                 // Add index offset: x8 = x8 + x9
                 try aarch64.addRegReg(self.buf, .x8, .x8, .x9);
                 // Load from [x8] -> x0
@@ -1577,7 +1646,7 @@ pub const CodeGen = struct {
         const dest = try self.allocReg(value.id);
 
         // ADD dest, sp, #offset
-        try aarch64.addRegImm12(self.buf, dest, .sp, sp_offset);
+        try self.addSpOffset(dest, sp_offset);
 
         try self.setResult(value.id, .{ .register = dest });
     }
@@ -1602,10 +1671,10 @@ pub const CodeGen = struct {
         // Check if source is a string/slice (16 bytes = ptr+len) or array (inline data)
         if (local_size == 16) {
             // String/slice: load the ptr from local into x8
-            try aarch64.ldrRegImm(self.buf, .x8, .sp, base_sp);
+            try self.ldrSpOffset(.x8, base_sp);
         } else {
             // Array: base address is the stack location itself
-            try aarch64.addRegImm12(self.buf, .x8, .sp, @intCast(base_sp));
+            try self.addSpOffset(.x8, base_sp);
         }
 
         // Get start value into x9
@@ -1642,7 +1711,7 @@ pub const CodeGen = struct {
         switch (base_mcv) {
             .stack => |stack_offset| {
                 // Slice is on stack: ptr at stack_offset
-                try aarch64.ldrRegImm(self.buf, .x8, .sp, stack_offset);
+                try self.ldrSpOffset(.x8, stack_offset);
             },
             .register => |reg| {
                 // Base ptr is in a register
@@ -1691,7 +1760,7 @@ pub const CodeGen = struct {
         const idx_mcv = self.getValue(args[1]);
 
         // Load slice ptr from local (first 8 bytes of slice) into x8
-        try aarch64.ldrRegImm(self.buf, .x8, .sp, sp_offset);
+        try self.ldrSpOffset(.x8, sp_offset);
 
         // Get index value into x9
         try self.loadToReg(.x9, idx_mcv);
@@ -1728,7 +1797,7 @@ pub const CodeGen = struct {
         const maybe_local_or_ssa = args[0];
 
         // Determine source offset for the union tag
-        var src_offset: ?u12 = null;
+        var src_offset: ?u32 = null;
 
         // If args[0] is an SSA value, check its MCValue location
         if (maybe_local_or_ssa < self.func.values.items.len) {
@@ -1760,14 +1829,14 @@ pub const CodeGen = struct {
 
         if (src_offset) |offset| {
             // Load tag into x0
-            try aarch64.ldrRegImm(self.buf, .x0, .sp, offset);
+            try self.ldrSpOffset(.x0, offset);
 
             // CRITICAL: Immediately spill to stack to ensure consistent location
             // across all control flow paths. This prevents corruption when
             // genUnionPayload in another branch calls spillReg(x0).
             const spill_offset = self.next_spill_offset;
             self.next_spill_offset += 8;
-            try aarch64.strRegImm(self.buf, .x0, .sp, spill_offset);
+            try self.strSpOffset(.x0, spill_offset);
 
             // Record result as stack location (not register)
             try self.setResult(value.id, .{ .stack = spill_offset });
@@ -1806,7 +1875,7 @@ pub const CodeGen = struct {
                     return;
                 }
 
-                try aarch64.ldrRegImm(self.buf, .x0, .sp, payload_offset);
+                try self.ldrSpOffset(.x0, payload_offset);
                 self.reg_manager.markUsed(.x0, value.id);
                 try self.setResult(value.id, .{ .register = .x0 });
                 return;
@@ -1828,7 +1897,7 @@ pub const CodeGen = struct {
                     }
 
                     // Load payload into x0
-                    try aarch64.ldrRegImm(self.buf, .x0, .sp, payload_offset);
+                    try self.ldrSpOffset(.x0, payload_offset);
                     self.reg_manager.markUsed(.x0, value.id);
                     try self.setResult(value.id, .{ .register = .x0 });
                     return;
@@ -1848,7 +1917,7 @@ pub const CodeGen = struct {
                 return;
             }
 
-            try aarch64.ldrRegImm(self.buf, .x0, .sp, payload_offset);
+            try self.ldrSpOffset(.x0, payload_offset);
             self.reg_manager.markUsed(.x0, value.id);
             try self.setResult(value.id, .{ .register = .x0 });
         }
@@ -1872,7 +1941,7 @@ pub const CodeGen = struct {
 
             // Store tag at offset 0
             try aarch64.movRegImm64(self.buf, scratch0, variant_idx);
-            try aarch64.strRegImm(self.buf, scratch0, .sp, dest_offset);
+            try self.strSpOffset(scratch0, dest_offset);
 
             // If there's a payload, copy it to offset 8
             if (args.len > 0) {
@@ -1884,19 +1953,19 @@ pub const CodeGen = struct {
                     // Payload is on stack - copy it
                     var copied: u32 = 0;
                     while (copied < payload_size) {
-                        const src_off = payload_mcv.stack + @as(u12, @intCast(copied));
-                        const dst_off = dest_offset + 8 + @as(u12, @intCast(copied));
-                        try aarch64.ldrRegImm(self.buf, scratch0, .sp, src_off);
-                        try aarch64.strRegImm(self.buf, scratch0, .sp, dst_off);
+                        const src_off = payload_mcv.stack + copied;
+                        const dst_off = dest_offset + 8 + copied;
+                        try self.ldrSpOffset(scratch0, src_off);
+                        try self.strSpOffset(scratch0, dst_off);
                         copied += 8;
                     }
                 } else if (payload_val.op == .const_int) {
                     // Constant payload - store directly
                     try aarch64.movRegImm64(self.buf, scratch0, payload_val.aux_int);
-                    try aarch64.strRegImm(self.buf, scratch0, .sp, dest_offset + 8);
+                    try self.strSpOffset(scratch0, dest_offset + 8);
                 } else if (payload_mcv == .register) {
                     // Payload in a register (small value)
-                    try aarch64.strRegImm(self.buf, payload_mcv.register, .sp, dest_offset + 8);
+                    try self.strSpOffset(payload_mcv.register, dest_offset + 8);
                 }
             }
 
@@ -1970,8 +2039,8 @@ pub const CodeGen = struct {
                 // Load 8 bytes from source pointer
                 try aarch64.ldrRegImm(self.buf, scratch0, .x0, @intCast(copied));
                 // Store to stack
-                const stack_off = dest_offset + @as(u12, @intCast(copied));
-                try aarch64.strRegImm(self.buf, scratch0, .sp, stack_off);
+                const stack_off = dest_offset + copied;
+                try self.strSpOffset(scratch0, stack_off);
                 copied += 8;
             }
 
@@ -2046,7 +2115,7 @@ pub const CodeGen = struct {
         const dest = try self.allocReg(value.id);
 
         // Load from the parameter's local slot
-        try aarch64.ldrRegImm(self.buf, dest, .sp, sp_offset);
+        try self.ldrSpOffset(dest, sp_offset);
 
         try self.setResult(value.id, .{ .register = dest });
     }
@@ -2215,7 +2284,7 @@ pub const CodeGen = struct {
                 .stack => |stack_offset| {
                     // Value already on stack - use its address directly
                     try self.loadToReg(.x0, handle_mcv);
-                    try aarch64.addRegImm12(self.buf, .x1, .sp, stack_offset);
+                    try self.addSpOffset(.x1, stack_offset);
                 },
                 .register => |reg| {
                     // Value in single register - need to copy to stack first
@@ -2225,21 +2294,21 @@ pub const CodeGen = struct {
 
                     // For 16-byte unions, tag in x0, payload in x1
                     if (elem_size > 8 and elem_size <= 16 and value_ssa.op == .union_init) {
-                        try aarch64.strRegImm(self.buf, .x0, .sp, temp_offset);
-                        try aarch64.strRegImm(self.buf, .x1, .sp, temp_offset + 8);
+                        try self.strSpOffset(.x0, temp_offset);
+                        try self.strSpOffset(.x1, temp_offset + 8);
                     } else {
-                        try aarch64.strRegImm(self.buf, reg, .sp, temp_offset);
+                        try self.strSpOffset(reg, temp_offset);
                     }
 
                     try self.loadToReg(.x0, handle_mcv);
-                    try aarch64.addRegImm12(self.buf, .x1, .sp, temp_offset);
+                    try self.addSpOffset(.x1, temp_offset);
                 },
                 else => {
                     // Unknown location - allocate temp and try to copy
                     const temp_offset = self.next_spill_offset;
                     self.next_spill_offset +|= @intCast(alignTo(elem_size, 8));
                     try self.loadToReg(.x0, handle_mcv);
-                    try aarch64.addRegImm12(self.buf, .x1, .sp, temp_offset);
+                    try self.addSpOffset(.x1, temp_offset);
                 },
             }
         }
@@ -2300,8 +2369,8 @@ pub const CodeGen = struct {
         // Save to a temp slot so other ops don't clobber it
         const temp_offset = self.next_spill_offset;
         self.next_spill_offset +|= 16; // 16 bytes for ptr+len
-        try aarch64.strRegImm(self.buf, .x0, .sp, temp_offset);
-        try aarch64.strRegImm(self.buf, .x1, .sp, temp_offset + 8);
+        try self.strSpOffset(.x0, temp_offset);
+        try self.strSpOffset(.x1, temp_offset + 8);
 
         // Track result as stack location
         try self.setResult(value.id, .{ .stack = temp_offset });
@@ -2319,7 +2388,7 @@ pub const CodeGen = struct {
             if (local_idx < self.func.locals.len) {
                 const local = self.func.locals[@intCast(local_idx)];
                 const sp_offset = convertOffset(local.offset, self.stack_size);
-                try aarch64.addRegImm12(self.buf, dest, .sp, sp_offset);
+                try self.addSpOffset(dest, sp_offset);
             }
         } else {
             // Just return current stack pointer as address
@@ -2353,15 +2422,15 @@ pub const CodeGen = struct {
             const dest = try self.allocReg(value.id);
             const size = self.type_reg.sizeOf(value.type_idx);
             if (size == 1) {
-                try aarch64.ldrbRegImm(self.buf, dest, .sp, sp_offset);
+                try self.ldrbSpOffset(dest, sp_offset);
             } else {
-                try aarch64.ldrRegImm(self.buf, dest, .sp, sp_offset);
+                try self.ldrSpOffset(dest, sp_offset);
             }
             try self.setResult(value.id, .{ .register = dest });
         } else {
             // Local is a pointer, dereference to access field
             const sp_offset = convertOffset(local.offset, self.stack_size);
-            try aarch64.ldrRegImm(self.buf, scratch0, .sp, sp_offset);
+            try self.ldrSpOffset(scratch0, sp_offset);
 
             const dest = try self.allocReg(value.id);
             try aarch64.ldrRegImm(self.buf, dest, scratch0, field_offset);
@@ -2385,8 +2454,8 @@ pub const CodeGen = struct {
                         // Result is in a spill slot - copy from there
                         var copied: u32 = 0;
                         while (copied < struct_size) {
-                            const src_offset = ret_mcv.stack + @as(u12, @intCast(copied));
-                            try aarch64.ldrRegImm(self.buf, scratch0, .sp, src_offset);
+                            const src_offset = ret_mcv.stack + copied;
+                            try self.ldrSpOffset(scratch0, src_offset);
                             try aarch64.strRegImm(self.buf, scratch0, .x19, @intCast(copied));
                             copied += 8;
                         }
@@ -2399,7 +2468,7 @@ pub const CodeGen = struct {
                             var copied: u32 = 0;
                             while (copied < struct_size) {
                                 const src_offset = convertOffset(local.offset + @as(i32, @intCast(copied)), self.stack_size);
-                                try aarch64.ldrRegImm(self.buf, scratch0, .sp, src_offset);
+                                try self.ldrSpOffset(scratch0, src_offset);
                                 try aarch64.strRegImm(self.buf, scratch0, .x19, @intCast(copied));
                                 copied += 8;
                             }
@@ -2411,8 +2480,8 @@ pub const CodeGen = struct {
                     // Use getValue to handle any MCValue (local, spill slot, etc.)
                     const ret_mcv = self.getValue(block.control);
                     if (ret_mcv == .stack) {
-                        try aarch64.ldrRegImm(self.buf, .x0, .sp, ret_mcv.stack);
-                        try aarch64.ldrRegImm(self.buf, .x1, .sp, ret_mcv.stack + 8);
+                        try self.ldrSpOffset(.x0, ret_mcv.stack);
+                        try self.ldrSpOffset(.x1, ret_mcv.stack + 8);
                     } else {
                         // Fallback: try to load from local if available
                         const args = ret_val.args();
@@ -2420,9 +2489,9 @@ pub const CodeGen = struct {
                             const local_idx: u32 = @intCast(args[0]);
                             const local = self.func.locals[local_idx];
                             const sp_offset = convertOffset(local.offset, self.stack_size);
-                            try aarch64.ldrRegImm(self.buf, .x0, .sp, sp_offset);
+                            try self.ldrSpOffset(.x0, sp_offset);
                             const sp_offset_plus8 = convertOffset(local.offset + 8, self.stack_size);
-                            try aarch64.ldrRegImm(self.buf, .x1, .sp, sp_offset_plus8);
+                            try self.ldrSpOffset(.x1, sp_offset_plus8);
                         }
                     }
                 },
@@ -2438,8 +2507,8 @@ pub const CodeGen = struct {
                         .stack => |offset| {
                             // Offset is already sp-relative (from spill during select/call)
                             // Don't use convertOffset - it expects fp-relative negative offsets
-                            try aarch64.ldrRegImm(self.buf, .x0, .sp, offset);
-                            try aarch64.ldrRegImm(self.buf, .x1, .sp, offset + 8);
+                            try self.ldrSpOffset(.x0, offset);
+                            try self.ldrSpOffset(.x1, offset + 8);
                         },
                         .register => |reg| {
                             // Slice in register means it's already in x0/x1 (or needs move)
@@ -2627,17 +2696,24 @@ pub const CodeGen = struct {
                     var copied: u32 = 0;
                     while (copied < param_size) {
                         const dst_offset = convertOffset(local.offset + @as(i32, @intCast(copied)), self.stack_size);
-                        try aarch64.ldrRegImm(self.buf, scratch0, src_addr, @intCast(copied));
-                        try aarch64.strRegImm(self.buf, scratch0, .sp, dst_offset);
+                        // Load from src_addr (small offset OK since it's from start of struct)
+                        if (copied <= 4095) {
+                            try aarch64.ldrRegImm(self.buf, scratch0, src_addr, @intCast(copied));
+                        } else {
+                            try aarch64.movRegImm64(self.buf, .x17, copied);
+                            try aarch64.addRegReg(self.buf, .x17, src_addr, .x17);
+                            try aarch64.ldrRegImm(self.buf, scratch0, .x17, 0);
+                        }
+                        try self.strSpOffset(scratch0, dst_offset);
                         copied += 8;
                     }
                     reg_idx += 1;
                 },
                 .double_reg, .slice => {
                     // Medium type or slice: 2 registers
-                    try aarch64.strRegImm(self.buf, param_regs[reg_idx], .sp, sp_offset);
+                    try self.strSpOffset(param_regs[reg_idx], sp_offset);
                     const sp_offset_plus8 = convertOffset(local.offset + 8, self.stack_size);
-                    try aarch64.strRegImm(self.buf, param_regs[reg_idx + 1], .sp, sp_offset_plus8);
+                    try self.strSpOffset(param_regs[reg_idx + 1], sp_offset_plus8);
                     reg_idx += 2;
                 },
                 .single_reg => {
@@ -2645,9 +2721,9 @@ pub const CodeGen = struct {
                     // Use appropriate store size based on type
                     const param_size = self.type_reg.sizeOf(local.type_idx);
                     if (param_size == 1) {
-                        try aarch64.strbRegImm(self.buf, param_regs[reg_idx], .sp, sp_offset);
+                        try self.strbSpOffset(param_regs[reg_idx], sp_offset);
                     } else {
-                        try aarch64.strRegImm(self.buf, param_regs[reg_idx], .sp, sp_offset);
+                        try self.strSpOffset(param_regs[reg_idx], sp_offset);
                     }
                     reg_idx += 1;
                 },
@@ -2665,13 +2741,17 @@ fn alignTo(value: u32, alignment: u32) u32 {
 }
 
 /// Convert rbp-relative offset (negative) to sp-relative offset (positive)
-/// Returns u12 for use with ARM64 load/store unsigned offset
-fn convertOffset(rbp_offset: i32, stack_size: u32) u12 {
+/// Returns u32 for large stack frames
+fn convertOffset(rbp_offset: i32, stack_size: u32) u32 {
     // rbp points to saved fp/lr, locals are at negative offsets from rbp
     // sp is stack_size bytes below rbp
     // sp_offset = stack_size + rbp_offset (should be positive)
     const sp_offset = @as(i32, @intCast(stack_size)) + rbp_offset;
-    return @intCast(@as(u32, @intCast(sp_offset)));
+    if (sp_offset < 0) {
+        std.debug.print("convertOffset error: rbp_offset={d}, stack_size={d}, sp_offset={d}\n", .{ rbp_offset, stack_size, sp_offset });
+        @panic("negative sp_offset in convertOffset");
+    }
+    return @intCast(sp_offset);
 }
 
 // ============================================================================

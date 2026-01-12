@@ -1368,6 +1368,27 @@ pub const Lowerer = struct {
                                 }
                             }
                         }
+                        // Fallthrough: handle deeper nesting via general field access lowering
+                    }
+                    // General case: handle arbitrary depth field access chains
+                    // e.g., a.b.c.nodes.get() where nodes is a List
+                    // Get the type of the base expression (the list/map)
+                    if (self.checker.expr_types.get(fa.base)) |base_type_idx| {
+                        const base_type = self.type_reg.get(base_type_idx);
+                        if (base_type == .list_type) {
+                            // Lower the base expression to get the list handle
+                            const base_handle = try self.lowerExpr(fa.base);
+                            if (base_handle != ir.null_node) {
+                                log.debug("  deep field access list method call: .{s}", .{fa.field});
+                                return self.lowerListMethodCallWithHandle(call, fa.field, base_handle, base_type_idx);
+                            }
+                        } else if (base_type == .map_type) {
+                            const base_handle = try self.lowerExpr(fa.base);
+                            if (base_handle != ir.null_node) {
+                                log.debug("  deep field access map method call: .{s}", .{fa.field});
+                                return self.lowerMapMethodCallWithHandle(call, fa.field, base_handle, base_type_idx);
+                            }
+                        }
                     }
                 }
             }

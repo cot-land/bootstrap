@@ -1119,8 +1119,8 @@ pub const Parser = struct {
                     },
                 });
             },
-            // Type keywords as identifiers (for builtins like @maxInt(i8))
-            .kw_i8, .kw_i16, .kw_i32, .kw_i64, .kw_u8, .kw_u16, .kw_u32, .kw_u64 => {
+            // Type keywords as identifiers (for builtins like @maxInt(i8) or @maxInt(int))
+            .kw_i8, .kw_i16, .kw_i32, .kw_i64, .kw_u8, .kw_u16, .kw_u32, .kw_u64, .kw_int, .kw_float, .kw_bool, .kw_string, .kw_byte => {
                 const name = self.tok.tok.toString();
                 self.advance();
                 return try self.ast.addNode(.{

@@ -1,0 +1,2031 @@
+// Recursive descent parser for cot bootstrap.
+// Simplified version using only currently-supported features.
+//
+// Changes from original parser.zig:
+// - No imports (types inlined)
+// - No optional types - use null_node sentinel
+// - No error types - use error codes
+// - List<Node> for node storage (runtime FFI)
+// - Functional style - pass state to functions
+
+// =============================================================================
+// Inlined from source_boot.cot
+// =============================================================================
+
+struct Pos {
+    offset: int,
+}
+
+const zero_pos: Pos = Pos{ .offset = 0 }
+
+fn posFromOffset(offset: int) Pos {
+    return Pos{ .offset = offset }
+}
+
+struct Span {
+    start: Pos,
+    end: Pos,
+}
+
+fn spanInit(s: Pos, e: Pos) Span {
+    return Span{ .start = s, .end = e }
+}
+
+fn spanFromPos(p: Pos) Span {
+    return Span{ .start = p, .end = p }
+}
+
+// =============================================================================
+// Inlined Token enum
+// =============================================================================
+
+enum Token: u8 {
+    eof,
+    invalid,
+    identifier,
+    int_literal,
+    float_literal,
+    string_literal,
+    string_interp_start,
+    string_interp_mid,
+    string_interp_end,
+    char_literal,
+    plus,
+    minus,
+    star,
+    slash,
+    percent,
+    ampersand,
+    pipe,
+    caret,
+    tilde,
+    bang,
+    equal,
+    less,
+    greater,
+    dot,
+    question,
+    at,
+    plus_equal,
+    minus_equal,
+    star_equal,
+    slash_equal,
+    percent_equal,
+    ampersand_equal,
+    pipe_equal,
+    caret_equal,
+    equal_equal,
+    bang_equal,
+    less_equal,
+    greater_equal,
+    less_less,
+    greater_greater,
+    dot_dot,
+    dot_star,
+    dot_question,
+    question_question,
+    question_dot,
+    arrow,
+    fat_arrow,
+    lparen,
+    rparen,
+    lbracket,
+    rbracket,
+    lbrace,
+    rbrace,
+    comma,
+    colon,
+    semicolon,
+    kw_fn,
+    kw_var,
+    kw_let,
+    kw_const,
+    kw_struct,
+    kw_enum,
+    kw_union,
+    kw_type,
+    kw_if,
+    kw_else,
+    kw_switch,
+    kw_while,
+    kw_for,
+    kw_in,
+    kw_return,
+    kw_break,
+    kw_continue,
+    kw_defer,
+    kw_import,
+    kw_new,
+    kw_null,
+    kw_true,
+    kw_false,
+    kw_and,
+    kw_or,
+    kw_not,
+    kw_int,
+    kw_float,
+    kw_bool,
+    kw_string,
+    kw_byte,
+    kw_decimal,
+    kw_alpha,
+    kw_i8,
+    kw_i16,
+    kw_i32,
+    kw_i64,
+    kw_u8,
+    kw_u16,
+    kw_u32,
+    kw_u64,
+    kw_f32,
+    kw_f64,
+    kw_void,
+}
+
+// =============================================================================
+// Token precedence for binary expression parsing
+// =============================================================================
+
+fn tokenPrecedence(tok: Token) int {
+    return switch tok {
+        .kw_or => 1,
+        .kw_and => 2,
+        .equal_equal => 3,
+        .bang_equal => 3,
+        .less => 4,
+        .greater => 4,
+        .less_equal => 4,
+        .greater_equal => 4,
+        .plus => 5,
+        .minus => 5,
+        .star => 6,
+        .slash => 6,
+        .percent => 6,
+        else => 0,
+    }
+}
+
+fn tokenIsCompoundAssign(tok: Token) bool {
+    return switch tok {
+        .plus_equal => true,
+        .minus_equal => true,
+        .star_equal => true,
+        .slash_equal => true,
+        else => false,
+    }
+}
+
+// =============================================================================
+// Core Types
+// =============================================================================
+
+type NodeIndex = int
+const null_node: int = @maxInt(int)
+
+// =============================================================================
+// Scanner State (from scanner_boot.cot)
+// =============================================================================
+
+struct ScannerState {
+    content: string,
+    pos: int,
+    len: int,
+}
+
+struct TokenResult {
+    tok: Token,
+    start: int,
+    end: int,
+}
+
+// Forward declarations of scanner functions
+fn scannerInit(content: string) ScannerState {
+    return ScannerState{
+        .content = content,
+        .pos = 0,
+        .len = len(content),
+    }
+}
+
+fn skipWhitespace(state: ScannerState) int {
+    var pos: int = state.pos
+    while pos < state.len {
+        var c: u8 = state.content[pos]
+        if c == 32 or c == 9 or c == 10 or c == 13 {
+            pos = pos + 1
+        } else if c == 47 and pos + 1 < state.len {
+            var next: u8 = state.content[pos + 1]
+            if next == 47 {
+                pos = pos + 2
+                while pos < state.len and state.content[pos] != 10 {
+                    pos = pos + 1
+                }
+                if pos < state.len {
+                    pos = pos + 1
+                }
+            } else if next == 42 {
+                pos = pos + 2
+                while pos + 1 < state.len {
+                    if state.content[pos] == 42 and state.content[pos + 1] == 47 {
+                        pos = pos + 2
+                        break
+                    }
+                    pos = pos + 1
+                }
+            } else {
+                break
+            }
+        } else {
+            break
+        }
+    }
+    return pos
+}
+
+fn isAlpha(c: u8) bool {
+    return (c >= 97 and c <= 122) or (c >= 65 and c <= 90)
+}
+
+fn isDigit(c: u8) bool {
+    return c >= 48 and c <= 57
+}
+
+fn isAlphaNumeric(c: u8) bool {
+    return isAlpha(c) or isDigit(c)
+}
+
+fn lookupKeyword(name: string) Token {
+    if name == "fn" { return Token.kw_fn }
+    if name == "var" { return Token.kw_var }
+    if name == "let" { return Token.kw_let }
+    if name == "const" { return Token.kw_const }
+    if name == "struct" { return Token.kw_struct }
+    if name == "enum" { return Token.kw_enum }
+    if name == "union" { return Token.kw_union }
+    if name == "type" { return Token.kw_type }
+    if name == "if" { return Token.kw_if }
+    if name == "else" { return Token.kw_else }
+    if name == "switch" { return Token.kw_switch }
+    if name == "while" { return Token.kw_while }
+    if name == "for" { return Token.kw_for }
+    if name == "in" { return Token.kw_in }
+    if name == "return" { return Token.kw_return }
+    if name == "break" { return Token.kw_break }
+    if name == "continue" { return Token.kw_continue }
+    if name == "defer" { return Token.kw_defer }
+    if name == "import" { return Token.kw_import }
+    if name == "new" { return Token.kw_new }
+    if name == "null" { return Token.kw_null }
+    if name == "true" { return Token.kw_true }
+    if name == "false" { return Token.kw_false }
+    if name == "and" { return Token.kw_and }
+    if name == "or" { return Token.kw_or }
+    if name == "not" { return Token.kw_not }
+    if name == "int" { return Token.kw_int }
+    if name == "float" { return Token.kw_float }
+    if name == "bool" { return Token.kw_bool }
+    if name == "string" { return Token.kw_string }
+    if name == "byte" { return Token.kw_byte }
+    if name == "void" { return Token.kw_void }
+    if name == "i8" { return Token.kw_i8 }
+    if name == "i16" { return Token.kw_i16 }
+    if name == "i32" { return Token.kw_i32 }
+    if name == "i64" { return Token.kw_i64 }
+    if name == "u8" { return Token.kw_u8 }
+    if name == "u16" { return Token.kw_u16 }
+    if name == "u32" { return Token.kw_u32 }
+    if name == "u64" { return Token.kw_u64 }
+    if name == "f32" { return Token.kw_f32 }
+    if name == "f64" { return Token.kw_f64 }
+    return Token.invalid
+}
+
+// =============================================================================
+// AST Node Types (simplified from ast_boot.cot)
+// =============================================================================
+
+enum NodeTag: u8 {
+    // Literals
+    int_literal,
+    float_literal,
+    string_literal,
+    char_literal,
+    bool_literal,
+    null_literal,
+    identifier,
+
+    // Expressions
+    binary_expr,
+    unary_expr,
+    call_expr,
+    index_expr,
+    slice_expr,
+    field_access,
+    array_literal,
+    struct_init,
+    new_expr,
+    paren_expr,
+
+    // Statements
+    return_stmt,
+    var_stmt,
+    assign_stmt,
+    expr_stmt,
+    if_stmt,
+    while_stmt,
+    for_stmt,
+    block_stmt,
+    break_stmt,
+    continue_stmt,
+
+    // Declarations
+    fn_decl,
+    struct_decl,
+    enum_decl,
+    union_decl,
+    type_alias,
+
+    // Type expressions
+    type_named,
+    type_pointer,
+    type_optional,
+    type_slice,
+    type_array,
+
+    // Switch
+    switch_expr,
+    switch_case,
+
+    // Special
+    bad_node,
+}
+
+// Unified node structure
+struct Node {
+    tag: NodeTag,
+    // Data fields used depending on tag:
+    name: string,
+    text: string,
+    op: Token,
+    left: NodeIndex,
+    right: NodeIndex,
+    cond: NodeIndex,
+    body: NodeIndex,
+    else_body: NodeIndex,
+    type_expr: NodeIndex,
+    args: []NodeIndex,
+    span: Span,
+}
+
+fn makeNode(tag: NodeTag, span: Span) Node {
+    // Create node with default values
+    // Note: args field will be empty slice - we use a sentinel array
+    var sentinel_args: [1]NodeIndex = [null_node]
+    return Node{
+        .tag = tag,
+        .name = "",
+        .text = "",
+        .op = Token.invalid,
+        .left = null_node,
+        .right = null_node,
+        .cond = null_node,
+        .body = null_node,
+        .else_body = null_node,
+        .type_expr = null_node,
+        .args = sentinel_args[0:0],  // Empty slice from array
+        .span = span,
+    }
+}
+
+// =============================================================================
+// Parser State
+// =============================================================================
+
+struct ParserState {
+    content: string,
+    pos: int,
+    len: int,
+    tok: Token,
+    tok_start: int,
+    tok_end: int,
+    tok_text: string,
+    nodes: List<Node>,
+    error_count: int,
+}
+
+fn parserInit(content: string) ParserState {
+    var state: ParserState = ParserState{
+        .content = content,
+        .pos = 0,
+        .len = len(content),
+        .tok = Token.eof,
+        .tok_start = 0,
+        .tok_end = 0,
+        .tok_text = "",
+        .nodes = new List<Node>(),
+        .error_count = 0,
+    }
+    // Prime with first token
+    state = parserAdvance(state)
+    return state
+}
+
+fn parserAdvance(state: ParserState) ParserState {
+    var pos: int = skipWhitespace(ScannerState{
+        .content = state.content,
+        .pos = state.pos,
+        .len = state.len,
+    })
+
+    if pos >= state.len {
+        return ParserState{
+            .content = state.content,
+            .pos = pos,
+            .len = state.len,
+            .tok = Token.eof,
+            .tok_start = pos,
+            .tok_end = pos,
+            .tok_text = "",
+            .nodes = state.nodes,
+            .error_count = state.error_count,
+        }
+    }
+
+    var c: u8 = state.content[pos]
+    var start: int = pos
+    var end: int = pos + 1
+    var tok: Token = Token.invalid
+
+    // Identifier or keyword
+    if isAlpha(c) or c == 95 {
+        while end < state.len {
+            var nc: u8 = state.content[end]
+            if isAlphaNumeric(nc) or nc == 95 {
+                end = end + 1
+            } else {
+                break
+            }
+        }
+        var text: string = state.content[start:end]
+        tok = lookupKeyword(text)
+        if tok == Token.invalid {
+            tok = Token.identifier
+        }
+        return ParserState{
+            .content = state.content,
+            .pos = end,
+            .len = state.len,
+            .tok = tok,
+            .tok_start = start,
+            .tok_end = end,
+            .tok_text = text,
+            .nodes = state.nodes,
+            .error_count = state.error_count,
+        }
+    }
+
+    // Number
+    if isDigit(c) {
+        while end < state.len and (isDigit(state.content[end]) or state.content[end] == 95) {
+            end = end + 1
+        }
+        // Check for float
+        if end < state.len and state.content[end] == 46 {
+            if end + 1 < state.len and state.content[end + 1] != 46 {
+                end = end + 1
+                while end < state.len and (isDigit(state.content[end]) or state.content[end] == 95) {
+                    end = end + 1
+                }
+                tok = Token.float_literal
+            } else {
+                tok = Token.int_literal
+            }
+        } else {
+            tok = Token.int_literal
+        }
+        return ParserState{
+            .content = state.content,
+            .pos = end,
+            .len = state.len,
+            .tok = tok,
+            .tok_start = start,
+            .tok_end = end,
+            .tok_text = state.content[start:end],
+            .nodes = state.nodes,
+            .error_count = state.error_count,
+        }
+    }
+
+    // String
+    if c == 34 {
+        end = start + 1
+        while end < state.len {
+            var sc: u8 = state.content[end]
+            if sc == 34 {
+                end = end + 1
+                break
+            } else if sc == 92 {
+                end = end + 2
+            } else if sc == 10 {
+                break
+            } else {
+                end = end + 1
+            }
+        }
+        return ParserState{
+            .content = state.content,
+            .pos = end,
+            .len = state.len,
+            .tok = Token.string_literal,
+            .tok_start = start,
+            .tok_end = end,
+            .tok_text = state.content[start:end],
+            .nodes = state.nodes,
+            .error_count = state.error_count,
+        }
+    }
+
+    // Char literal
+    if c == 39 {
+        end = start + 1
+        if end < state.len {
+            if state.content[end] == 92 {
+                end = end + 2
+            } else {
+                end = end + 1
+            }
+        }
+        if end < state.len and state.content[end] == 39 {
+            end = end + 1
+        }
+        return ParserState{
+            .content = state.content,
+            .pos = end,
+            .len = state.len,
+            .tok = Token.char_literal,
+            .tok_start = start,
+            .tok_end = end,
+            .tok_text = state.content[start:end],
+            .nodes = state.nodes,
+            .error_count = state.error_count,
+        }
+    }
+
+    // Operators and punctuation
+    var next: int = 0
+    if end < state.len {
+        next = 0 + state.content[end]
+    }
+
+    if c == 40 { tok = Token.lparen }
+    if c == 41 { tok = Token.rparen }
+    if c == 91 { tok = Token.lbracket }
+    if c == 93 { tok = Token.rbracket }
+    if c == 123 { tok = Token.lbrace }
+    if c == 125 { tok = Token.rbrace }
+    if c == 44 { tok = Token.comma }
+    if c == 59 { tok = Token.semicolon }
+    if c == 58 { tok = Token.colon }
+    if c == 126 { tok = Token.tilde }
+    if c == 64 { tok = Token.at }
+
+    if c == 43 {
+        if next == 61 { tok = Token.plus_equal; end = end + 1 }
+        else { tok = Token.plus }
+    }
+    if c == 45 {
+        if next == 61 { tok = Token.minus_equal; end = end + 1 }
+        else if next == 62 { tok = Token.arrow; end = end + 1 }
+        else { tok = Token.minus }
+    }
+    if c == 42 {
+        if next == 61 { tok = Token.star_equal; end = end + 1 }
+        else { tok = Token.star }
+    }
+    if c == 47 {
+        if next == 61 { tok = Token.slash_equal; end = end + 1 }
+        else { tok = Token.slash }
+    }
+    if c == 37 {
+        if next == 61 { tok = Token.percent_equal; end = end + 1 }
+        else { tok = Token.percent }
+    }
+    if c == 38 {
+        if next == 61 { tok = Token.ampersand_equal; end = end + 1 }
+        else { tok = Token.ampersand }
+    }
+    if c == 124 {
+        if next == 61 { tok = Token.pipe_equal; end = end + 1 }
+        else { tok = Token.pipe }
+    }
+    if c == 94 {
+        if next == 61 { tok = Token.caret_equal; end = end + 1 }
+        else { tok = Token.caret }
+    }
+    if c == 61 {
+        if next == 61 { tok = Token.equal_equal; end = end + 1 }
+        else if next == 62 { tok = Token.fat_arrow; end = end + 1 }
+        else { tok = Token.equal }
+    }
+    if c == 33 {
+        if next == 61 { tok = Token.bang_equal; end = end + 1 }
+        else { tok = Token.bang }
+    }
+    if c == 60 {
+        if next == 61 { tok = Token.less_equal; end = end + 1 }
+        else if next == 60 { tok = Token.less_less; end = end + 1 }
+        else { tok = Token.less }
+    }
+    if c == 62 {
+        if next == 61 { tok = Token.greater_equal; end = end + 1 }
+        else if next == 62 { tok = Token.greater_greater; end = end + 1 }
+        else { tok = Token.greater }
+    }
+    if c == 46 {
+        if next == 46 { tok = Token.dot_dot; end = end + 1 }
+        else if next == 42 { tok = Token.dot_star; end = end + 1 }
+        else if next == 63 { tok = Token.dot_question; end = end + 1 }
+        else { tok = Token.dot }
+    }
+    if c == 63 {
+        if next == 63 { tok = Token.question_question; end = end + 1 }
+        else if next == 46 { tok = Token.question_dot; end = end + 1 }
+        else { tok = Token.question }
+    }
+
+    return ParserState{
+        .content = state.content,
+        .pos = end,
+        .len = state.len,
+        .tok = tok,
+        .tok_start = start,
+        .tok_end = end,
+        .tok_text = state.content[start:end],
+        .nodes = state.nodes,
+        .error_count = state.error_count,
+    }
+}
+
+fn parserCheck(state: ParserState, tok: Token) bool {
+    return state.tok == tok
+}
+
+fn parserMatch(state: ParserState, tok: Token) ParserState {
+    if state.tok == tok {
+        return parserAdvance(state)
+    }
+    return state
+}
+
+fn parserExpect(state: ParserState, tok: Token) ParserState {
+    if state.tok == tok {
+        return parserAdvance(state)
+    }
+    // Error: expected token not found
+    return ParserState{
+        .content = state.content,
+        .pos = state.pos,
+        .len = state.len,
+        .tok = state.tok,
+        .tok_start = state.tok_start,
+        .tok_end = state.tok_end,
+        .tok_text = state.tok_text,
+        .nodes = state.nodes,
+        .error_count = state.error_count + 1,
+    }
+}
+
+fn parserPos(state: ParserState) Pos {
+    return posFromOffset(state.tok_start)
+}
+
+fn parserSpan(state: ParserState) Span {
+    return spanInit(posFromOffset(state.tok_start), posFromOffset(state.tok_end))
+}
+
+// =============================================================================
+// Node allocation
+// =============================================================================
+
+struct ParseResult {
+    state: ParserState,
+    node_idx: NodeIndex,
+}
+
+fn addNode(state: ParserState, node: Node) ParseResult {
+    state.nodes.push(node)
+    var idx: NodeIndex = len(state.nodes) - 1
+    return ParseResult{
+        .state = state,
+        .node_idx = idx,
+    }
+}
+
+// =============================================================================
+// Expression parsing
+// =============================================================================
+
+fn parseBinaryExpr(state: ParserState, min_prec: int) ParseResult {
+    var left_result: ParseResult = parseUnaryExpr(state)
+    if left_result.node_idx == null_node {
+        return left_result
+    }
+
+    var current: ParserState = left_result.state
+    var left: NodeIndex = left_result.node_idx
+
+    while true {
+        var prec: int = tokenPrecedence(current.tok)
+        if prec < min_prec {
+            break
+        }
+
+        var op: Token = current.tok
+        var op_start: int = current.tok_start
+        current = parserAdvance(current)
+
+        var right_result: ParseResult = parseBinaryExpr(current, prec + 1)
+        if right_result.node_idx == null_node {
+            return ParseResult{ .state = right_result.state, .node_idx = null_node }
+        }
+        current = right_result.state
+
+        // Get spans for creating combined span
+        var left_node: Node = current.nodes.get(left)
+        var right_node: Node = current.nodes.get(right_result.node_idx)
+        var combined_span: Span = spanInit(left_node.span.start, right_node.span.end)
+
+        var bin_node: Node = makeNode(NodeTag.binary_expr, combined_span)
+        bin_node.op = op
+        bin_node.left = left
+        bin_node.right = right_result.node_idx
+
+        var add_result: ParseResult = addNode(current, bin_node)
+        current = add_result.state
+        left = add_result.node_idx
+    }
+
+    return ParseResult{ .state = current, .node_idx = left }
+}
+
+fn parseUnaryExpr(state: ParserState) ParseResult {
+    if state.tok == Token.minus or state.tok == Token.kw_not or state.tok == Token.bang {
+        var op: Token = state.tok
+        var start: Pos = parserPos(state)
+        var next: ParserState = parserAdvance(state)
+
+        var operand_result: ParseResult = parseUnaryExpr(next)
+        if operand_result.node_idx == null_node {
+            return operand_result
+        }
+
+        var operand_node: Node = operand_result.state.nodes.get(operand_result.node_idx)
+        var span: Span = spanInit(start, operand_node.span.end)
+
+        var unary_node: Node = makeNode(NodeTag.unary_expr, span)
+        unary_node.op = op
+        unary_node.left = operand_result.node_idx
+
+        return addNode(operand_result.state, unary_node)
+    }
+
+    return parsePrimaryExpr(state)
+}
+
+fn parsePrimaryExpr(state: ParserState) ParseResult {
+    var result: ParseResult = parseOperand(state)
+    if result.node_idx == null_node {
+        return result
+    }
+
+    var current: ParserState = result.state
+    var base: NodeIndex = result.node_idx
+
+    // Handle postfix operations: calls, indexing, field access
+    while true {
+        if current.tok == Token.lparen {
+            // Function call
+            var call_result: ParseResult = parseCallExpr(current, base)
+            if call_result.node_idx == null_node {
+                return call_result
+            }
+            current = call_result.state
+            base = call_result.node_idx
+        } else if current.tok == Token.lbracket {
+            // Index or slice
+            var index_result: ParseResult = parseIndexExpr(current, base)
+            if index_result.node_idx == null_node {
+                return index_result
+            }
+            current = index_result.state
+            base = index_result.node_idx
+        } else if current.tok == Token.dot {
+            // Field access
+            var field_result: ParseResult = parseFieldAccess(current, base)
+            if field_result.node_idx == null_node {
+                return field_result
+            }
+            current = field_result.state
+            base = field_result.node_idx
+        } else if current.tok == Token.dot_question {
+            // Optional unwrap .?
+            current = parserAdvance(current)
+            var base_node: Node = current.nodes.get(base)
+            var span: Span = spanInit(base_node.span.start, parserPos(current))
+
+            var unwrap_node: Node = makeNode(NodeTag.unary_expr, span)
+            unwrap_node.op = Token.dot_question
+            unwrap_node.left = base
+
+            var unwrap_result: ParseResult = addNode(current, unwrap_node)
+            current = unwrap_result.state
+            base = unwrap_result.node_idx
+        } else {
+            break
+        }
+    }
+
+    return ParseResult{ .state = current, .node_idx = base }
+}
+
+fn parseOperand(state: ParserState) ParseResult {
+    var span: Span = parserSpan(state)
+
+    // Integer literal
+    if state.tok == Token.int_literal {
+        var node: Node = makeNode(NodeTag.int_literal, span)
+        node.text = state.tok_text
+        var next: ParserState = parserAdvance(state)
+        return addNode(next, node)
+    }
+
+    // Float literal
+    if state.tok == Token.float_literal {
+        var node: Node = makeNode(NodeTag.float_literal, span)
+        node.text = state.tok_text
+        var next: ParserState = parserAdvance(state)
+        return addNode(next, node)
+    }
+
+    // String literal
+    if state.tok == Token.string_literal {
+        var node: Node = makeNode(NodeTag.string_literal, span)
+        node.text = state.tok_text
+        var next: ParserState = parserAdvance(state)
+        return addNode(next, node)
+    }
+
+    // Char literal
+    if state.tok == Token.char_literal {
+        var node: Node = makeNode(NodeTag.char_literal, span)
+        node.text = state.tok_text
+        var next: ParserState = parserAdvance(state)
+        return addNode(next, node)
+    }
+
+    // Boolean literals
+    if state.tok == Token.kw_true or state.tok == Token.kw_false {
+        var node: Node = makeNode(NodeTag.bool_literal, span)
+        node.text = state.tok_text
+        var next: ParserState = parserAdvance(state)
+        return addNode(next, node)
+    }
+
+    // Null literal
+    if state.tok == Token.kw_null {
+        var node: Node = makeNode(NodeTag.null_literal, span)
+        var next: ParserState = parserAdvance(state)
+        return addNode(next, node)
+    }
+
+    // Identifier (may be followed by struct init)
+    if state.tok == Token.identifier {
+        var name: string = state.tok_text
+        var next: ParserState = parserAdvance(state)
+
+        // Check for struct init: Name{ ... }
+        if next.tok == Token.lbrace {
+            return parseStructInit(next, name, span.start)
+        }
+
+        // Check for enum/union variant: Name.variant
+        if next.tok == Token.dot {
+            var dot_next: ParserState = parserAdvance(next)
+            if dot_next.tok == Token.identifier {
+                var variant_name: string = dot_next.tok_text
+                var after_variant: ParserState = parserAdvance(dot_next)
+
+                // Check for union constructor: Type.variant(value)
+                if after_variant.tok == Token.lparen {
+                    return parseUnionConstructor(after_variant, name, variant_name, span.start)
+                }
+
+                // Plain enum variant
+                var combined_span: Span = spanInit(span.start, posFromOffset(dot_next.tok_end))
+                var node: Node = makeNode(NodeTag.field_access, combined_span)
+                node.name = name
+                node.text = variant_name
+                return addNode(after_variant, node)
+            }
+        }
+
+        // Plain identifier
+        var node: Node = makeNode(NodeTag.identifier, span)
+        node.name = name
+        return addNode(next, node)
+    }
+
+    // Parenthesized expression
+    if state.tok == Token.lparen {
+        var next: ParserState = parserAdvance(state)
+        var inner_result: ParseResult = parseExpr(next)
+        if inner_result.node_idx == null_node {
+            return inner_result
+        }
+        var after: ParserState = parserExpect(inner_result.state, Token.rparen)
+
+        var inner_node: Node = after.nodes.get(inner_result.node_idx)
+        var paren_span: Span = spanInit(span.start, parserPos(after))
+        var node: Node = makeNode(NodeTag.paren_expr, paren_span)
+        node.left = inner_result.node_idx
+        return addNode(after, node)
+    }
+
+    // Array literal: [1, 2, 3]
+    if state.tok == Token.lbracket {
+        return parseArrayLiteral(state)
+    }
+
+    // New expression: new Type()
+    if state.tok == Token.kw_new {
+        return parseNewExpr(state)
+    }
+
+    // Builtin: @name(args)
+    if state.tok == Token.at {
+        return parseBuiltin(state)
+    }
+
+    // Switch expression
+    if state.tok == Token.kw_switch {
+        return parseSwitchExpr(state)
+    }
+
+    // If expression
+    if state.tok == Token.kw_if {
+        return parseIfExpr(state)
+    }
+
+    // Type keywords as identifiers
+    if state.tok == Token.kw_int or state.tok == Token.kw_float or
+       state.tok == Token.kw_bool or state.tok == Token.kw_string or
+       state.tok == Token.kw_void or state.tok == Token.kw_i8 or
+       state.tok == Token.kw_i16 or state.tok == Token.kw_i32 or
+       state.tok == Token.kw_i64 or state.tok == Token.kw_u8 or
+       state.tok == Token.kw_u16 or state.tok == Token.kw_u32 or
+       state.tok == Token.kw_u64 or state.tok == Token.kw_f32 or
+       state.tok == Token.kw_f64 {
+        var node: Node = makeNode(NodeTag.type_named, span)
+        node.name = state.tok_text
+        var next: ParserState = parserAdvance(state)
+        return addNode(next, node)
+    }
+
+    // No valid operand found
+    return ParseResult{ .state = state, .node_idx = null_node }
+}
+
+fn parseCallExpr(state: ParserState, callee: NodeIndex) ParseResult {
+    var start_pos: Pos = state.nodes.get(callee).span.start
+    var current: ParserState = parserAdvance(state)  // consume '('
+
+    var args: List<NodeIndex> = new List<NodeIndex>()
+
+    while current.tok != Token.rparen and current.tok != Token.eof {
+        var arg_result: ParseResult = parseExpr(current)
+        if arg_result.node_idx == null_node {
+            return arg_result
+        }
+        current = arg_result.state
+        args.push(arg_result.node_idx)
+
+        if current.tok == Token.comma {
+            current = parserAdvance(current)
+        } else {
+            break
+        }
+    }
+
+    current = parserExpect(current, Token.rparen)
+
+    var span: Span = spanInit(start_pos, parserPos(current))
+    var node: Node = makeNode(NodeTag.call_expr, span)
+    node.left = callee
+    // Note: args is stored in the List, node.args stays empty for now
+    // Future: convert List to slice when we have that capability
+
+    return addNode(current, node)
+}
+
+fn parseIndexExpr(state: ParserState, base: NodeIndex) ParseResult {
+    var start_pos: Pos = state.nodes.get(base).span.start
+    var current: ParserState = parserAdvance(state)  // consume '['
+
+    var idx_result: ParseResult = parseExpr(current)
+    if idx_result.node_idx == null_node {
+        return idx_result
+    }
+    current = idx_result.state
+
+    // Check for slice: [start:end]
+    if current.tok == Token.colon {
+        current = parserAdvance(current)
+
+        var end_idx: NodeIndex = null_node
+        if current.tok != Token.rbracket {
+            var end_result: ParseResult = parseExpr(current)
+            if end_result.node_idx != null_node {
+                current = end_result.state
+                end_idx = end_result.node_idx
+            }
+        }
+
+        current = parserExpect(current, Token.rbracket)
+
+        var span: Span = spanInit(start_pos, parserPos(current))
+        var node: Node = makeNode(NodeTag.slice_expr, span)
+        node.left = base
+        node.cond = idx_result.node_idx   // start
+        node.right = end_idx              // end
+        return addNode(current, node)
+    }
+
+    current = parserExpect(current, Token.rbracket)
+
+    var span: Span = spanInit(start_pos, parserPos(current))
+    var node: Node = makeNode(NodeTag.index_expr, span)
+    node.left = base
+    node.right = idx_result.node_idx
+    return addNode(current, node)
+}
+
+fn parseFieldAccess(state: ParserState, base: NodeIndex) ParseResult {
+    var start_pos: Pos = state.nodes.get(base).span.start
+    var current: ParserState = parserAdvance(state)  // consume '.'
+
+    if current.tok != Token.identifier {
+        return ParseResult{ .state = current, .node_idx = null_node }
+    }
+
+    var field_name: string = current.tok_text
+    current = parserAdvance(current)
+
+    var span: Span = spanInit(start_pos, parserPos(current))
+    var node: Node = makeNode(NodeTag.field_access, span)
+    node.left = base
+    node.name = field_name
+    return addNode(current, node)
+}
+
+fn parseStructInit(state: ParserState, type_name: string, start: Pos) ParseResult {
+    var current: ParserState = parserAdvance(state)  // consume '{'
+
+    // Parse field initializers
+    while current.tok != Token.rbrace and current.tok != Token.eof {
+        // Expect .field = value
+        if current.tok == Token.dot {
+            current = parserAdvance(current)
+            if current.tok == Token.identifier {
+                var field_name: string = current.tok_text
+                current = parserAdvance(current)
+                current = parserExpect(current, Token.equal)
+
+                var val_result: ParseResult = parseExpr(current)
+                if val_result.node_idx != null_node {
+                    current = val_result.state
+                }
+            }
+        }
+
+        if current.tok == Token.comma {
+            current = parserAdvance(current)
+        } else {
+            break
+        }
+    }
+
+    current = parserExpect(current, Token.rbrace)
+
+    var span: Span = spanInit(start, parserPos(current))
+    var node: Node = makeNode(NodeTag.struct_init, span)
+    node.name = type_name
+    return addNode(current, node)
+}
+
+fn parseUnionConstructor(state: ParserState, type_name: string, variant: string, start: Pos) ParseResult {
+    var current: ParserState = parserAdvance(state)  // consume '('
+
+    var val_result: ParseResult = parseExpr(current)
+    if val_result.node_idx != null_node {
+        current = val_result.state
+    }
+
+    current = parserExpect(current, Token.rparen)
+
+    var span: Span = spanInit(start, parserPos(current))
+    var node: Node = makeNode(NodeTag.call_expr, span)
+    node.name = type_name
+    node.text = variant
+    if val_result.node_idx != null_node {
+        node.left = val_result.node_idx
+    }
+    return addNode(current, node)
+}
+
+fn parseArrayLiteral(state: ParserState) ParseResult {
+    var start: Pos = parserPos(state)
+    var current: ParserState = parserAdvance(state)  // consume '['
+
+    while current.tok != Token.rbracket and current.tok != Token.eof {
+        var elem_result: ParseResult = parseExpr(current)
+        if elem_result.node_idx != null_node {
+            current = elem_result.state
+        }
+
+        if current.tok == Token.comma {
+            current = parserAdvance(current)
+        } else {
+            break
+        }
+    }
+
+    current = parserExpect(current, Token.rbracket)
+
+    var span: Span = spanInit(start, parserPos(current))
+    var node: Node = makeNode(NodeTag.array_literal, span)
+    return addNode(current, node)
+}
+
+fn parseNewExpr(state: ParserState) ParseResult {
+    var start: Pos = parserPos(state)
+    var current: ParserState = parserAdvance(state)  // consume 'new'
+
+    // Parse type: List<T> or Map<K,V>
+    if current.tok == Token.identifier {
+        var type_name: string = current.tok_text
+        current = parserAdvance(current)
+
+        // Check for generic params: <T>
+        if current.tok == Token.less {
+            current = parserAdvance(current)
+            // Skip type params for now
+            while current.tok != Token.greater and current.tok != Token.eof {
+                current = parserAdvance(current)
+            }
+            current = parserExpect(current, Token.greater)
+        }
+
+        // Expect ()
+        current = parserExpect(current, Token.lparen)
+        current = parserExpect(current, Token.rparen)
+
+        var span: Span = spanInit(start, parserPos(current))
+        var node: Node = makeNode(NodeTag.new_expr, span)
+        node.name = type_name
+        return addNode(current, node)
+    }
+
+    return ParseResult{ .state = current, .node_idx = null_node }
+}
+
+fn parseBuiltin(state: ParserState) ParseResult {
+    var start: Pos = parserPos(state)
+    var current: ParserState = parserAdvance(state)  // consume '@'
+
+    if current.tok != Token.identifier {
+        return ParseResult{ .state = current, .node_idx = null_node }
+    }
+
+    var builtin_name: string = current.tok_text
+    current = parserAdvance(current)
+
+    current = parserExpect(current, Token.lparen)
+
+    // Parse arguments
+    var first_arg: NodeIndex = null_node
+    if current.tok != Token.rparen {
+        var arg_result: ParseResult = parseExpr(current)
+        if arg_result.node_idx != null_node {
+            current = arg_result.state
+            first_arg = arg_result.node_idx
+        }
+    }
+
+    current = parserExpect(current, Token.rparen)
+
+    var span: Span = spanInit(start, parserPos(current))
+    var node: Node = makeNode(NodeTag.call_expr, span)
+    node.name = builtin_name
+    node.left = first_arg
+    return addNode(current, node)
+}
+
+fn parseSwitchExpr(state: ParserState) ParseResult {
+    var start: Pos = parserPos(state)
+    var current: ParserState = parserAdvance(state)  // consume 'switch'
+
+    var subj_result: ParseResult = parseExpr(current)
+    if subj_result.node_idx == null_node {
+        return subj_result
+    }
+    current = subj_result.state
+
+    current = parserExpect(current, Token.lbrace)
+
+    // Parse cases
+    while current.tok != Token.rbrace and current.tok != Token.eof {
+        // Parse case value(s)
+        if current.tok == Token.dot {
+            current = parserAdvance(current)
+            if current.tok == Token.identifier {
+                current = parserAdvance(current)
+
+                // Check for capture |val|
+                if current.tok == Token.pipe {
+                    current = parserAdvance(current)
+                    if current.tok == Token.identifier {
+                        current = parserAdvance(current)
+                    }
+                    current = parserExpect(current, Token.pipe)
+                }
+            }
+        } else if current.tok == Token.kw_else {
+            current = parserAdvance(current)
+        } else {
+            // Integer case
+            var case_result: ParseResult = parseExpr(current)
+            if case_result.node_idx != null_node {
+                current = case_result.state
+            }
+        }
+
+        current = parserExpect(current, Token.fat_arrow)
+
+        // Parse case body
+        var body_result: ParseResult = parseExpr(current)
+        if body_result.node_idx != null_node {
+            current = body_result.state
+        }
+
+        if current.tok == Token.comma {
+            current = parserAdvance(current)
+        }
+    }
+
+    current = parserExpect(current, Token.rbrace)
+
+    var span: Span = spanInit(start, parserPos(current))
+    var node: Node = makeNode(NodeTag.switch_expr, span)
+    node.left = subj_result.node_idx
+    return addNode(current, node)
+}
+
+fn parseIfExpr(state: ParserState) ParseResult {
+    var start: Pos = parserPos(state)
+    var current: ParserState = parserAdvance(state)  // consume 'if'
+
+    var cond_result: ParseResult = parseExpr(current)
+    if cond_result.node_idx == null_node {
+        return cond_result
+    }
+    current = cond_result.state
+
+    current = parserExpect(current, Token.lbrace)
+
+    // Parse then body
+    var then_body: NodeIndex = null_node
+    if current.tok != Token.rbrace {
+        var then_result: ParseResult = parseExpr(current)
+        if then_result.node_idx != null_node {
+            current = then_result.state
+            then_body = then_result.node_idx
+        }
+    }
+
+    current = parserExpect(current, Token.rbrace)
+
+    // Check for else
+    var else_body: NodeIndex = null_node
+    if current.tok == Token.kw_else {
+        current = parserAdvance(current)
+        current = parserExpect(current, Token.lbrace)
+
+        if current.tok != Token.rbrace {
+            var else_result: ParseResult = parseExpr(current)
+            if else_result.node_idx != null_node {
+                current = else_result.state
+                else_body = else_result.node_idx
+            }
+        }
+
+        current = parserExpect(current, Token.rbrace)
+    }
+
+    var span: Span = spanInit(start, parserPos(current))
+    var node: Node = makeNode(NodeTag.if_stmt, span)
+    node.cond = cond_result.node_idx
+    node.body = then_body
+    node.else_body = else_body
+    return addNode(current, node)
+}
+
+fn parseExpr(state: ParserState) ParseResult {
+    return parseBinaryExpr(state, 1)
+}
+
+// =============================================================================
+// Statement parsing
+// =============================================================================
+
+fn parseStmt(state: ParserState) ParseResult {
+    if state.tok == Token.kw_return {
+        return parseReturnStmt(state)
+    }
+    if state.tok == Token.kw_var or state.tok == Token.kw_const {
+        return parseVarStmt(state)
+    }
+    if state.tok == Token.kw_if {
+        return parseIfStmt(state)
+    }
+    if state.tok == Token.kw_while {
+        return parseWhileStmt(state)
+    }
+    if state.tok == Token.kw_for {
+        return parseForStmt(state)
+    }
+    if state.tok == Token.kw_break {
+        var span: Span = parserSpan(state)
+        var node: Node = makeNode(NodeTag.break_stmt, span)
+        var next: ParserState = parserAdvance(state)
+        return addNode(next, node)
+    }
+    if state.tok == Token.kw_continue {
+        var span: Span = parserSpan(state)
+        var node: Node = makeNode(NodeTag.continue_stmt, span)
+        var next: ParserState = parserAdvance(state)
+        return addNode(next, node)
+    }
+    if state.tok == Token.lbrace {
+        return parseBlockStmt(state)
+    }
+
+    // Expression statement or assignment
+    return parseExprOrAssignStmt(state)
+}
+
+fn parseReturnStmt(state: ParserState) ParseResult {
+    var start: Pos = parserPos(state)
+    var current: ParserState = parserAdvance(state)  // consume 'return'
+
+    var value: NodeIndex = null_node
+    if current.tok != Token.rbrace and current.tok != Token.semicolon and current.tok != Token.eof {
+        var val_result: ParseResult = parseExpr(current)
+        if val_result.node_idx != null_node {
+            current = val_result.state
+            value = val_result.node_idx
+        }
+    }
+
+    var span: Span = spanInit(start, parserPos(current))
+    var node: Node = makeNode(NodeTag.return_stmt, span)
+    node.left = value
+    return addNode(current, node)
+}
+
+fn parseVarStmt(state: ParserState) ParseResult {
+    var start: Pos = parserPos(state)
+    var is_const: bool = state.tok == Token.kw_const
+    var current: ParserState = parserAdvance(state)  // consume 'var' or 'const'
+
+    if current.tok != Token.identifier {
+        return ParseResult{ .state = current, .node_idx = null_node }
+    }
+
+    var var_name: string = current.tok_text
+    current = parserAdvance(current)
+
+    // Optional type annotation
+    var type_expr: NodeIndex = null_node
+    if current.tok == Token.colon {
+        current = parserAdvance(current)
+        var type_result: ParseResult = parseTypeExpr(current)
+        if type_result.node_idx != null_node {
+            current = type_result.state
+            type_expr = type_result.node_idx
+        }
+    }
+
+    // Optional initializer
+    var value: NodeIndex = null_node
+    if current.tok == Token.equal {
+        current = parserAdvance(current)
+        var val_result: ParseResult = parseExpr(current)
+        if val_result.node_idx != null_node {
+            current = val_result.state
+            value = val_result.node_idx
+        }
+    }
+
+    var span: Span = spanInit(start, parserPos(current))
+    var node: Node = makeNode(NodeTag.var_stmt, span)
+    node.name = var_name
+    node.type_expr = type_expr
+    node.left = value
+    if is_const {
+        node.text = "const"
+    }
+    return addNode(current, node)
+}
+
+fn parseIfStmt(state: ParserState) ParseResult {
+    var start: Pos = parserPos(state)
+    var current: ParserState = parserAdvance(state)  // consume 'if'
+
+    var cond_result: ParseResult = parseExpr(current)
+    if cond_result.node_idx == null_node {
+        return cond_result
+    }
+    current = cond_result.state
+
+    // Parse then block
+    var then_result: ParseResult = parseBlockStmt(current)
+    if then_result.node_idx == null_node {
+        return then_result
+    }
+    current = then_result.state
+
+    // Optional else
+    var else_body: NodeIndex = null_node
+    if current.tok == Token.kw_else {
+        current = parserAdvance(current)
+
+        if current.tok == Token.kw_if {
+            // else if
+            var elif_result: ParseResult = parseIfStmt(current)
+            if elif_result.node_idx != null_node {
+                current = elif_result.state
+                else_body = elif_result.node_idx
+            }
+        } else {
+            // else block
+            var else_result: ParseResult = parseBlockStmt(current)
+            if else_result.node_idx != null_node {
+                current = else_result.state
+                else_body = else_result.node_idx
+            }
+        }
+    }
+
+    var span: Span = spanInit(start, parserPos(current))
+    var node: Node = makeNode(NodeTag.if_stmt, span)
+    node.cond = cond_result.node_idx
+    node.body = then_result.node_idx
+    node.else_body = else_body
+    return addNode(current, node)
+}
+
+fn parseWhileStmt(state: ParserState) ParseResult {
+    var start: Pos = parserPos(state)
+    var current: ParserState = parserAdvance(state)  // consume 'while'
+
+    var cond_result: ParseResult = parseExpr(current)
+    if cond_result.node_idx == null_node {
+        return cond_result
+    }
+    current = cond_result.state
+
+    var body_result: ParseResult = parseBlockStmt(current)
+    if body_result.node_idx == null_node {
+        return body_result
+    }
+    current = body_result.state
+
+    var span: Span = spanInit(start, parserPos(current))
+    var node: Node = makeNode(NodeTag.while_stmt, span)
+    node.cond = cond_result.node_idx
+    node.body = body_result.node_idx
+    return addNode(current, node)
+}
+
+fn parseForStmt(state: ParserState) ParseResult {
+    var start: Pos = parserPos(state)
+    var current: ParserState = parserAdvance(state)  // consume 'for'
+
+    if current.tok != Token.identifier {
+        return ParseResult{ .state = current, .node_idx = null_node }
+    }
+
+    var binding: string = current.tok_text
+    current = parserAdvance(current)
+
+    current = parserExpect(current, Token.kw_in)
+
+    var iter_result: ParseResult = parseExpr(current)
+    if iter_result.node_idx == null_node {
+        return iter_result
+    }
+    current = iter_result.state
+
+    var body_result: ParseResult = parseBlockStmt(current)
+    if body_result.node_idx == null_node {
+        return body_result
+    }
+    current = body_result.state
+
+    var span: Span = spanInit(start, parserPos(current))
+    var node: Node = makeNode(NodeTag.for_stmt, span)
+    node.name = binding
+    node.left = iter_result.node_idx
+    node.body = body_result.node_idx
+    return addNode(current, node)
+}
+
+fn parseBlockStmt(state: ParserState) ParseResult {
+    var start: Pos = parserPos(state)
+    var current: ParserState = parserExpect(state, Token.lbrace)
+
+    while current.tok != Token.rbrace and current.tok != Token.eof {
+        var stmt_result: ParseResult = parseStmt(current)
+        if stmt_result.node_idx != null_node {
+            current = stmt_result.state
+        } else {
+            // Error recovery: skip token
+            current = parserAdvance(current)
+        }
+    }
+
+    current = parserExpect(current, Token.rbrace)
+
+    var span: Span = spanInit(start, parserPos(current))
+    var node: Node = makeNode(NodeTag.block_stmt, span)
+    return addNode(current, node)
+}
+
+fn parseExprOrAssignStmt(state: ParserState) ParseResult {
+    var expr_result: ParseResult = parseExpr(state)
+    if expr_result.node_idx == null_node {
+        return expr_result
+    }
+    var current: ParserState = expr_result.state
+
+    // Check for assignment
+    if current.tok == Token.equal or tokenIsCompoundAssign(current.tok) {
+        var op: Token = current.tok
+        current = parserAdvance(current)
+
+        var val_result: ParseResult = parseExpr(current)
+        if val_result.node_idx == null_node {
+            return val_result
+        }
+        current = val_result.state
+
+        var left_node: Node = current.nodes.get(expr_result.node_idx)
+        var span: Span = spanInit(left_node.span.start, parserPos(current))
+        var node: Node = makeNode(NodeTag.assign_stmt, span)
+        node.op = op
+        node.left = expr_result.node_idx
+        node.right = val_result.node_idx
+        return addNode(current, node)
+    }
+
+    // Expression statement
+    var expr_node: Node = current.nodes.get(expr_result.node_idx)
+    var span: Span = expr_node.span
+    var node: Node = makeNode(NodeTag.expr_stmt, span)
+    node.left = expr_result.node_idx
+    return addNode(current, node)
+}
+
+// =============================================================================
+// Type expression parsing
+// =============================================================================
+
+fn parseTypeExpr(state: ParserState) ParseResult {
+    var span: Span = parserSpan(state)
+
+    // Pointer type: *T
+    if state.tok == Token.star {
+        var next: ParserState = parserAdvance(state)
+        var inner_result: ParseResult = parseTypeExpr(next)
+        if inner_result.node_idx == null_node {
+            return inner_result
+        }
+
+        var inner_node: Node = inner_result.state.nodes.get(inner_result.node_idx)
+        var ptr_span: Span = spanInit(span.start, inner_node.span.end)
+        var node: Node = makeNode(NodeTag.type_pointer, ptr_span)
+        node.left = inner_result.node_idx
+        return addNode(inner_result.state, node)
+    }
+
+    // Optional type: ?T
+    if state.tok == Token.question {
+        var next: ParserState = parserAdvance(state)
+        var inner_result: ParseResult = parseTypeExpr(next)
+        if inner_result.node_idx == null_node {
+            return inner_result
+        }
+
+        var inner_node: Node = inner_result.state.nodes.get(inner_result.node_idx)
+        var opt_span: Span = spanInit(span.start, inner_node.span.end)
+        var node: Node = makeNode(NodeTag.type_optional, opt_span)
+        node.left = inner_result.node_idx
+        return addNode(inner_result.state, node)
+    }
+
+    // Slice type: []T
+    if state.tok == Token.lbracket {
+        var next: ParserState = parserAdvance(state)
+        if next.tok == Token.rbracket {
+            next = parserAdvance(next)
+            var inner_result: ParseResult = parseTypeExpr(next)
+            if inner_result.node_idx == null_node {
+                return inner_result
+            }
+
+            var inner_node: Node = inner_result.state.nodes.get(inner_result.node_idx)
+            var slice_span: Span = spanInit(span.start, inner_node.span.end)
+            var node: Node = makeNode(NodeTag.type_slice, slice_span)
+            node.left = inner_result.node_idx
+            return addNode(inner_result.state, node)
+        }
+
+        // Array type: [N]T
+        var size_result: ParseResult = parseExpr(next)
+        if size_result.node_idx == null_node {
+            return size_result
+        }
+        next = parserExpect(size_result.state, Token.rbracket)
+
+        var inner_result: ParseResult = parseTypeExpr(next)
+        if inner_result.node_idx == null_node {
+            return inner_result
+        }
+
+        var inner_node: Node = inner_result.state.nodes.get(inner_result.node_idx)
+        var arr_span: Span = spanInit(span.start, inner_node.span.end)
+        var node: Node = makeNode(NodeTag.type_array, arr_span)
+        node.left = size_result.node_idx
+        node.right = inner_result.node_idx
+        return addNode(inner_result.state, node)
+    }
+
+    // Named type (includes built-in types)
+    if state.tok == Token.identifier or state.tok == Token.kw_int or
+       state.tok == Token.kw_float or state.tok == Token.kw_bool or
+       state.tok == Token.kw_string or state.tok == Token.kw_void or
+       state.tok == Token.kw_i8 or state.tok == Token.kw_i16 or
+       state.tok == Token.kw_i32 or state.tok == Token.kw_i64 or
+       state.tok == Token.kw_u8 or state.tok == Token.kw_u16 or
+       state.tok == Token.kw_u32 or state.tok == Token.kw_u64 or
+       state.tok == Token.kw_f32 or state.tok == Token.kw_f64 {
+        var node: Node = makeNode(NodeTag.type_named, span)
+        node.name = state.tok_text
+        var next: ParserState = parserAdvance(state)
+        return addNode(next, node)
+    }
+
+    return ParseResult{ .state = state, .node_idx = null_node }
+}
+
+// =============================================================================
+// Declaration parsing
+// =============================================================================
+
+fn parseDecl(state: ParserState) ParseResult {
+    if state.tok == Token.kw_fn {
+        return parseFnDecl(state)
+    }
+    if state.tok == Token.kw_struct {
+        return parseStructDecl(state)
+    }
+    if state.tok == Token.kw_enum {
+        return parseEnumDecl(state)
+    }
+    if state.tok == Token.kw_union {
+        return parseUnionDecl(state)
+    }
+    if state.tok == Token.kw_type {
+        return parseTypeAlias(state)
+    }
+    if state.tok == Token.kw_const {
+        return parseConstDecl(state)
+    }
+
+    return ParseResult{ .state = state, .node_idx = null_node }
+}
+
+fn parseFnDecl(state: ParserState) ParseResult {
+    var start: Pos = parserPos(state)
+    var current: ParserState = parserAdvance(state)  // consume 'fn'
+
+    if current.tok != Token.identifier {
+        return ParseResult{ .state = current, .node_idx = null_node }
+    }
+
+    var fn_name: string = current.tok_text
+    current = parserAdvance(current)
+
+    // Parameters
+    current = parserExpect(current, Token.lparen)
+
+    while current.tok != Token.rparen and current.tok != Token.eof {
+        if current.tok == Token.identifier {
+            var param_name: string = current.tok_text
+            current = parserAdvance(current)
+
+            current = parserExpect(current, Token.colon)
+
+            var type_result: ParseResult = parseTypeExpr(current)
+            if type_result.node_idx != null_node {
+                current = type_result.state
+            }
+        }
+
+        if current.tok == Token.comma {
+            current = parserAdvance(current)
+        } else {
+            break
+        }
+    }
+
+    current = parserExpect(current, Token.rparen)
+
+    // Return type
+    var return_type: NodeIndex = null_node
+    if current.tok != Token.lbrace {
+        var ret_result: ParseResult = parseTypeExpr(current)
+        if ret_result.node_idx != null_node {
+            current = ret_result.state
+            return_type = ret_result.node_idx
+        }
+    }
+
+    // Body
+    var body_result: ParseResult = parseBlockStmt(current)
+    if body_result.node_idx == null_node {
+        return body_result
+    }
+    current = body_result.state
+
+    var span: Span = spanInit(start, parserPos(current))
+    var node: Node = makeNode(NodeTag.fn_decl, span)
+    node.name = fn_name
+    node.type_expr = return_type
+    node.body = body_result.node_idx
+    return addNode(current, node)
+}
+
+fn parseStructDecl(state: ParserState) ParseResult {
+    var start: Pos = parserPos(state)
+    var current: ParserState = parserAdvance(state)  // consume 'struct'
+
+    if current.tok != Token.identifier {
+        return ParseResult{ .state = current, .node_idx = null_node }
+    }
+
+    var struct_name: string = current.tok_text
+    current = parserAdvance(current)
+
+    current = parserExpect(current, Token.lbrace)
+
+    // Parse fields
+    while current.tok != Token.rbrace and current.tok != Token.eof {
+        if current.tok == Token.identifier {
+            var field_name: string = current.tok_text
+            current = parserAdvance(current)
+
+            current = parserExpect(current, Token.colon)
+
+            var type_result: ParseResult = parseTypeExpr(current)
+            if type_result.node_idx != null_node {
+                current = type_result.state
+            }
+        }
+
+        if current.tok == Token.comma {
+            current = parserAdvance(current)
+        } else {
+            break
+        }
+    }
+
+    current = parserExpect(current, Token.rbrace)
+
+    var span: Span = spanInit(start, parserPos(current))
+    var node: Node = makeNode(NodeTag.struct_decl, span)
+    node.name = struct_name
+    return addNode(current, node)
+}
+
+fn parseEnumDecl(state: ParserState) ParseResult {
+    var start: Pos = parserPos(state)
+    var current: ParserState = parserAdvance(state)  // consume 'enum'
+
+    if current.tok != Token.identifier {
+        return ParseResult{ .state = current, .node_idx = null_node }
+    }
+
+    var enum_name: string = current.tok_text
+    current = parserAdvance(current)
+
+    // Optional backing type: enum Name: u8
+    var backing_type: NodeIndex = null_node
+    if current.tok == Token.colon {
+        current = parserAdvance(current)
+        var type_result: ParseResult = parseTypeExpr(current)
+        if type_result.node_idx != null_node {
+            current = type_result.state
+            backing_type = type_result.node_idx
+        }
+    }
+
+    current = parserExpect(current, Token.lbrace)
+
+    // Parse variants
+    while current.tok != Token.rbrace and current.tok != Token.eof {
+        if current.tok == Token.identifier {
+            var variant_name: string = current.tok_text
+            current = parserAdvance(current)
+
+            // Optional explicit value: variant = 100
+            if current.tok == Token.equal {
+                current = parserAdvance(current)
+                var val_result: ParseResult = parseExpr(current)
+                if val_result.node_idx != null_node {
+                    current = val_result.state
+                }
+            }
+        }
+
+        if current.tok == Token.comma {
+            current = parserAdvance(current)
+        } else {
+            break
+        }
+    }
+
+    current = parserExpect(current, Token.rbrace)
+
+    var span: Span = spanInit(start, parserPos(current))
+    var node: Node = makeNode(NodeTag.enum_decl, span)
+    node.name = enum_name
+    node.type_expr = backing_type
+    return addNode(current, node)
+}
+
+fn parseUnionDecl(state: ParserState) ParseResult {
+    var start: Pos = parserPos(state)
+    var current: ParserState = parserAdvance(state)  // consume 'union'
+
+    if current.tok != Token.identifier {
+        return ParseResult{ .state = current, .node_idx = null_node }
+    }
+
+    var union_name: string = current.tok_text
+    current = parserAdvance(current)
+
+    current = parserExpect(current, Token.lbrace)
+
+    // Parse variants
+    while current.tok != Token.rbrace and current.tok != Token.eof {
+        if current.tok == Token.identifier {
+            var variant_name: string = current.tok_text
+            current = parserAdvance(current)
+
+            // Optional type: variant: Type
+            if current.tok == Token.colon {
+                current = parserAdvance(current)
+                var type_result: ParseResult = parseTypeExpr(current)
+                if type_result.node_idx != null_node {
+                    current = type_result.state
+                }
+            }
+        }
+
+        if current.tok == Token.comma {
+            current = parserAdvance(current)
+        } else {
+            break
+        }
+    }
+
+    current = parserExpect(current, Token.rbrace)
+
+    var span: Span = spanInit(start, parserPos(current))
+    var node: Node = makeNode(NodeTag.union_decl, span)
+    node.name = union_name
+    return addNode(current, node)
+}
+
+fn parseTypeAlias(state: ParserState) ParseResult {
+    var start: Pos = parserPos(state)
+    var current: ParserState = parserAdvance(state)  // consume 'type'
+
+    if current.tok != Token.identifier {
+        return ParseResult{ .state = current, .node_idx = null_node }
+    }
+
+    var alias_name: string = current.tok_text
+    current = parserAdvance(current)
+
+    current = parserExpect(current, Token.equal)
+
+    var type_result: ParseResult = parseTypeExpr(current)
+    if type_result.node_idx == null_node {
+        return type_result
+    }
+    current = type_result.state
+
+    var span: Span = spanInit(start, parserPos(current))
+    var node: Node = makeNode(NodeTag.type_alias, span)
+    node.name = alias_name
+    node.type_expr = type_result.node_idx
+    return addNode(current, node)
+}
+
+fn parseConstDecl(state: ParserState) ParseResult {
+    var start: Pos = parserPos(state)
+    var current: ParserState = parserAdvance(state)  // consume 'const'
+
+    if current.tok != Token.identifier {
+        return ParseResult{ .state = current, .node_idx = null_node }
+    }
+
+    var const_name: string = current.tok_text
+    current = parserAdvance(current)
+
+    // Optional type
+    var type_expr: NodeIndex = null_node
+    if current.tok == Token.colon {
+        current = parserAdvance(current)
+        var type_result: ParseResult = parseTypeExpr(current)
+        if type_result.node_idx != null_node {
+            current = type_result.state
+            type_expr = type_result.node_idx
+        }
+    }
+
+    current = parserExpect(current, Token.equal)
+
+    var val_result: ParseResult = parseExpr(current)
+    if val_result.node_idx == null_node {
+        return val_result
+    }
+    current = val_result.state
+
+    var span: Span = spanInit(start, parserPos(current))
+    var node: Node = makeNode(NodeTag.var_stmt, span)
+    node.name = const_name
+    node.type_expr = type_expr
+    node.left = val_result.node_idx
+    node.text = "const"
+    return addNode(current, node)
+}
+
+// =============================================================================
+// File parsing
+// =============================================================================
+
+fn parseFile(state: ParserState) ParserState {
+    var current: ParserState = state
+
+    while current.tok != Token.eof {
+        var decl_result: ParseResult = parseDecl(current)
+        if decl_result.node_idx != null_node {
+            current = decl_result.state
+        } else {
+            // Error recovery: skip to next token
+            current = parserAdvance(current)
+        }
+    }
+
+    return current
+}
+
+// =============================================================================
+// Simple test
+// =============================================================================
+
+fn main() int {
+    var content: string = "fn main() int { return 42 }"
+    var state: ParserState = parserInit(content)
+
+    state = parseFile(state)
+
+    // Check that we parsed something
+    if len(state.nodes) > 0 {
+        return 42
+    }
+    return 1
+}

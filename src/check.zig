@@ -1704,8 +1704,19 @@ pub const Checker = struct {
             },
             .array => |a| {
                 const elem = try self.resolveTypeExpr(a.elem);
-                // TODO: evaluate size expression as constant
-                return try self.types.makeArray(elem, 0);
+                // Evaluate size expression as constant (for now, only int literals)
+                const size_node = self.tree.getNode(a.size);
+                const size: usize = switch (size_node) {
+                    .expr => |e| switch (e) {
+                        .literal => |lit| if (lit.kind == .int)
+                            std.fmt.parseInt(usize, lit.value, 10) catch 0
+                        else
+                            0,
+                        else => 0,
+                    },
+                    else => 0,
+                };
+                return try self.types.makeArray(elem, size);
             },
             .function => {
                 // TODO: function types
