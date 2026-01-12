@@ -1,0 +1,242 @@
+// Error handling for cot bootstrap.
+// Simplified version using only currently-supported features.
+//
+// Changes from original errors.zig:
+// - No ErrorHandler callback (function pointers not supported)
+// - Standalone functions instead of methods
+// - Uses boolean flag instead of optional capture for first error
+// - Simplified error printing (no source context)
+
+// =============================================================================
+// Error Codes
+// =============================================================================
+
+// Error codes categorize errors for tooling and documentation.
+// Format: Exxx where xxx is the numeric code.
+// Note: Using int backing type for simpler bootstrap (no u16->int conversion needed)
+enum ErrorCode: int {
+    // Scanner errors (1xx)
+    E100 = 100,  // unterminated string literal
+    E101 = 101,  // unterminated character literal
+    E102 = 102,  // invalid escape sequence
+    E103 = 103,  // invalid number literal
+    E104 = 104,  // unexpected character
+
+    // Parser errors (2xx)
+    E200 = 200,  // unexpected token
+    E201 = 201,  // expected expression
+    E202 = 202,  // expected type
+    E203 = 203,  // expected identifier
+    E204 = 204,  // expected '{'
+    E205 = 205,  // expected '}'
+    E206 = 206,  // expected '('
+    E207 = 207,  // expected ')'
+    E208 = 208,  // expected ';' or newline
+
+    // Type errors (3xx)
+    E300 = 300,  // type mismatch
+    E301 = 301,  // undefined identifier
+    E302 = 302,  // redefined identifier
+    E303 = 303,  // invalid operation
+}
+
+fn errorCodeDescription(code: ErrorCode) string {
+    return switch code {
+        .E100 => "unterminated string literal",
+        .E101 => "unterminated character literal",
+        .E102 => "invalid escape sequence",
+        .E103 => "invalid number literal",
+        .E104 => "unexpected character",
+        .E200 => "unexpected token",
+        .E201 => "expected expression",
+        .E202 => "expected type",
+        .E203 => "expected identifier",
+        .E204 => "expected '{'",
+        .E205 => "expected '}'",
+        .E206 => "expected '('",
+        .E207 => "expected ')'",
+        .E208 => "expected ';' or newline",
+        .E300 => "type mismatch",
+        .E301 => "undefined identifier",
+        .E302 => "redefined identifier",
+        .E303 => "invalid operation",
+    }
+}
+
+fn errorCodeValue(code: ErrorCode) int {
+    return @intFromEnum(code)
+}
+
+// =============================================================================
+// Span (from source_boot.cot)
+// =============================================================================
+
+// Position in source code
+struct Pos {
+    offset: int,
+}
+
+// Span in source code
+struct Span {
+    start: Pos,
+    end: Pos,
+}
+
+fn spanFromPos(pos: Pos) Span {
+    return Span{ .start = pos, .end = pos }
+}
+
+fn spanFromOffset(offset: int) Span {
+    var pos: Pos = Pos{ .offset = offset }
+    return Span{ .start = pos, .end = pos }
+}
+
+// =============================================================================
+// Error
+// =============================================================================
+
+// An error at a specific source location.
+struct Error {
+    span: Span,
+    msg: string,
+    code: int,      // ErrorCode as int, -1 means no code
+}
+
+fn errorInit(span: Span, msg: string) Error {
+    return Error{
+        .span = span,
+        .msg = msg,
+        .code = -1,
+    }
+}
+
+fn errorInitWithCode(span: Span, msg: string, code: ErrorCode) Error {
+    return Error{
+        .span = span,
+        .msg = msg,
+        .code = @intFromEnum(code),
+    }
+}
+
+fn errorHasCode(err: Error) bool {
+    return err.code >= 0
+}
+
+fn errorGetCode(err: Error) ErrorCode {
+    return @enumFromInt(ErrorCode, err.code)
+}
+
+// =============================================================================
+// Error Reporter
+// =============================================================================
+
+// Collects and reports errors during compilation.
+// Simplified version without callbacks - just tracks errors.
+struct ErrorReporter {
+    filename: string,
+    count: int,
+    has_first: bool,
+    first: Error,
+}
+
+fn errorReporterInit(filename: string) ErrorReporter {
+    // Create a dummy first error (will be overwritten)
+    var dummy_pos: Pos = Pos{ .offset = 0 }
+    var dummy_span: Span = Span{ .start = dummy_pos, .end = dummy_pos }
+    var dummy_error: Error = Error{
+        .span = dummy_span,
+        .msg = "",
+        .code = -1,
+    }
+
+    return ErrorReporter{
+        .filename = filename,
+        .count = 0,
+        .has_first = false,
+        .first = dummy_error,
+    }
+}
+
+fn errorReporterErrorAt(reporter: ErrorReporter, offset: int, msg: string) void {
+    var span: Span = spanFromOffset(offset)
+    var err: Error = errorInit(span, msg)
+    errorReporterReport(reporter, err)
+}
+
+fn errorReporterErrorWithCode(reporter: ErrorReporter, offset: int, code: ErrorCode, msg: string) void {
+    var span: Span = spanFromOffset(offset)
+    var err: Error = errorInitWithCode(span, msg, code)
+    errorReporterReport(reporter, err)
+}
+
+fn errorReporterErrorAtSpan(reporter: ErrorReporter, span: Span, msg: string) void {
+    var err: Error = errorInit(span, msg)
+    errorReporterReport(reporter, err)
+}
+
+fn errorReporterReport(reporter: ErrorReporter, err: Error) void {
+    // Track first error
+    if not reporter.has_first {
+        reporter.first = err
+        reporter.has_first = true
+    }
+    reporter.count = reporter.count + 1
+
+    // Print the error
+    errorReporterPrint(reporter, err)
+}
+
+fn errorReporterPrint(reporter: ErrorReporter, err: Error) void {
+    // In bootstrap, we don't have print/println available as builtins
+    // The actual compiler will use proper error formatting
+    // For now, this is a no-op placeholder
+    var dummy: int = reporter.count
+    var dummy2: int = err.span.start.offset
+}
+
+fn errorReporterHasErrors(reporter: ErrorReporter) bool {
+    return reporter.count > 0
+}
+
+fn errorReporterGetCount(reporter: ErrorReporter) int {
+    return reporter.count
+}
+
+fn errorReporterGetFirst(reporter: ErrorReporter) Error {
+    return reporter.first
+}
+
+fn errorReporterHasFirst(reporter: ErrorReporter) bool {
+    return reporter.has_first
+}
+
+// =============================================================================
+// Trace (debug output)
+// =============================================================================
+
+// Trace flag - set to true when debugging
+// Note: In bootstrap, trace output is disabled (no print available)
+fn traceMsg(msg: string) void {
+    // No-op in bootstrap - print/println not available
+    var dummy: int = len(msg)
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+fn main() int {
+    // Test calling errorCodeValue
+    var val: int = errorCodeValue(ErrorCode.E100)
+    if val != 100 {
+        return 1
+    }
+
+    // Test span creation
+    var span: Span = spanFromOffset(42)
+    if span.start.offset != 42 {
+        return 2
+    }
+
+    return 42
+}
