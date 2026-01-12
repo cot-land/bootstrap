@@ -566,8 +566,14 @@ pub fn stpPostIndex(buf: *CodeBuffer, rt: Reg, rt2: Reg, rn: Reg, imm7: i7) !voi
 
 /// LDRB Wd, [Xn, #imm] - Load byte with zero extension to 64-bit
 pub fn ldrbRegImm(buf: *CodeBuffer, rt: Reg, rn: Reg, offset: u12) !void {
-    // size=00 (byte), V=0, opc=01 (load)
+    // size=00 (byte), V=0, opc=01 (load unsigned)
     try emit32(buf, loadStoreUnsignedOffset(0b00, false, 0b01, offset, rn, rt));
+}
+
+/// LDRSB Xt, [Xn, #imm] - Load signed byte, sign-extend to 64-bit
+pub fn ldrsbRegImm(buf: *CodeBuffer, rt: Reg, rn: Reg, offset: u12) !void {
+    // size=00 (byte), V=0, opc=10 (load signed extend to 64-bit)
+    try emit32(buf, loadStoreUnsignedOffset(0b00, false, 0b10, offset, rn, rt));
 }
 
 /// STRB Wd, [Xn, #imm] - Store low byte of register

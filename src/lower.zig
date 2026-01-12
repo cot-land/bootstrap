@@ -2183,16 +2183,19 @@ pub const Lowerer = struct {
             }
         }
 
-        // Fall back to generic index op for other cases
+        // Fall back to index_value for non-local bases (e.g., container.content[i])
+        // args[0] = IR node ref (base value), args[1] = index value
         const base = try self.lowerExpr(index.base);
         const idx = try self.lowerExpr(index.index);
 
         // Get the element type from the base expression's type
         const base_type_idx = self.inferTypeFromExpr(index.base);
         const elem_type = self.type_ctx.getElementType(base_type_idx) orelse TypeRegistry.VOID;
+        const elem_size: u32 = self.type_reg.sizeOf(elem_type);
 
-        const node = ir.Node.init(.index, elem_type, Span.fromPos(Pos.zero))
-            .withArgs(&.{ base, idx });
+        const node = ir.Node.init(.index_value, elem_type, Span.fromPos(Pos.zero))
+            .withArgs(&.{ base, idx })
+            .withAux(@intCast(elem_size));
 
         return try fb.emit(node);
     }
@@ -2247,9 +2250,9 @@ pub const Lowerer = struct {
                     end = try fb.emit(len_node);
                 }
 
-                // Emit slice op: args[0] = local_idx, args[1] = start, args[2] = end
+                // Emit slice_local op: args[0] = local_idx, args[1] = start, args[2] = end
                 // aux = element size for pointer arithmetic
-                const node = ir.Node.init(.slice, slice_type, slice_expr.span)
+                const node = ir.Node.init(.slice_local, slice_type, slice_expr.span)
                     .withArgs(&.{ @as(ir.NodeIndex, @intCast(local_idx)), start, end })
                     .withAux(@intCast(elem_size));
 
@@ -2260,109 +2263,90 @@ pub const Lowerer = struct {
             }
         }
 
-        // Fallback for other cases (TODO: handle slicing slices, etc.)
-        log.debug("  slice expr: fallback path (not fully implemented)", .{});
-        const zero_node = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
-            .withAux(0);
-        return try fb.emit(zero_node);
+        // Fallback for non-local bases (e.g., state.content[0:2]) - use slice_value
+        // Lower the base expression first
+        const base = try self.lowerExpr(slice_expr.base);
+
+        // Lower start index (default to 0 if not provided)
+        var start: ir.NodeIndex = ir.null_node;
+        if (slice_expr.start != ast.null_node) {
+            start = try self.lowerExpr(slice_expr.start);
+        } else {
+            const zero_node = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
+                .withAux(0);
+            start = try fb.emit(zero_node);
+        }
+
+        // Lower end index
+        var end: ir.NodeIndex = ir.null_node;
+        if (slice_expr.end != ast.null_node) {
+            end = try self.lowerExpr(slice_expr.end);
+        } else {
+            // For slices without explicit end, we'd need the length
+            // For now, require explicit end on non-local bases
+            const zero_node = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
+                .withAux(0);
+            end = try fb.emit(zero_node);
+        }
+
+        log.debug("  slice expr: value base, start={d}, end={d}, elem_size={d}", .{
+            start, end, elem_size,
+        });
+
+        const node = ir.Node.init(.slice_value, slice_type, slice_expr.span)
+            .withArgs(&.{ base, start, end })
+            .withAux(@intCast(elem_size));
+        return try fb.emit(node);
     }
 
     fn lowerFieldAccess(self: *Lowerer, field: ast.FieldAccess) Allocator.Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
 
-        // Get the base expression to determine its type
-        const base_node = self.tree.getNode(field.base);
-        var base_type_idx: TypeIndex = TypeRegistry.VOID;
+        // For value-type nested field access (e.g., span.start.offset), we compute
+        // cumulative offset and emit a single field op from the root local.
+        // This follows Go's approach: value-type field access is flattened at compile time.
+        // Only pointer-type field access requires separate load-then-field operations.
 
-        // Check if base is an identifier (local variable)
-        if (base_node == .expr) {
-            switch (base_node.expr) {
-                .identifier => |ident| {
-                    if (fb.lookupLocal(ident.name)) |local_idx| {
-                        base_type_idx = fb.locals.items[local_idx].type_idx;
-                    }
-                },
-                else => {},
-            }
-        }
+        // Walk the field access chain to find root local and compute cumulative offset
+        const chain_info = self.resolveFieldAccessChain(field);
 
-        // Look up struct type and find field offset
-        const base_type = self.type_reg.get(base_type_idx);
-        var field_offset: u32 = 0;
-        var field_type_idx: TypeIndex = TypeRegistry.VOID;
-        var is_ptr_deref = false;
+        if (chain_info.root_local_idx) |local_idx| {
+            log.debug("  field_access: .{s} cumulative offset {d}, ptr_deref={}", .{
+                field.field,
+                chain_info.cumulative_offset,
+                chain_info.is_ptr_deref,
+            });
 
-        switch (base_type) {
-            .struct_type => |st| {
-                for (st.fields) |f| {
-                    if (std.mem.eql(u8, f.name, field.field)) {
-                        field_offset = f.offset;
-                        field_type_idx = f.type_idx;
-                        break;
-                    }
-                }
-            },
-            .pointer => |ptr| {
-                // Pointer to struct - need to dereference
-                const elem_type = self.type_reg.get(ptr.elem);
-                if (elem_type == .struct_type) {
-                    const st = elem_type.struct_type;
-                    for (st.fields) |f| {
-                        if (std.mem.eql(u8, f.name, field.field)) {
-                            field_offset = f.offset;
-                            field_type_idx = f.type_idx;
-                            is_ptr_deref = true;
-                            break;
-                        }
-                    }
-                }
-            },
-            else => {},
-        }
+            const local = fb.locals.items[local_idx];
+            const root_type = self.type_reg.get(local.type_idx);
+            const is_large_struct_param = local.is_param and
+                root_type == .struct_type and
+                self.type_reg.sizeOf(local.type_idx) > 16;
 
-        log.debug("  field_access: .{s} at offset {d}, ptr_deref={}", .{ field.field, field_offset, is_ptr_deref });
-
-        // Emit: addr_local for base, then load at offset
-        const base_node_idx = self.tree.getNode(field.base);
-        if (base_node_idx == .expr and base_node_idx.expr == .identifier) {
-            const ident = base_node_idx.expr.identifier;
-            if (fb.lookupLocal(ident.name)) |local_idx| {
-                // Check if this is a large struct parameter (passed by reference on ARM64)
-                // Large struct params (>16 bytes) are passed as pointers, need ptr_field
-                const local = fb.locals.items[local_idx];
-                const is_large_struct_param = local.is_param and
-                    base_type == .struct_type and
-                    self.type_reg.sizeOf(base_type_idx) > 16;
-
-                if (is_ptr_deref or is_large_struct_param) {
-                    // For pointer to struct OR large struct param: load pointer value, then access field at offset
-                    // args[0] = local_idx (which holds the pointer), aux = field_offset
-                    const node = ir.Node.init(.ptr_field, field_type_idx, Span.fromPos(Pos.zero))
-                        .withArgs(&.{@intCast(local_idx)})
-                        .withAux(@intCast(field_offset));
-                    return try fb.emit(node);
-                } else {
-                    // For direct struct: emit field op to load the field value
-                    const field_node = ir.Node.init(.field, field_type_idx, Span.fromPos(Pos.zero))
-                        .withArgs(&.{@intCast(local_idx)})
-                        .withAux(@intCast(field_offset));
-                    return try fb.emit(field_node);
-                }
+            if (chain_info.is_ptr_deref or is_large_struct_param) {
+                const node = ir.Node.init(.ptr_field, chain_info.field_type_idx, Span.fromPos(Pos.zero))
+                    .withArgs(&.{@intCast(local_idx)})
+                    .withAux(@intCast(chain_info.cumulative_offset));
+                return try fb.emit(node);
+            } else {
+                // Field access on local variable - use field_local (arg = local index)
+                const field_node = ir.Node.init(.field_local, chain_info.field_type_idx, Span.fromPos(Pos.zero))
+                    .withArgs(&.{@intCast(local_idx)})
+                    .withAux(@intCast(chain_info.cumulative_offset));
+                return try fb.emit(field_node);
             }
         }
 
         // Check if this is an enum variant access (e.g., Token.kw_fn)
+        const base_node = self.tree.getNode(field.base);
         if (base_node == .expr and base_node.expr == .identifier) {
             const type_name = base_node.expr.identifier.name;
-            // Look up the type by name
             if (self.type_reg.lookupByName(type_name)) |type_idx| {
                 const ty = self.type_reg.get(type_idx);
                 if (ty == .enum_type) {
                     const et = ty.enum_type;
-                    // Look up the variant by name
                     for (et.variants) |variant| {
                         if (std.mem.eql(u8, variant.name, field.field)) {
-                            // Return the variant's value as a const_int
                             const const_node = ir.Node.init(.const_int, et.backing_type, Span.fromPos(Pos.zero))
                                 .withAux(variant.value);
                             return try fb.emit(const_node);
@@ -2372,12 +2356,114 @@ pub const Lowerer = struct {
             }
         }
 
-        // Fallback: emit basic field op
+        // Fallback for non-local bases (e.g., function call results) - use field_value (arg = IR node ref)
+        log.debug("  field_access: fallback for .{s}", .{field.field});
         const base = try self.lowerExpr(field.base);
-        const node = ir.Node.init(.field, field_type_idx, Span.fromPos(Pos.zero))
+        const node = ir.Node.init(.field_value, chain_info.field_type_idx, Span.fromPos(Pos.zero))
             .withArgs(&.{base})
-            .withAux(@intCast(field_offset));
+            .withAux(@intCast(chain_info.cumulative_offset));
         return try fb.emit(node);
+    }
+
+    /// Resolve a chain of field accesses to find the root local and cumulative offset.
+    /// For `span.start.offset`, returns root_local=span, offset=0+0=0, type=int.
+    const FieldAccessChainInfo = struct {
+        root_local_idx: ?u32,
+        cumulative_offset: u32,
+        field_type_idx: TypeIndex,
+        is_ptr_deref: bool,
+    };
+
+    fn resolveFieldAccessChain(self: *Lowerer, field: ast.FieldAccess) FieldAccessChainInfo {
+        const fb = self.current_func orelse return .{
+            .root_local_idx = null,
+            .cumulative_offset = 0,
+            .field_type_idx = TypeRegistry.VOID,
+            .is_ptr_deref = false,
+        };
+
+        var cumulative_offset: u32 = 0;
+        var current_type_idx: TypeIndex = TypeRegistry.VOID;
+        var field_type_idx: TypeIndex = TypeRegistry.VOID;
+        var is_ptr_deref = false;
+
+        // Walk up the chain collecting field names
+        var field_names: [16][]const u8 = undefined; // Max 16 levels of nesting
+        var field_count: usize = 0;
+        field_names[field_count] = field.field;
+        field_count += 1;
+
+        var current_base = field.base;
+        var root_local_idx: ?u32 = null;
+
+        while (field_count < 16) {
+            const base_node = self.tree.getNode(current_base);
+            if (base_node == .expr) {
+                switch (base_node.expr) {
+                    .identifier => |ident| {
+                        if (fb.lookupLocal(ident.name)) |local_idx| {
+                            root_local_idx = local_idx;
+                            current_type_idx = fb.locals.items[local_idx].type_idx;
+                        }
+                        break;
+                    },
+                    .field_access => |fa| {
+                        field_names[field_count] = fa.field;
+                        field_count += 1;
+                        current_base = fa.base;
+                    },
+                    else => break,
+                }
+            } else {
+                break;
+            }
+        }
+
+        // Process fields from root outward (reverse order)
+        if (root_local_idx != null) {
+            var i: usize = field_count;
+            while (i > 0) {
+                i -= 1;
+                const field_name = field_names[i];
+                const current_type = self.type_reg.get(current_type_idx);
+
+                switch (current_type) {
+                    .struct_type => |st| {
+                        for (st.fields) |f| {
+                            if (std.mem.eql(u8, f.name, field_name)) {
+                                cumulative_offset += f.offset;
+                                field_type_idx = f.type_idx;
+                                current_type_idx = f.type_idx;
+                                break;
+                            }
+                        }
+                    },
+                    .pointer => |ptr| {
+                        const elem_type = self.type_reg.get(ptr.elem);
+                        if (elem_type == .struct_type) {
+                            const st = elem_type.struct_type;
+                            for (st.fields) |f| {
+                                if (std.mem.eql(u8, f.name, field_name)) {
+                                    cumulative_offset += f.offset;
+                                    field_type_idx = f.type_idx;
+                                    current_type_idx = f.type_idx;
+                                    is_ptr_deref = true;
+                                    break;
+                                }
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        return .{
+            .root_local_idx = root_local_idx,
+            .cumulative_offset = cumulative_offset,
+            .field_type_idx = field_type_idx,
+            .is_ptr_deref = is_ptr_deref,
+        };
     }
 
     fn lowerStructInit(self: *Lowerer, si: ast.StructInit) Allocator.Error!ir.NodeIndex {
@@ -2830,8 +2916,33 @@ pub const Lowerer = struct {
                         return TypeRegistry.VOID;
                     },
 
-                    // Field access
-                    .field_access => return TypeRegistry.VOID, // TODO: look up field type
+                    // Field access - recursively get base type, then look up field
+                    .field_access => |fa| {
+                        const base_type_idx = self.inferTypeFromExpr(fa.base);
+                        const base_type = self.type_reg.get(base_type_idx);
+                        switch (base_type) {
+                            .struct_type => |st| {
+                                for (st.fields) |f| {
+                                    if (std.mem.eql(u8, f.name, fa.field)) {
+                                        return f.type_idx;
+                                    }
+                                }
+                            },
+                            .pointer => |ptr| {
+                                const elem_type = self.type_reg.get(ptr.elem);
+                                if (elem_type == .struct_type) {
+                                    const st = elem_type.struct_type;
+                                    for (st.fields) |f| {
+                                        if (std.mem.eql(u8, f.name, fa.field)) {
+                                            return f.type_idx;
+                                        }
+                                    }
+                                }
+                            },
+                            else => {},
+                        }
+                        return TypeRegistry.VOID;
+                    },
 
                     // Index - get element type from indexable
                     .index => |idx| {

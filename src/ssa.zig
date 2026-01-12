@@ -133,15 +133,29 @@ pub const Op = enum(u8) {
     addr,
     alloc,
 
-    // Struct/array
-    field,
+    // Struct/array field access
+    /// Get struct field from local variable. args[0] = local index (raw), aux_int = field offset
+    field_local,
+    /// Get struct field from SSA value (nested/chained access). args[0] = SSA value ref, aux_int = field offset
+    field_value,
     // Load field through pointer: args[0] = local index holding ptr, aux_int = field offset
     ptr_field,
+
+    // Array/slice indexing
+    /// Index into local array/slice. args[0] = local index (raw), args[1] = index (SSA ref)
+    index_local,
+    /// Index into SSA value (chained access). args[0] = SSA value ref, args[1] = index (SSA ref)
+    index_value,
+    // Legacy ops (to be removed)
+    field,
     index,
 
     // Slice construction
-    // args[0] = base local index, args[1] = start value, args[2] = end value
-    // aux_int = element size
+    /// Slice from local array/slice. args[0] = local index (raw), args[1] = start, args[2] = end. aux_int = elem_size
+    slice_local,
+    /// Slice from SSA value. args[0] = SSA value ref, args[1] = start, args[2] = end. aux_int = elem_size
+    slice_value,
+    // Legacy (to be removed)
     slice_make,
 
     // Slice indexing

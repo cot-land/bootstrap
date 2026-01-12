@@ -672,10 +672,17 @@ pub const Driver = struct {
         // This avoids the complexity of body-first with separate epilogue patching
         const estimated_spill = estimateSpillRequirements(func, type_reg);
 
-        // Stack size: frame_size (locals) + 16 (fp/lr) + estimated spill space
-        const stack_size = alignTo(func.frame_size + 16 + estimated_spill, 16);
+        // Stack size: frame_size (locals) + 16 (fp/lr) + 80 (callee-saved) + estimated spill
+        // We always reserve 80 bytes for callee-saved registers (x19-x28 = 10 regs * 8 bytes)
+        // but only save/restore the ones actually used (Go's approach for simplicity).
+        // This avoids the complexity of two-phase codegen with offset adjustment.
+        const callee_saved_reserved: u32 = 80;
+        const stack_size = alignTo(func.frame_size + 16 + callee_saved_reserved + estimated_spill, 16);
 
-        // Create CodeGen with pre-calculated stack size
+        // Simple approach: Always save ALL callee-saved registers in prologue.
+        // This wastes some stack/instructions but is correct and simple.
+        // (Optimizing to only save used registers requires two-phase codegen.)
+
         var cg = arm64_codegen.CodeGen.init(
             self.allocator,
             buf,
@@ -690,7 +697,7 @@ pub const Driver = struct {
         // Compute liveness for smart spill decisions
         try cg.computeLiveness();
 
-        // Generate prologue
+        // Generate prologue (saves ALL callee-saved registers)
         try cg.genPrologue();
 
         // Track block start offsets for jumps
@@ -1005,13 +1012,21 @@ fn convertIRNode(func: *ssa.Func, node: *const ir.Node, ir_to_ssa: *std.AutoHash
         .param => .arg,
         .select => .select,
 
-        // Struct/Array
-        .field => .field,
-        .index => .index,
-        .addr_index => .index, // Dynamic array indexing becomes index op
+        // Struct/Array - new distinct ops
+        .field_local => .field_local,
+        .field_value => .field_value,
+        .index_local => .index_local,
+        .index_value => .index_value,
+        // Legacy ops (map to local variants for backwards compatibility)
+        .field => .field_local,
+        .index => .index_local,
+        .addr_index => .index_local, // Dynamic array indexing on local
 
-        // Slice operations
-        .slice => .slice_make,
+        // Slice operations - new distinct ops
+        .slice_local => .slice_local,
+        .slice_value => .slice_value,
+        // Legacy
+        .slice => .slice_local,
         .slice_index => .slice_index,
 
         // Union operations
@@ -1077,20 +1092,49 @@ fn convertIRNode(func: *ssa.Func, node: *const ir.Node, ir_to_ssa: *std.AutoHash
                 }
             }
         },
-        .field, .ptr_field, .addr_field => {
-            // field/ptr_field/addr_field: args[0] = local index (raw, not SSA ref), aux = field offset
-            // Keep args[0] as local index directly
+        .field_local, .field, .ptr_field, .addr_field => {
+            // field_local/ptr_field/addr_field: args[0] is always local index (raw)
             if (node.args_len > 0) {
-                value.args_storage[0] = node.args()[0]; // local index, not SSA converted
+                value.args_storage[0] = node.args()[0]; // local index, raw
                 value.args_len = 1;
             }
             // aux_int already copied above (contains field offset)
         },
-        .slice => {
-            // slice: args[0] = local index (raw), args[1] = start (SSA), args[2] = end (SSA)
+        .field_value => {
+            // field_value: args[0] is always IR node ref (convert to SSA)
+            if (node.args_len > 0) {
+                if (ir_to_ssa.get(node.args()[0])) |ssa_ref| {
+                    value.args_storage[0] = ssa_ref;
+                    value.args_len = 1;
+                }
+            }
+            // aux_int already copied above (contains field offset)
+        },
+        .slice_local, .slice => {
+            // slice_local: args[0] = local index (raw), args[1] = start (SSA), args[2] = end (SSA)
             // aux = element size
             if (node.args_len > 0) {
                 value.args_storage[0] = node.args()[0]; // local index, raw
+            }
+            if (node.args_len > 1) {
+                if (ir_to_ssa.get(node.args()[1])) |ssa_val| {
+                    value.args_storage[1] = ssa_val; // start value (SSA ref)
+                }
+            }
+            if (node.args_len > 2) {
+                if (ir_to_ssa.get(node.args()[2])) |ssa_val| {
+                    value.args_storage[2] = ssa_val; // end value (SSA ref)
+                }
+            }
+            value.args_len = 3;
+        },
+        .slice_value => {
+            // slice_value: args[0] = base value (SSA), args[1] = start (SSA), args[2] = end (SSA)
+            // aux = element size
+            if (node.args_len > 0) {
+                if (ir_to_ssa.get(node.args()[0])) |ssa_ref| {
+                    value.args_storage[0] = ssa_ref; // base value (SSA ref)
+                }
             }
             if (node.args_len > 1) {
                 if (ir_to_ssa.get(node.args()[1])) |ssa_val| {
@@ -1117,11 +1161,26 @@ fn convertIRNode(func: *ssa.Func, node: *const ir.Node, ir_to_ssa: *std.AutoHash
             }
             value.args_len = 2;
         },
-        .index, .addr_index => {
-            // index/addr_index: args[0] = local index (raw), args[1] = index value (SSA)
+        .index_local, .index, .addr_index => {
+            // index_local/addr_index: args[0] is always local index (raw), args[1] = index (SSA)
             // aux = element size
             if (node.args_len > 0) {
                 value.args_storage[0] = node.args()[0]; // local index, raw
+            }
+            if (node.args_len > 1) {
+                if (ir_to_ssa.get(node.args()[1])) |ssa_val| {
+                    value.args_storage[1] = ssa_val; // index value (SSA ref)
+                }
+            }
+            value.args_len = 2;
+        },
+        .index_value => {
+            // index_value: args[0] = base value (SSA), args[1] = index (SSA)
+            // aux = element size
+            if (node.args_len > 0) {
+                if (ir_to_ssa.get(node.args()[0])) |ssa_ref| {
+                    value.args_storage[0] = ssa_ref; // base value (SSA ref)
+                }
             }
             if (node.args_len > 1) {
                 if (ir_to_ssa.get(node.args()[1])) |ssa_val| {

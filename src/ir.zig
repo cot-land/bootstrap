@@ -124,11 +124,22 @@ pub const Op = enum(u8) {
     ptr_field,
 
     // ========== Struct/Array/Union ==========
-    /// Get struct field. aux = field index, args[0] = struct value
+    /// Get struct field from local variable. aux = field offset, args[0] = local index
+    field_local,
+    /// Get struct field from IR value (nested/chained access). aux = field offset, args[0] = IR node ref
+    field_value,
+    /// Get array/slice element from local. args[0] = local index, args[1] = index value
+    index_local,
+    /// Get array/slice element from IR value (chained access). args[0] = IR node ref, args[1] = index value
+    index_value,
+    // Legacy ops (to be removed after migration)
     field,
-    /// Get array/slice element. args[0] = array, args[1] = index
     index,
-    /// Slice operation. args[0] = array, args[1] = start, args[2] = end
+    /// Slice operation on local. args[0] = local index, args[1] = start, args[2] = end. aux = elem_size
+    slice_local,
+    /// Slice operation on IR value. args[0] = IR node ref, args[1] = start, args[2] = end. aux = elem_size
+    slice_value,
+    // Legacy slice op (to be removed)
     slice,
     /// Index into slice. args[0] = slice local, args[1] = index. aux = elem_size
     slice_index,

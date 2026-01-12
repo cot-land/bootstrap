@@ -8,8 +8,8 @@
 
 | Platform | Status | Notes |
 |----------|--------|-------|
-| ARM64 (macOS) | ✅ 63/65 Pass | Comprehensive passes, 2 interp tests skip |
-| x86_64 (Linux) | ✅ 63/65 Pass | Comprehensive passes, 2 interp tests skip |
+| ARM64 (macOS) | ✅ 71/81 Pass | All tests pass, 10 skipped (no expected value) |
+| x86_64 (Linux) | ✅ 71/81 Pass | All tests pass, 10 skipped (no expected value) |
 
 ```bash
 # Fast validation (default - runs comprehensive test only)
@@ -46,8 +46,9 @@ zig build test                    # 135+ embedded tests
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| `i8, i16, i32, i64` | Done | Signed integers |
-| `u8, u16, u32, u64` | Done | Unsigned integers |
+| `i8, i16, i32, i64` | Done | Signed integers (sign-extending loads) |
+| `u8, u16, u32, u64` | Done | Unsigned integers (zero-extending loads) |
+| Integer widening | Done | Implicit i8→i64, u8→u64 (same signedness) |
 | `int` (alias for i64) | Done | Default integer type |
 | `f32, f64, float` | Done | Floating point |
 | `bool` | Done | Boolean |

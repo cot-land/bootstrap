@@ -99,6 +99,14 @@ pub const BasicKind = enum(u8) {
         };
     }
 
+    /// Check if this is an unsigned integer type.
+    pub fn isUnsigned(self: BasicKind) bool {
+        return switch (self) {
+            .u8_type, .u16_type, .u32_type, .u64_type => true,
+            else => false,
+        };
+    }
+
     /// Check if this is a floating point type.
     pub fn isFloat(self: BasicKind) bool {
         return switch (self) {
@@ -498,6 +506,32 @@ pub const TypeRegistry = struct {
         return null;
     }
 
+    /// Get the type of a struct field at a given byte offset.
+    /// Returns the field's type_idx if found, or null if not a struct or no field at that offset.
+    pub fn getFieldTypeAtOffset(self: *const TypeRegistry, struct_type_idx: TypeIndex, offset: u32) ?TypeIndex {
+        const t = self.get(struct_type_idx);
+        switch (t) {
+            .struct_type => |st| {
+                for (st.fields) |field| {
+                    if (field.offset == offset) {
+                        return field.type_idx;
+                    }
+                }
+                return null;
+            },
+            else => return null,
+        }
+    }
+
+    /// Check if a type is a signed integer (i8, i16, i32, i64).
+    pub fn isSigned(self: *const TypeRegistry, idx: TypeIndex) bool {
+        const t = self.get(idx);
+        return switch (t) {
+            .basic => |b| b.isSigned(),
+            else => false,
+        };
+    }
+
     /// Check if two types are equal.
     pub fn equal(self: *const TypeRegistry, a: TypeIndex, b: TypeIndex) bool {
         if (a == b) return true;
@@ -584,7 +618,7 @@ pub const TypeRegistry = struct {
         const tf = self.get(from);
         const tt = self.get(to);
 
-        // Handle untyped -> typed conversions
+        // Handle untyped -> typed conversions and implicit widening
         return switch (tf) {
             .basic => |kf| switch (tt) {
                 .basic => |kt| {
@@ -594,6 +628,14 @@ pub const TypeRegistry = struct {
                     if (kf == .untyped_null) {
                         // null is assignable to optional types (handled below)
                         return false;
+                    }
+                    // Allow implicit widening of integer types
+                    // Signed -> larger signed, unsigned -> larger unsigned
+                    if (kf.isSigned() and kt.isSigned()) {
+                        return self.sizeOf(from) <= self.sizeOf(to);
+                    }
+                    if (kf.isUnsigned() and kt.isUnsigned()) {
+                        return self.sizeOf(from) <= self.sizeOf(to);
                     }
                     return false;
                 },
