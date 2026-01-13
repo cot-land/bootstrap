@@ -1,0 +1,18 @@
+// Test @fileRead builtin
+
+fn main() int {
+    // Read build.zig (should exist and have content)
+    var content: string = @fileRead("build.zig")
+
+    // Check that it has content
+    if len(content) < 100 {
+        return 1
+    }
+
+    // Check first character is expected (should be 'c' from "const std...")
+    if content[0] != 99 {
+        return 2
+    }
+
+    return 42
+}

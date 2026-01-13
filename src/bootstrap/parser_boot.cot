@@ -373,14 +373,12 @@ struct Node {
     body: NodeIndex,
     else_body: NodeIndex,
     type_expr: NodeIndex,
-    args: []NodeIndex,
+    args: List<NodeIndex>,
     span: Span,
 }
 
 fn makeNode(tag: NodeTag, span: Span) Node {
     // Create node with default values
-    // Note: args field will be empty slice - we use a sentinel array
-    var sentinel_args: [1]NodeIndex = [null_node]
     return Node{
         .tag = tag,
         .name = "",
@@ -392,7 +390,7 @@ fn makeNode(tag: NodeTag, span: Span) Node {
         .body = null_node,
         .else_body = null_node,
         .type_expr = null_node,
-        .args = sentinel_args[0:0],  // Empty slice from array
+        .args = new List<NodeIndex>(),
         .span = span,
     }
 }

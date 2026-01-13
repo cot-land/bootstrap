@@ -1,0 +1,17 @@
+// Test @fileExists builtin
+
+fn main() int {
+    // Test @fileExists on a known file
+    var exists: int = @fileExists("build.zig")
+    if exists != 1 {
+        return 1
+    }
+
+    // Test @fileExists on a non-existent file
+    var not_exists: int = @fileExists("nonexistent_file_12345.txt")
+    if not_exists != 0 {
+        return 2
+    }
+
+    return 42
+}

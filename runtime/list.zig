@@ -203,6 +203,24 @@ export fn cot_list_elem_size(handle: ?*ListHandle) i64 {
     return @intCast(h.data.elem_size);
 }
 
+/// Get raw data pointer for the list's internal storage.
+/// Returns the byte pointer, or null (0) if empty or invalid.
+/// Used for file I/O where we need direct access to the bytes.
+export fn cot_list_data_ptr(handle: ?*ListHandle) i64 {
+    const h = handle orelse return 0;
+    const data = h.data;
+    const ptr = data.elements_ptr orelse return 0;
+    return @intCast(@intFromPtr(ptr));
+}
+
+/// Get total byte size of list data (length * elem_size).
+/// Returns 0 if empty or invalid.
+export fn cot_list_byte_size(handle: ?*ListHandle) i64 {
+    const h = handle orelse return 0;
+    const data = h.data;
+    return @intCast(data.length * data.elem_size);
+}
+
 /// Set an element in the list at a specific index
 /// For elements <= 8 bytes, value is passed directly
 /// For larger elements, value is a pointer to the source data

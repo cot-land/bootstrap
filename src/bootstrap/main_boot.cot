@@ -1,0 +1,182 @@
+// Main entry point for cot bootstrap compiler.
+// This is the CLI driver that orchestrates compilation.
+//
+// Based on src/main.zig patterns.
+// For stage 1 bootstrap, we start with hardcoded test paths.
+
+// =============================================================================
+// Version and Constants
+// =============================================================================
+
+fn getVersionMajor() int { return 0 }
+fn getVersionMinor() int { return 2 }
+fn getVersionPatch() int { return 0 }
+
+// =============================================================================
+// String Helpers
+// =============================================================================
+
+// Compare two strings for equality
+fn stringEquals(a: string, b: string) bool {
+    if len(a) != len(b) {
+        return false
+    }
+    var i: int = 0
+    while i < len(a) {
+        if a[i] != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Check if string starts with prefix
+fn stringStartsWith(s: string, prefix: string) bool {
+    if len(s) < len(prefix) {
+        return false
+    }
+    var i: int = 0
+    while i < len(prefix) {
+        if s[i] != prefix[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Check if string ends with ".cot"
+fn stringEndsCot(s: string) bool {
+    if len(s) < 4 {
+        return false
+    }
+    var suffix_start: int = len(s) - 4
+    if s[suffix_start] != 46 { return false }      // '.'
+    if s[suffix_start + 1] != 99 { return false }  // 'c'
+    if s[suffix_start + 2] != 111 { return false } // 'o'
+    if s[suffix_start + 3] != 116 { return false } // 't'
+    return true
+}
+
+// =============================================================================
+// Command Parsing
+// =============================================================================
+
+enum Command: u8 {
+    build,
+    version,
+    help,
+    unknown,
+}
+
+fn parseCommand(arg: string) Command {
+    if stringEquals(arg, "build") {
+        return Command.build
+    }
+    if stringEquals(arg, "version") {
+        return Command.version
+    }
+    if stringEquals(arg, "help") {
+        return Command.help
+    }
+    // If it ends with .cot, treat as build
+    if stringEndsCot(arg) {
+        return Command.build
+    }
+    return Command.unknown
+}
+
+// =============================================================================
+// Build Options Parsing
+// =============================================================================
+
+struct BuildOptions {
+    input_path: string,
+    output_path: string,
+    compile_only: bool,
+    verbose: bool,
+    debug_ir: bool,
+    debug_ssa: bool,
+    debug_codegen: bool,
+    disasm: bool,
+}
+
+fn buildOptionsDefault() BuildOptions {
+    return BuildOptions{
+        .input_path = "",
+        .output_path = "",
+        .compile_only = false,
+        .verbose = false,
+        .debug_ir = false,
+        .debug_ssa = false,
+        .debug_codegen = false,
+        .disasm = false,
+    }
+}
+
+// Check if string is an option flag (starts with -)
+fn isOptionFlag(arg: string) bool {
+    if len(arg) == 0 {
+        return false
+    }
+    return arg[0] == 45  // '-'
+}
+
+// =============================================================================
+// Test Entry Point
+// =============================================================================
+
+// For now, test with hardcoded paths until we add @argsGet builtin
+fn main() int {
+    // Test version functions
+    if getVersionMajor() != 0 { return 1 }
+    if getVersionMinor() != 2 { return 2 }
+    if getVersionPatch() != 0 { return 3 }
+
+    // Test string comparison
+    var test_str: string = "build"
+    if !stringEquals(test_str, "build") { return 4 }
+    if stringEquals(test_str, "help") { return 5 }
+
+    // Test stringEndsCot
+    if !stringEndsCot("test.cot") { return 6 }
+    if stringEndsCot("unknown") { return 7 }
+
+    // Test command parsing
+    var cmd: Command = parseCommand("build")
+    if cmd != Command.build { return 8 }
+
+    cmd = parseCommand("version")
+    if cmd != Command.version { return 9 }
+
+    cmd = parseCommand("help")
+    if cmd != Command.help { return 10 }
+
+    cmd = parseCommand("test.cot")
+    if cmd != Command.build { return 11 }
+
+    cmd = parseCommand("unknown")
+    if cmd != Command.unknown { return 12 }
+
+    // Test stringEquals with same-length different strings
+    var unk: string = "unknown"
+    var ver: string = "version"
+    if stringEquals(unk, ver) { return 13 }
+
+    // Test option flag detection
+    if !isOptionFlag("-o") { return 14 }
+    if isOptionFlag("file.cot") { return 15 }
+
+    // Test build options default
+    var opts: BuildOptions = buildOptionsDefault()
+    if len(opts.input_path) != 0 { return 16 }
+    if opts.compile_only { return 17 }
+    if opts.verbose { return 18 }
+
+    // Test string starts with
+    if !stringStartsWith("--debug-ir", "--debug") { return 19 }
+    if stringStartsWith("--debug-ir", "--other") { return 20 }
+
+    return 42
+}

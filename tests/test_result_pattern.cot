@@ -1,0 +1,95 @@
+enum Token: u8 {
+    eof, identifier, kw_fn
+}
+
+struct Node {
+    tag: int,
+    value: int,
+}
+
+struct ParserState {
+    content: string,
+    pos: int,
+    len: int,
+    tok: Token,
+    tok_start: int,
+    tok_end: int,
+    tok_text: string,
+    nodes: List<Node>,
+    error_count: int,
+}
+
+struct ParseResult {
+    state: ParserState,
+    node_idx: int,
+}
+
+const null_node: int = 2147483647
+
+fn advance(state: ParserState) ParserState {
+    var new_pos: int = state.pos + 1
+    if new_pos >= state.len {
+        return ParserState{
+            .content = state.content,
+            .pos = new_pos,
+            .len = state.len,
+            .tok = Token.eof,
+            .tok_start = new_pos,
+            .tok_end = new_pos,
+            .tok_text = "",
+            .nodes = state.nodes,
+            .error_count = state.error_count,
+        }
+    }
+    return ParserState{
+        .content = state.content,
+        .pos = new_pos,
+        .len = state.len,
+        .tok = Token.identifier,
+        .tok_start = new_pos,
+        .tok_end = new_pos,
+        .tok_text = "t",
+        .nodes = state.nodes,
+        .error_count = state.error_count,
+    }
+}
+
+fn parseDecl(state: ParserState) ParseResult {
+    // Simulate: just advance and return
+    var new_state: ParserState = advance(state)
+    return ParseResult{
+        .state = new_state,
+        .node_idx = 1,  // pretend we parsed something
+    }
+}
+
+fn main() int {
+    var state: ParserState = ParserState{
+        .content = "test",
+        .pos = 0,
+        .len = 4,
+        .tok = Token.identifier,
+        .tok_start = 0,
+        .tok_end = 0,
+        .tok_text = "",
+        .nodes = new List<Node>(),
+        .error_count = 0,
+    }
+
+    var count: int = 0
+    var current: ParserState = state
+
+    while current.tok != Token.eof {
+        var result: ParseResult = parseDecl(current)
+        if result.node_idx != null_node {
+            current = result.state
+        } else {
+            current = advance(current)
+        }
+        count = count + 1
+        if count > 10 {
+            return 99
+        }
+    }
+    return count
+}

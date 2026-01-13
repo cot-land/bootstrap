@@ -33,10 +33,15 @@ zig build test                    # 135+ embedded tests
 
 | Progress | Count | Status |
 |----------|-------|--------|
-| Bootstrap .cot files done | 18/22 | 82% |
+| Bootstrap .cot files done | 20/23 | 87% |
+| Bootstrap tests passing (ARM64) | 16/16 | ✅ 100% |
 | Zig source files | 22 | Reference implementation |
 
-**Completed:** `token_boot.cot`, `source_boot.cot`, `scanner_boot.cot`, `ast_boot.cot`, `types_boot.cot`, `errors_boot.cot`, `parser_boot.cot`, `check_boot.cot`, `ir_boot.cot`, `lower_boot.cot`, `ssa_boot.cot`, `liveness_boot.cot`, `type_context_boot.cot`, `debug_boot.cot`, `backend_boot.cot`, `aarch64_boot.cot`, `arm64_boot.cot`, `object_boot.cot`
+**Core files (16/16 passing):** `token_boot.cot`, `source_boot.cot`, `scanner_boot.cot`, `ast_boot.cot`, `types_boot.cot`, `errors_boot.cot`, `parser_boot.cot`, `check_boot.cot`, `ir_boot.cot`, `lower_boot.cot`, `ssa_boot.cot`, `liveness_boot.cot`, `type_context_boot.cot`, `debug_boot.cot`, `driver_boot.cot`, `main_boot.cot`
+
+**Codegen files (4):** `backend_boot.cot`, `aarch64_boot.cot`, `arm64_boot.cot`, `object_boot.cot`
+
+**Remaining:** `amd64_boot.cot`, `x86_64_boot.cot`, `pe_coff_boot.cot` (x86_64/Windows - not required for ARM64 bootstrap)
 
 ---
 

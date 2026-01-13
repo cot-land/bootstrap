@@ -101,6 +101,8 @@ aarch64_boot
 arm64_boot
 arm64_boot_test
 object_boot
+driver_boot
+main_boot
 
 # Any test binary in root
 /test_*

@@ -1,0 +1,207 @@
+// Compilation driver for cot bootstrap.
+// Orchestrates the entire compilation pipeline.
+//
+// Based on src/driver.zig patterns.
+// For stage 1 bootstrap, we only need ARM64 macOS output.
+
+// =============================================================================
+// Target Configuration
+// =============================================================================
+
+enum Arch: u8 {
+    x86_64,
+    aarch64,
+}
+
+enum OS: u8 {
+    linux,
+    macos,
+    windows,
+}
+
+struct Target {
+    arch: Arch,
+    os: OS,
+}
+
+fn targetNative() Target {
+    // For bootstrap, assume ARM64 macOS
+    return Target{
+        .arch = Arch.aarch64,
+        .os = OS.macos,
+    }
+}
+
+// =============================================================================
+// Compile Options
+// =============================================================================
+
+struct CompileOptions {
+    input_path: string,
+    output_path: string,
+    target: Target,
+    debug_ir: bool,
+    debug_ssa: bool,
+    debug_codegen: bool,
+}
+
+fn compileOptionsNew(input: string, output: string) CompileOptions {
+    return CompileOptions{
+        .input_path = input,
+        .output_path = output,
+        .target = targetNative(),
+        .debug_ir = false,
+        .debug_ssa = false,
+        .debug_codegen = false,
+    }
+}
+
+// =============================================================================
+// Compile Result
+// =============================================================================
+
+struct CompileResult {
+    success: bool,
+    error_count: int,
+}
+
+fn compileResultSuccess() CompileResult {
+    return CompileResult{
+        .success = true,
+        .error_count = 0,
+    }
+}
+
+fn compileResultFailure(count: int) CompileResult {
+    return CompileResult{
+        .success = false,
+        .error_count = count,
+    }
+}
+
+// =============================================================================
+// Driver State
+// =============================================================================
+
+struct Driver {
+    options: CompileOptions,
+    source_content: string,
+    error_count: int,
+}
+
+fn driverNew(opts: CompileOptions) Driver {
+    return Driver{
+        .options = opts,
+        .source_content = "",
+        .error_count = 0,
+    }
+}
+
+// =============================================================================
+// Import Processing (Bootstrap - Textual Inclusion)
+// =============================================================================
+
+// Skip whitespace characters
+fn skipWhitespace(content: string, start: int) int {
+    var pos: int = start
+    while pos < len(content) {
+        var ch: int = content[pos]
+        if ch != 32 and ch != 9 and ch != 13 {  // space, tab, CR
+            return pos
+        }
+        pos = pos + 1
+    }
+    return pos
+}
+
+// Check if string starts with "import" at position
+fn isImportKeyword(content: string, pos: int) bool {
+    if pos + 6 > len(content) {
+        return false
+    }
+    if content[pos] != 105 { return false }      // 'i'
+    if content[pos + 1] != 109 { return false }  // 'm'
+    if content[pos + 2] != 112 { return false }  // 'p'
+    if content[pos + 3] != 111 { return false }  // 'o'
+    if content[pos + 4] != 114 { return false }  // 'r'
+    if content[pos + 5] != 116 { return false }  // 't'
+    return true
+}
+
+// =============================================================================
+// Main Compilation Pipeline
+// =============================================================================
+
+fn driverCompile(driver: *Driver) CompileResult {
+    // Phase 1: Read source file
+    var content: string = @fileRead(driver.*.options.input_path)
+    if len(content) == 0 {
+        // Error: cannot read source file
+        return compileResultFailure(1)
+    }
+    driver.*.source_content = content
+
+    // Phase 2: Parse
+    // TODO: Call parser_boot functions
+
+    // Phase 3: Type check
+    // TODO: Call check_boot functions
+
+    // Phase 4: Lower to IR
+    // TODO: Call lower_boot functions
+
+    // Phase 5: Convert to SSA
+    // TODO: Call ssa_boot functions
+
+    // Phase 6: Generate code
+    // TODO: Call arm64_boot functions
+
+    // Phase 7: Write object file
+    // TODO: Call object_boot functions
+
+    return compileResultSuccess()
+}
+
+// =============================================================================
+// Public Entry Point
+// =============================================================================
+
+fn compile(input_path: string, output_path: string) CompileResult {
+    var opts: CompileOptions = compileOptionsNew(input_path, output_path)
+    var driver: Driver = driverNew(opts)
+    return driverCompile(&driver)
+}
+
+// =============================================================================
+// Test
+// =============================================================================
+
+fn main() int {
+    // Test driver can read a file
+    var opts: CompileOptions = compileOptionsNew("build.zig", "test_out")
+    var driver: Driver = driverNew(opts)
+
+    var content: string = @fileRead(driver.options.input_path)
+    if len(content) < 100 {
+        return 1
+    }
+
+    // Test that we read the right file (starts with "const")
+    if content[0] != 99 {  // 'c'
+        return 2
+    }
+    if content[1] != 111 { // 'o'
+        return 3
+    }
+    if content[2] != 110 { // 'n'
+        return 4
+    }
+    if content[3] != 115 { // 's'
+        return 5
+    }
+    if content[4] != 116 { // 't'
+        return 6
+    }
+
+    return 42
+}

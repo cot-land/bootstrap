@@ -1658,6 +1658,26 @@ pub const Lowerer = struct {
             return self.lowerBuiltinMinInt(call);
         }
 
+        // Handle file I/O builtins (for bootstrap)
+        if (std.mem.eql(u8, func_name, "@fileRead")) {
+            return self.lowerBuiltinFileRead(call);
+        }
+        if (std.mem.eql(u8, func_name, "@fileWrite")) {
+            return self.lowerBuiltinFileWrite(call);
+        }
+        if (std.mem.eql(u8, func_name, "@fileExists")) {
+            return self.lowerBuiltinFileExists(call);
+        }
+        if (std.mem.eql(u8, func_name, "@fileFree")) {
+            return self.lowerBuiltinFileFree(call);
+        }
+        if (std.mem.eql(u8, func_name, "@listDataPtr")) {
+            return self.lowerBuiltinListDataPtr(call);
+        }
+        if (std.mem.eql(u8, func_name, "@listByteSize")) {
+            return self.lowerBuiltinListByteSize(call);
+        }
+
         // Lower arguments for regular call
         var args = std.ArrayList(ir.NodeIndex){ .items = &.{}, .capacity = 0 };
         defer args.deinit(self.allocator);
@@ -2003,6 +2023,98 @@ pub const Lowerer = struct {
         // Use i64 as result type since these are compile-time constants
         const node = ir.Node.init(.const_int, TypeRegistry.I64, Span.fromPos(Pos.zero))
             .withAux(min_value);
+        return try fb.emit(node);
+    }
+
+    /// Lower builtin @fileRead(path) - read file contents to string
+    fn lowerBuiltinFileRead(self: *Lowerer, call: ast.Call) Allocator.Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+
+        if (call.args.len != 1) return ir.null_node;
+
+        // Lower the path argument (should be a string)
+        const path_node = try self.lowerExpr(call.args[0]);
+
+        // Emit file_read op - result is a string (slice type)
+        const node = ir.Node.init(.file_read, TypeRegistry.STRING, Span.fromPos(Pos.zero))
+            .withArgs(&.{path_node});
+        return try fb.emit(node);
+    }
+
+    /// Lower builtin @fileWrite(path, data_ptr, data_len) - write bytes to file
+    fn lowerBuiltinFileWrite(self: *Lowerer, call: ast.Call) Allocator.Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+
+        if (call.args.len != 3) return ir.null_node;
+
+        // Lower arguments
+        const path_node = try self.lowerExpr(call.args[0]);
+        const data_ptr_node = try self.lowerExpr(call.args[1]);
+        const data_len_node = try self.lowerExpr(call.args[2]);
+
+        // Emit file_write op - result is i64 (success/failure)
+        const node = ir.Node.init(.file_write, TypeRegistry.I64, Span.fromPos(Pos.zero))
+            .withArgs(&.{ path_node, data_ptr_node, data_len_node });
+        return try fb.emit(node);
+    }
+
+    /// Lower builtin @fileExists(path) - check if file exists
+    fn lowerBuiltinFileExists(self: *Lowerer, call: ast.Call) Allocator.Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+
+        if (call.args.len != 1) return ir.null_node;
+
+        // Lower the path argument
+        const path_node = try self.lowerExpr(call.args[0]);
+
+        // Emit file_exists op - result is i64 (1 if exists, 0 if not)
+        const node = ir.Node.init(.file_exists, TypeRegistry.I64, Span.fromPos(Pos.zero))
+            .withArgs(&.{path_node});
+        return try fb.emit(node);
+    }
+
+    /// Lower builtin @fileFree(ptr) - free memory from file_read
+    fn lowerBuiltinFileFree(self: *Lowerer, call: ast.Call) Allocator.Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+
+        if (call.args.len != 1) return ir.null_node;
+
+        // Lower the pointer argument
+        const ptr_node = try self.lowerExpr(call.args[0]);
+
+        // Emit file_free op - void result
+        const node = ir.Node.init(.file_free, TypeRegistry.VOID, Span.fromPos(Pos.zero))
+            .withArgs(&.{ptr_node});
+        return try fb.emit(node);
+    }
+
+    /// Lower builtin @listDataPtr(handle) - get raw data pointer from list
+    fn lowerBuiltinListDataPtr(self: *Lowerer, call: ast.Call) Allocator.Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+
+        if (call.args.len != 1) return ir.null_node;
+
+        // Lower the handle argument
+        const handle_node = try self.lowerExpr(call.args[0]);
+
+        // Emit list_data_ptr op - result is i64 (pointer as integer)
+        const node = ir.Node.init(.list_data_ptr, TypeRegistry.I64, Span.fromPos(Pos.zero))
+            .withArgs(&.{handle_node});
+        return try fb.emit(node);
+    }
+
+    /// Lower builtin @listByteSize(handle) - get total byte size of list data
+    fn lowerBuiltinListByteSize(self: *Lowerer, call: ast.Call) Allocator.Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+
+        if (call.args.len != 1) return ir.null_node;
+
+        // Lower the handle argument
+        const handle_node = try self.lowerExpr(call.args[0]);
+
+        // Emit list_byte_size op - result is i64
+        const node = ir.Node.init(.list_byte_size, TypeRegistry.I64, Span.fromPos(Pos.zero))
+            .withArgs(&.{handle_node});
         return try fb.emit(node);
     }
 

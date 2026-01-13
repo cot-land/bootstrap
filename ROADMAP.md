@@ -59,8 +59,8 @@ Every Zig source file needs a corresponding bootstrap .cot file that uses only s
 | `src/lower.zig` | `src/bootstrap/lower_boot.cot` | **Done** | AST → IR lowering |
 | `src/ssa.zig` | `src/bootstrap/ssa_boot.cot` | **Done** | SSA conversion |
 | `src/liveness.zig` | `src/bootstrap/liveness_boot.cot` | **Done** | Liveness analysis |
-| `src/driver.zig` | `src/bootstrap/driver_boot.cot` | TODO | Compilation orchestration |
-| `src/main.zig` | `src/bootstrap/main_boot.cot` | TODO | Entry point |
+| `src/driver.zig` | `src/bootstrap/driver_boot.cot` | **Done** | Compilation orchestration |
+| `src/main.zig` | `src/bootstrap/main_boot.cot` | **Done** | Entry point |
 | `src/codegen/backend.zig` | `src/bootstrap/codegen/backend_boot.cot` | **Done** | Backend abstraction |
 | `src/codegen/arm64_codegen.zig` | `src/bootstrap/codegen/arm64_boot.cot` | **Done** | ARM64 code generation |
 | `src/codegen/amd64_codegen.zig` | `src/bootstrap/codegen/amd64_boot.cot` | TODO | x86_64 code generation |
@@ -71,7 +71,7 @@ Every Zig source file needs a corresponding bootstrap .cot file that uses only s
 | `src/debug.zig` | `src/bootstrap/debug_boot.cot` | **Done** | Debug output utilities |
 | `src/type_context.zig` | `src/bootstrap/type_context_boot.cot` | **Done** | Type context for checker |
 
-**Progress: 18/22 files complete**
+**Progress: 20/23 files complete (ARM64 bootstrap ready)**
 
 ---
 
@@ -171,9 +171,9 @@ These features exist in wireframe .cot files but are NOT in Zig compiler yet:
 10. ✅ `lower_boot.cot` - Lowering (DONE)
 11. ✅ `ssa_boot.cot` - SSA conversion (DONE)
 12. ✅ `liveness_boot.cot` - Liveness analysis (DONE)
-13. `codegen/*_boot.cot` - Code generation
-14. `driver_boot.cot` - Orchestration
-15. `main_boot.cot` - Entry point
+13. ✅ `codegen/*_boot.cot` - Code generation (ARM64 DONE)
+14. ✅ `driver_boot.cot` - Orchestration (DONE)
+15. ✅ `main_boot.cot` - Entry point (DONE)
 
 ### Phase 2: Add Missing Features (Only If Blocking)
 

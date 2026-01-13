@@ -455,6 +455,71 @@ pub const CodeGen = struct {
         }
     }
 
+    /// Safely load two values into x0 and x1, handling register clobbering.
+    /// This prevents the bug where arg1 is in x0 and loading arg0 into x0 first clobbers it.
+    pub fn loadTwoArgs(self: *CodeGen, arg0: MCValue, arg1: MCValue) !void {
+        if (arg1 == .register and arg1.register == .x0) {
+            // arg1 is in x0 - move to x1 first, then load arg0
+            try aarch64.movRegReg(self.buf, .x1, .x0);
+            try self.loadToReg(.x0, arg0);
+        } else if (arg0 == .register and arg0.register == .x1) {
+            // arg0 is in x1 - move to x0 first, then load arg1
+            try aarch64.movRegReg(self.buf, .x0, .x1);
+            try self.loadToReg(.x1, arg1);
+        } else {
+            // No conflicts - normal order
+            try self.loadToReg(.x0, arg0);
+            try self.loadToReg(.x1, arg1);
+        }
+    }
+
+    /// Safely load three values into x0, x1, x2, handling register clobbering.
+    /// Uses x9 as scratch to break cycles if needed.
+    pub fn loadThreeArgs(self: *CodeGen, arg0: MCValue, arg1: MCValue, arg2: MCValue) !void {
+        // Check for conflicts and resolve them
+        // Worst case: arg2 in x0, arg0 in x2 (cycle) - use scratch x9
+        const arg0_in_x1 = arg0 == .register and arg0.register == .x1;
+        const arg0_in_x2 = arg0 == .register and arg0.register == .x2;
+        const arg1_in_x0 = arg1 == .register and arg1.register == .x0;
+        const arg1_in_x2 = arg1 == .register and arg1.register == .x2;
+        const arg2_in_x0 = arg2 == .register and arg2.register == .x0;
+        const arg2_in_x1 = arg2 == .register and arg2.register == .x1;
+
+        // Simple case: no conflicts
+        if (!arg0_in_x1 and !arg0_in_x2 and !arg1_in_x0 and !arg1_in_x2 and !arg2_in_x0 and !arg2_in_x1) {
+            try self.loadToReg(.x0, arg0);
+            try self.loadToReg(.x1, arg1);
+            try self.loadToReg(.x2, arg2);
+            return;
+        }
+
+        // Save any conflicting values to scratch registers first
+        if (arg2_in_x0) {
+            try aarch64.movRegReg(self.buf, .x9, .x0); // Save arg2 to x9
+        }
+        if (arg2_in_x1 and !arg2_in_x0) {
+            try aarch64.movRegReg(self.buf, .x9, .x1); // Save arg2 to x9
+        }
+        if (arg1_in_x0 and !arg2_in_x0) {
+            try aarch64.movRegReg(self.buf, .x10, .x0); // Save arg1 to x10
+        }
+
+        // Now load in order
+        try self.loadToReg(.x0, arg0);
+
+        if (arg1_in_x0) {
+            try aarch64.movRegReg(self.buf, .x1, .x10);
+        } else {
+            try self.loadToReg(.x1, arg1);
+        }
+
+        if (arg2_in_x0 or arg2_in_x1) {
+            try aarch64.movRegReg(self.buf, .x2, .x9);
+        } else {
+            try self.loadToReg(.x2, arg2);
+        }
+    }
+
     /// Load from [sp + offset] handling large offsets
     /// For offsets > 4095, uses scratch register x16
     fn ldrSpOffset(self: *CodeGen, dest: aarch64.Reg, offset: u32) !void {
@@ -1075,11 +1140,19 @@ pub const CodeGen = struct {
         // Standard value store - use MCValue-based approach (Go/Zig pattern)
         // Key principle: use DESTINATION type for store size, not source type
         // This ensures u8 variables get 1-byte stores even when assigned from int literals
-        const dest_type_idx = if (field_offset == 0)
-            local.type_idx // Simple scalar store - use local's type
+        //
+        // For struct locals, we need to distinguish between:
+        // 1. Whole-struct store: `var current: S = other_struct` - use full struct size
+        // 2. Field store: `s.field = value` - use field size
+        // Check if source type matches local type (whole-struct store) or not (field store)
+        const local_type = self.type_reg.get(local.type_idx);
+        const src_type_idx = src_value.type_idx;
+        const dest_type_idx = if (local_type == .struct_type and src_type_idx != local.type_idx)
+            // Struct field store - source type differs from local type, look up field type
+            self.type_reg.getFieldTypeAtOffset(local.type_idx, @intCast(field_offset)) orelse local.type_idx
         else
-            // Struct field store - look up field type at offset
-            self.type_reg.getFieldTypeAtOffset(local.type_idx, @intCast(field_offset)) orelse local.type_idx;
+            // Whole value store (scalar or whole struct) - use local's type
+            local.type_idx;
         const size = self.type_reg.sizeOf(dest_type_idx);
         const src_mcv = self.getValue(src_id);
 
@@ -1435,8 +1508,9 @@ pub const CodeGen = struct {
         const local = self.func.locals[@intCast(local_idx)];
         const sp_offset = convertOffset(local.offset + field_offset, self.stack_size);
 
-        // For slice/string fields (16 bytes), record stack location instead of loading
-        if (size == 16) {
+        // For multi-word fields (>8 bytes), record stack location instead of loading
+        // This handles slices (16 bytes), nested structs (any size), etc.
+        if (size > 8) {
             try self.setResult(value.id, .{ .stack = sp_offset });
             return;
         }
@@ -1468,6 +1542,27 @@ pub const CodeGen = struct {
 
         // Get the base value's location
         const base_mcv = self.getValue(args[0]);
+
+        // For multi-word fields (>8 bytes), compute stack address and return stack MCValue
+        // This handles nested structs, slices, strings, etc.
+        if (size > 8) {
+            switch (base_mcv) {
+                .stack => |stack_offset| {
+                    // Field is at base stack offset + field offset
+                    const field_sp_offset: u32 = @intCast(@as(i64, stack_offset) + field_offset);
+                    try self.setResult(value.id, .{ .stack = field_sp_offset });
+                },
+                else => {
+                    // Base is in register or unknown - this is an edge case
+                    // For now, fall through to single-register load (may be buggy for large fields)
+                    const dest: aarch64.Reg = .x0;
+                    try self.loadToReg(dest, base_mcv);
+                    self.reg_manager.markUsed(.x0, value.id);
+                    try self.setResult(value.id, .{ .register = dest });
+                },
+            }
+            return;
+        }
 
         // Always use x0 for field results
         const dest: aarch64.Reg = .x0;
@@ -1685,7 +1780,34 @@ pub const CodeGen = struct {
         if (args.len < 2) return;
 
         const elem_size: i64 = if (value.aux_int != 0) value.aux_int else 8;
+
+        // IMPORTANT: Get base_mcv FIRST, before loading index into x9
+        // Otherwise if base is in x9, loading index clobbers it!
+        const base_mcv = self.getValue(args[0]);
         const idx_mcv = self.getValue(args[1]);
+
+        // Check if base is in x9 - if so, save it to x8 first
+        if (base_mcv == .register and base_mcv.register == .x9) {
+            try aarch64.movRegReg(self.buf, .x8, .x9);
+            // Load index into x9
+            try self.loadToReg(.x9, idx_mcv);
+            // Calculate offset: index * elem_size -> x9
+            if (elem_size > 1) {
+                try aarch64.movRegImm64(self.buf, .x10, elem_size);
+                try aarch64.mulRegReg(self.buf, .x9, .x9, .x10);
+            }
+            // Add: x8 = x8 + x9
+            try aarch64.addRegReg(self.buf, .x8, .x8, .x9);
+            // Load from [x8]
+            if (elem_size == 1) {
+                try aarch64.ldrbRegImm(self.buf, .x0, .x8, 0);
+            } else {
+                try aarch64.ldrRegImm(self.buf, .x0, .x8, 0);
+            }
+            self.reg_manager.markUsed(.x0, value.id);
+            try self.setResult(value.id, .{ .register = .x0 });
+            return;
+        }
 
         // Load index into x9
         try self.loadToReg(.x9, idx_mcv);
@@ -1695,9 +1817,6 @@ pub const CodeGen = struct {
             try aarch64.movRegImm64(self.buf, .x10, elem_size);
             try aarch64.mulRegReg(self.buf, .x9, .x9, .x10);
         }
-
-        // Get the base value's location (should be a slice with ptr+len)
-        const base_mcv = self.getValue(args[0]);
 
         switch (base_mcv) {
             .stack => |stack_offset| {
@@ -1935,17 +2054,19 @@ pub const CodeGen = struct {
         // Add to ptr: x8 = x8 + x9
         try aarch64.addRegReg(self.buf, .x8, .x8, .x9);
 
+        // Allocate a register for the result (instead of hardcoding x0)
+        const dest = try self.allocReg(value.id);
+
         // Load value from [x8] based on element size
         if (elem_size == 1) {
-            // Byte load: ldrb x0, [x8]
-            try aarch64.ldrbRegImm(self.buf, .x0, .x8, 0);
+            // Byte load: ldrb dest, [x8]
+            try aarch64.ldrbRegImm(self.buf, dest, .x8, 0);
         } else {
-            // 64-bit load: ldr x0, [x8, #0]
-            try aarch64.ldrRegImm(self.buf, .x0, .x8, 0);
+            // 64-bit load: ldr dest, [x8, #0]
+            try aarch64.ldrRegImm(self.buf, dest, .x8, 0);
         }
 
-        self.reg_manager.markUsed(.x0, value.id);
-        try self.setResult(value.id, .{ .register = .x0 });
+        try self.setResult(value.id, .{ .register = dest });
     }
 
     /// Generate code for union_tag: extract tag from union
@@ -2179,13 +2300,10 @@ pub const CodeGen = struct {
         // Spill all caller-saved registers before the function call
         try self.spillCallerSaved();
 
-        // Load handle into x0 via MCValue
+        // Use loadTwoArgs to safely load handle→x0, index→x1 without clobbering
         const handle_mcv = self.getValue(args[0]);
-        try self.loadToReg(.x0, handle_mcv);
-
-        // Load index into x1 via MCValue
         const idx_mcv = self.getValue(args[1]);
-        try self.loadToReg(.x1, idx_mcv);
+        try self.loadTwoArgs(handle_mcv, idx_mcv);
 
         try aarch64.callSymbol(self.buf, "_cot_list_get");
 
@@ -2602,17 +2720,8 @@ pub const CodeGen = struct {
 
         if (elem_size <= 8) {
             // Small element - pass value directly in x1
-            // Handle register clobbering: if value is in x0, we must load it first
-            if (val_mcv == .register and val_mcv.register == .x0) {
-                // Value is in x0 - move it to x1 first
-                try aarch64.movRegReg(self.buf, .x1, .x0);
-                // Then load handle into x0
-                try self.loadToReg(.x0, handle_mcv);
-            } else {
-                // Normal order: load handle to x0, then value to x1
-                try self.loadToReg(.x0, handle_mcv);
-                try self.loadToReg(.x1, val_mcv);
-            }
+            // Use loadTwoArgs to safely load handle→x0, value→x1 without clobbering
+            try self.loadTwoArgs(handle_mcv, val_mcv);
         } else {
             // Large element - pass pointer in x1
             // Use MCValue to determine where the value actually is (not operation type)
@@ -2672,37 +2781,15 @@ pub const CodeGen = struct {
 
         if (elem_size <= 8) {
             // Small element - pass value directly in x2
-            // Handle register clobbering carefully
-            // Load in reverse order of dependencies: value, index, handle
-
-            // Save value first if it's in x0 or x1 (will be clobbered)
-            if (val_mcv == .register and (val_mcv.register == .x0 or val_mcv.register == .x1)) {
-                try aarch64.movRegReg(self.buf, .x2, val_mcv.register);
-            }
-
-            // Save index if it's in x0 (will be clobbered by handle load)
-            if (index_mcv == .register and index_mcv.register == .x0) {
-                try aarch64.movRegReg(self.buf, .x1, .x0);
-                try self.loadToReg(.x0, handle_mcv);
-                // Value may need loading if not already saved
-                if (!(val_mcv == .register and (val_mcv.register == .x0 or val_mcv.register == .x1))) {
-                    try self.loadToReg(.x2, val_mcv);
-                }
-            } else {
-                // Normal order: load handle to x0, index to x1, value to x2
-                try self.loadToReg(.x0, handle_mcv);
-                try self.loadToReg(.x1, index_mcv);
-                if (!(val_mcv == .register and (val_mcv.register == .x0 or val_mcv.register == .x1))) {
-                    try self.loadToReg(.x2, val_mcv);
-                }
-            }
+            // Use loadThreeArgs to safely load handle→x0, index→x1, value→x2 without clobbering
+            try self.loadThreeArgs(handle_mcv, index_mcv, val_mcv);
         } else {
             // Large element - pass pointer in x2
             switch (val_mcv) {
                 .stack => |stack_offset| {
                     // Value already on stack - use its address directly
-                    try self.loadToReg(.x0, handle_mcv);
-                    try self.loadToReg(.x1, index_mcv);
+                    // Use loadTwoArgs to safely load handle→x0, index→x1
+                    try self.loadTwoArgs(handle_mcv, index_mcv);
                     try self.addSpOffset(.x2, stack_offset);
                 },
                 .register => |reg| {
@@ -2718,16 +2805,16 @@ pub const CodeGen = struct {
                         try self.strSpOffset(reg, temp_offset);
                     }
 
-                    try self.loadToReg(.x0, handle_mcv);
-                    try self.loadToReg(.x1, index_mcv);
+                    // Use loadTwoArgs to safely load handle→x0, index→x1
+                    try self.loadTwoArgs(handle_mcv, index_mcv);
                     try self.addSpOffset(.x2, temp_offset);
                 },
                 else => {
                     // Unknown location - allocate temp
                     const temp_offset = self.next_spill_offset;
                     self.next_spill_offset +|= @intCast(alignTo(elem_size, 8));
-                    try self.loadToReg(.x0, handle_mcv);
-                    try self.loadToReg(.x1, index_mcv);
+                    // Use loadTwoArgs to safely load handle→x0, index→x1
+                    try self.loadTwoArgs(handle_mcv, index_mcv);
                     try self.addSpOffset(.x2, temp_offset);
                 },
             }
@@ -2802,6 +2889,148 @@ pub const CodeGen = struct {
         try self.setResult(value.id, .{ .stack = temp_offset });
     }
 
+    /// Generate code for file_read: args[0]=path (string)
+    /// Calls cot_file_read(path_ptr, path_len) -> returns (data_ptr, data_len) in x0, x1
+    pub fn genFileRead(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+        if (args.len < 1) return;
+
+        try self.spillCallerSaved();
+
+        // Load path string (ptr, len) to x0, x1
+        const path_val = &self.func.values.items[args[0]];
+        try self.loadSliceToRegs(path_val, .x0, .x1);
+
+        // Call cot_file_read(path_ptr, path_len)
+        const func_name = if (self.os == .macos) "_cot_file_read" else "cot_file_read";
+        try self.buf.addRelocation(.pc_rel_32, func_name, 0);
+        try aarch64.bl(self.buf, 0);
+
+        // Result is in x0 (ptr), x1 (len) - it's a slice
+        const temp_offset = self.next_spill_offset;
+        self.next_spill_offset +|= 16;
+        try self.strSpOffset(.x0, temp_offset);
+        try self.strSpOffset(.x1, temp_offset + 8);
+
+        try self.setResult(value.id, .{ .stack = temp_offset });
+    }
+
+    /// Generate code for file_write: args[0]=path (string), args[1]=data_ptr, args[2]=data_len
+    /// Calls cot_file_write(path_ptr, path_len, data_ptr, data_len) -> returns i64 in x0
+    pub fn genFileWrite(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+        if (args.len < 3) return;
+
+        try self.spillCallerSaved();
+
+        // Load path string (ptr, len) to x0, x1
+        const path_val = &self.func.values.items[args[0]];
+        try self.loadSliceToRegs(path_val, .x0, .x1);
+
+        // Load data_ptr to x2
+        const data_ptr_mcv = self.getValue(args[1]);
+        try self.loadToReg(.x2, data_ptr_mcv);
+
+        // Load data_len to x3
+        const data_len_mcv = self.getValue(args[2]);
+        try self.loadToReg(.x3, data_len_mcv);
+
+        // Call cot_file_write(path_ptr, path_len, data_ptr, data_len)
+        const func_name = if (self.os == .macos) "_cot_file_write" else "cot_file_write";
+        try self.buf.addRelocation(.pc_rel_32, func_name, 0);
+        try aarch64.bl(self.buf, 0);
+
+        // Result in x0
+        self.reg_manager.markUsed(.x0, value.id);
+        try self.setResult(value.id, .{ .register = .x0 });
+    }
+
+    /// Generate code for file_exists: args[0]=path (string)
+    /// Calls cot_file_exists(path_ptr, path_len) -> returns i64 in x0
+    pub fn genFileExists(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+        if (args.len < 1) return;
+
+        try self.spillCallerSaved();
+
+        // Load path string (ptr, len) to x0, x1
+        const path_val = &self.func.values.items[args[0]];
+        try self.loadSliceToRegs(path_val, .x0, .x1);
+
+        // Call cot_file_exists(path_ptr, path_len)
+        const func_name = if (self.os == .macos) "_cot_file_exists" else "cot_file_exists";
+        try self.buf.addRelocation(.pc_rel_32, func_name, 0);
+        try aarch64.bl(self.buf, 0);
+
+        // Result in x0
+        self.reg_manager.markUsed(.x0, value.id);
+        try self.setResult(value.id, .{ .register = .x0 });
+    }
+
+    /// Generate code for file_free: args[0]=ptr
+    /// Calls cot_file_free(ptr)
+    pub fn genFileFree(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+        if (args.len < 1) return;
+
+        try self.spillCallerSaved();
+
+        // Load ptr to x0
+        const ptr_mcv = self.getValue(args[0]);
+        try self.loadToReg(.x0, ptr_mcv);
+
+        // Call cot_file_free(ptr)
+        const func_name = if (self.os == .macos) "_cot_file_free" else "cot_file_free";
+        try self.buf.addRelocation(.pc_rel_32, func_name, 0);
+        try aarch64.bl(self.buf, 0);
+
+        // No result
+    }
+
+    /// Generate code for list_data_ptr: args[0]=handle
+    /// Calls cot_list_data_ptr(handle) -> returns i64 in x0
+    pub fn genListDataPtr(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+        if (args.len < 1) return;
+
+        try self.spillCallerSaved();
+
+        // Load handle to x0
+        const handle_mcv = self.getValue(args[0]);
+        try self.loadToReg(.x0, handle_mcv);
+
+        // Call cot_list_data_ptr(handle)
+        const func_name = if (self.os == .macos) "_cot_list_data_ptr" else "cot_list_data_ptr";
+        try self.buf.addRelocation(.pc_rel_32, func_name, 0);
+        try aarch64.bl(self.buf, 0);
+
+        // Result in x0
+        self.reg_manager.markUsed(.x0, value.id);
+        try self.setResult(value.id, .{ .register = .x0 });
+    }
+
+    /// Generate code for list_byte_size: args[0]=handle
+    /// Calls cot_list_byte_size(handle) -> returns i64 in x0
+    pub fn genListByteSize(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+        if (args.len < 1) return;
+
+        try self.spillCallerSaved();
+
+        // Load handle to x0
+        const handle_mcv = self.getValue(args[0]);
+        try self.loadToReg(.x0, handle_mcv);
+
+        // Call cot_list_byte_size(handle)
+        const func_name = if (self.os == .macos) "_cot_list_byte_size" else "cot_list_byte_size";
+        try self.buf.addRelocation(.pc_rel_32, func_name, 0);
+        try aarch64.bl(self.buf, 0);
+
+        // Result in x0
+        self.reg_manager.markUsed(.x0, value.id);
+        try self.setResult(value.id, .{ .register = .x0 });
+    }
+
     /// Generate code for alloc: allocate space on stack (returns address)
     /// aux_int = size to allocate, or uses local slot
     pub fn genAlloc(self: *CodeGen, value: *ssa.Value) !void {
@@ -2835,6 +3064,7 @@ pub const CodeGen = struct {
 
         const local = self.func.locals[@intCast(local_idx)];
         const field_offset: u12 = @intCast(@as(u32, @intCast(value.aux_int)));
+        const size = self.type_reg.sizeOf(value.type_idx);
 
         // Check if local is a struct parameter that was copied in prologue
         // If local.size > 8, it's an actual struct (not a pointer)
@@ -2845,8 +3075,14 @@ pub const CodeGen = struct {
             // Local IS the struct (after prologue copy), access field directly
             const sp_offset = convertOffset(local.offset + @as(i32, @intCast(field_offset)), self.stack_size);
 
+            // For multi-word fields (strings, slices >8 bytes), don't load into register
+            // Just record the stack location so store can copy the full value
+            if (size > 8) {
+                try self.setResult(value.id, .{ .stack = sp_offset });
+                return;
+            }
+
             const dest = try self.allocReg(value.id);
-            const size = self.type_reg.sizeOf(value.type_idx);
             if (size == 1) {
                 try self.ldrbSpOffset(dest, sp_offset);
             } else {
@@ -2858,6 +3094,8 @@ pub const CodeGen = struct {
             const sp_offset = convertOffset(local.offset, self.stack_size);
             try self.ldrSpOffset(scratch0, sp_offset);
 
+            // For multi-word fields, we'd need to spill to stack - for now just load first word
+            // TODO: Handle >8 byte fields accessed through pointers
             const dest = try self.allocReg(value.id);
             try aarch64.ldrRegImm(self.buf, dest, scratch0, field_offset);
             try self.setResult(value.id, .{ .register = dest });
@@ -3078,6 +3316,12 @@ pub const CodeGen = struct {
             .list_len => try self.genListLen(value),
             .list_free => try self.genListFree(value),
             .str_concat => try self.genStrConcat(value),
+            .file_read => try self.genFileRead(value),
+            .file_write => try self.genFileWrite(value),
+            .file_exists => try self.genFileExists(value),
+            .file_free => try self.genFileFree(value),
+            .list_data_ptr => try self.genListDataPtr(value),
+            .list_byte_size => try self.genListByteSize(value),
             .arg => try self.genArg(value),
             .retain, .release, .@"unreachable" => {}, // TODO: implement
         }

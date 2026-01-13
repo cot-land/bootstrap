@@ -765,6 +765,25 @@ pub const Checker = struct {
                 if (std.mem.eql(u8, name, "@minInt")) {
                     return self.checkBuiltinMinInt(c);
                 }
+                // File I/O builtins (for bootstrap)
+                if (std.mem.eql(u8, name, "@fileRead")) {
+                    return self.checkBuiltinFileRead(c);
+                }
+                if (std.mem.eql(u8, name, "@fileWrite")) {
+                    return self.checkBuiltinFileWrite(c);
+                }
+                if (std.mem.eql(u8, name, "@fileExists")) {
+                    return self.checkBuiltinFileExists(c);
+                }
+                if (std.mem.eql(u8, name, "@fileFree")) {
+                    return self.checkBuiltinFileFree(c);
+                }
+                if (std.mem.eql(u8, name, "@listDataPtr")) {
+                    return self.checkBuiltinListDataPtr(c);
+                }
+                if (std.mem.eql(u8, name, "@listByteSize")) {
+                    return self.checkBuiltinListByteSize(c);
+                }
             }
         }
 
@@ -1016,6 +1035,87 @@ pub const Checker = struct {
 
         // Return the same type as the argument - @minInt(i32) returns i32
         return type_idx;
+    }
+
+    /// Check builtin @fileRead(path) - read file to string
+    fn checkBuiltinFileRead(self: *Checker, c: ast.Call) CheckError!TypeIndex {
+        if (c.args.len != 1) {
+            self.err.errorWithCode(c.span.start, .E300, "@fileRead() expects one argument: path string");
+            return invalid_type;
+        }
+        // Check argument is a string
+        const arg_type = try self.checkExpr(c.args[0]);
+        if (arg_type != TypeRegistry.STRING) {
+            self.err.errorWithCode(c.span.start, .E300, "@fileRead() path must be a string");
+            return invalid_type;
+        }
+        return TypeRegistry.STRING; // Returns file content as string
+    }
+
+    /// Check builtin @fileWrite(path, data_ptr, data_len) - write bytes to file
+    fn checkBuiltinFileWrite(self: *Checker, c: ast.Call) CheckError!TypeIndex {
+        if (c.args.len != 3) {
+            self.err.errorWithCode(c.span.start, .E300, "@fileWrite() expects three arguments: path, data_ptr, data_len");
+            return invalid_type;
+        }
+        // Check path is string
+        const path_type = try self.checkExpr(c.args[0]);
+        if (path_type != TypeRegistry.STRING) {
+            self.err.errorWithCode(c.span.start, .E300, "@fileWrite() path must be a string");
+            return invalid_type;
+        }
+        // Check data_ptr and data_len are integers
+        const ptr_type = try self.checkExpr(c.args[1]);
+        const len_type = try self.checkExpr(c.args[2]);
+        if (!isInteger(self.types.get(ptr_type)) or !isInteger(self.types.get(len_type))) {
+            self.err.errorWithCode(c.span.start, .E300, "@fileWrite() data_ptr and data_len must be integers");
+            return invalid_type;
+        }
+        return TypeRegistry.I64; // Returns 1 on success, 0 on failure
+    }
+
+    /// Check builtin @fileExists(path) - check if file exists
+    fn checkBuiltinFileExists(self: *Checker, c: ast.Call) CheckError!TypeIndex {
+        if (c.args.len != 1) {
+            self.err.errorWithCode(c.span.start, .E300, "@fileExists() expects one argument: path string");
+            return invalid_type;
+        }
+        const arg_type = try self.checkExpr(c.args[0]);
+        if (arg_type != TypeRegistry.STRING) {
+            self.err.errorWithCode(c.span.start, .E300, "@fileExists() path must be a string");
+            return invalid_type;
+        }
+        return TypeRegistry.I64; // Returns 1 if exists, 0 if not
+    }
+
+    /// Check builtin @fileFree(ptr) - free memory from file read
+    fn checkBuiltinFileFree(self: *Checker, c: ast.Call) CheckError!TypeIndex {
+        if (c.args.len != 1) {
+            self.err.errorWithCode(c.span.start, .E300, "@fileFree() expects one argument: pointer");
+            return invalid_type;
+        }
+        _ = try self.checkExpr(c.args[0]);
+        return TypeRegistry.VOID;
+    }
+
+    /// Check builtin @listDataPtr(handle) - get raw data pointer
+    fn checkBuiltinListDataPtr(self: *Checker, c: ast.Call) CheckError!TypeIndex {
+        if (c.args.len != 1) {
+            self.err.errorWithCode(c.span.start, .E300, "@listDataPtr() expects one argument: list handle");
+            return invalid_type;
+        }
+        _ = try self.checkExpr(c.args[0]);
+        return TypeRegistry.I64; // Pointer as integer
+    }
+
+    /// Check builtin @listByteSize(handle) - get total byte size
+    fn checkBuiltinListByteSize(self: *Checker, c: ast.Call) CheckError!TypeIndex {
+        if (c.args.len != 1) {
+            self.err.errorWithCode(c.span.start, .E300, "@listByteSize() expects one argument: list handle");
+            return invalid_type;
+        }
+        _ = try self.checkExpr(c.args[0]);
+        return TypeRegistry.I64;
     }
 
     /// Check index expression.

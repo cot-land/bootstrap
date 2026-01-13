@@ -1034,10 +1034,19 @@ pub const CodeGen = struct {
                 }
             },
             .stack => |offset| {
-                try x86.movRegMem(self.buf, scratch0, .rbp, offset);
-                switch (size) {
-                    1 => try x86.movMem8Reg(self.buf, .rbp, total_offset, scratch0),
-                    else => try x86.movMemReg(self.buf, .rbp, total_offset, scratch0),
+                // For multi-word values (>8 bytes), use memcpy
+                if (size > 8) {
+                    // Set up memcpy args: rdi=dest, rsi=src, rdx=size
+                    try x86.leaRegMem(self.buf, .rdi, .rbp, total_offset);
+                    try x86.leaRegMem(self.buf, .rsi, .rbp, offset);
+                    try x86.movRegImm64(self.buf, .rdx, size);
+                    try self.emitRuntimeCall("memcpy");
+                } else {
+                    try x86.movRegMem(self.buf, scratch0, .rbp, offset);
+                    switch (size) {
+                        1 => try x86.movMem8Reg(self.buf, .rbp, total_offset, scratch0),
+                        else => try x86.movMemReg(self.buf, .rbp, total_offset, scratch0),
+                    }
                 }
             },
             else => {},
@@ -1189,27 +1198,49 @@ pub const CodeGen = struct {
         const maybe_local_or_ssa = args[0];
         const field_offset: i32 = @intCast(value.aux_int);
         const size = self.type_reg.sizeOf(value.type_idx);
-        const dest = try self.allocReg(value.id);
 
         if (maybe_local_or_ssa < self.func.locals.len) {
             // CASE 1: Direct local field access
             const local = self.func.locals[@intCast(maybe_local_or_ssa)];
             const total_offset = local.offset + field_offset;
 
+            // For multi-word fields (>8 bytes), record stack location instead of loading
+            // This handles nested structs, slices, strings, etc.
+            if (size > 8) {
+                try self.setResult(value.id, .{ .stack = total_offset });
+                return;
+            }
+
+            const dest = try self.allocReg(value.id);
             switch (size) {
                 1 => try x86.movzxRegMem8(self.buf, dest, .rbp, total_offset),
                 else => try x86.movRegMem(self.buf, dest, .rbp, total_offset),
             }
+            try self.setResult(value.id, .{ .register = dest });
         } else {
             // CASE 2: SSA value reference - address was computed by prior .addr op
             // The address should be in rax from the prior value
+            const base_mcv = self.getValue(maybe_local_or_ssa);
+
+            // For multi-word fields from SSA values on stack
+            if (size > 8) {
+                switch (base_mcv) {
+                    .stack => |stack_offset| {
+                        const field_sp_offset = stack_offset + field_offset;
+                        try self.setResult(value.id, .{ .stack = field_sp_offset });
+                        return;
+                    },
+                    else => {},
+                }
+            }
+
+            const dest = try self.allocReg(value.id);
             switch (size) {
                 1 => try x86.movzxRegMem8(self.buf, dest, .rax, field_offset),
                 else => try x86.movRegMem(self.buf, dest, .rax, field_offset),
             }
+            try self.setResult(value.id, .{ .register = dest });
         }
-
-        try self.setResult(value.id, .{ .register = dest });
     }
 
     /// Generate code for logical NOT: XOR with 1 to flip boolean
@@ -1958,6 +1989,142 @@ pub const CodeGen = struct {
         try self.setResult(value.id, .{ .stack = temp_offset });
     }
 
+    /// Generate code for file_read: args[0]=path (string)
+    /// Calls cot_file_read(path_ptr, path_len) -> returns (data_ptr, data_len) in rax, rdx
+    pub fn genFileRead(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+        if (args.len < 1) return;
+
+        try self.spillCallerSaved();
+
+        // Load path string (ptr, len) to rdi, rsi
+        const path_val = &self.func.values.items[args[0]];
+        try self.loadSliceToRegs(path_val, .rdi, .rsi);
+
+        // Call cot_file_read(path_ptr, path_len)
+        const func_name = if (self.os == .macos) "_cot_file_read" else "cot_file_read";
+        try x86.callSymbol(self.buf, func_name);
+
+        // Result is in rax (ptr), rdx (len) - it's a slice
+        const temp_offset = self.next_spill_offset;
+        self.next_spill_offset -= 16;
+        try x86.movMemReg(self.buf, .rbp, temp_offset, .rax);
+        try x86.movMemReg(self.buf, .rbp, temp_offset + 8, .rdx);
+
+        try self.setResult(value.id, .{ .stack = temp_offset });
+    }
+
+    /// Generate code for file_write: args[0]=path (string), args[1]=data_ptr, args[2]=data_len
+    /// Calls cot_file_write(path_ptr, path_len, data_ptr, data_len) -> returns i64 in rax
+    pub fn genFileWrite(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+        if (args.len < 3) return;
+
+        try self.spillCallerSaved();
+
+        // Load path string (ptr, len) to rdi, rsi
+        const path_val = &self.func.values.items[args[0]];
+        try self.loadSliceToRegs(path_val, .rdi, .rsi);
+
+        // Load data_ptr to rdx
+        const data_ptr_mcv = self.getValue(args[1]);
+        try self.loadToReg(.rdx, data_ptr_mcv);
+
+        // Load data_len to rcx
+        const data_len_mcv = self.getValue(args[2]);
+        try self.loadToReg(.rcx, data_len_mcv);
+
+        // Call cot_file_write(path_ptr, path_len, data_ptr, data_len)
+        const func_name = if (self.os == .macos) "_cot_file_write" else "cot_file_write";
+        try x86.callSymbol(self.buf, func_name);
+
+        // Result in rax
+        self.reg_manager.markUsed(.rax, value.id);
+        try self.setResult(value.id, .{ .register = .rax });
+    }
+
+    /// Generate code for file_exists: args[0]=path (string)
+    /// Calls cot_file_exists(path_ptr, path_len) -> returns i64 in rax
+    pub fn genFileExists(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+        if (args.len < 1) return;
+
+        try self.spillCallerSaved();
+
+        // Load path string (ptr, len) to rdi, rsi
+        const path_val = &self.func.values.items[args[0]];
+        try self.loadSliceToRegs(path_val, .rdi, .rsi);
+
+        // Call cot_file_exists(path_ptr, path_len)
+        const func_name = if (self.os == .macos) "_cot_file_exists" else "cot_file_exists";
+        try x86.callSymbol(self.buf, func_name);
+
+        // Result in rax
+        self.reg_manager.markUsed(.rax, value.id);
+        try self.setResult(value.id, .{ .register = .rax });
+    }
+
+    /// Generate code for file_free: args[0]=ptr
+    /// Calls cot_file_free(ptr)
+    pub fn genFileFree(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+        if (args.len < 1) return;
+
+        try self.spillCallerSaved();
+
+        // Load ptr to rdi
+        const ptr_mcv = self.getValue(args[0]);
+        try self.loadToReg(.rdi, ptr_mcv);
+
+        // Call cot_file_free(ptr)
+        const func_name = if (self.os == .macos) "_cot_file_free" else "cot_file_free";
+        try x86.callSymbol(self.buf, func_name);
+
+        // No result
+    }
+
+    /// Generate code for list_data_ptr: args[0]=handle
+    /// Calls cot_list_data_ptr(handle) -> returns i64 in rax
+    pub fn genListDataPtr(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+        if (args.len < 1) return;
+
+        try self.spillCallerSaved();
+
+        // Load handle to rdi
+        const handle_mcv = self.getValue(args[0]);
+        try self.loadToReg(.rdi, handle_mcv);
+
+        // Call cot_list_data_ptr(handle)
+        const func_name = if (self.os == .macos) "_cot_list_data_ptr" else "cot_list_data_ptr";
+        try x86.callSymbol(self.buf, func_name);
+
+        // Result in rax
+        self.reg_manager.markUsed(.rax, value.id);
+        try self.setResult(value.id, .{ .register = .rax });
+    }
+
+    /// Generate code for list_byte_size: args[0]=handle
+    /// Calls cot_list_byte_size(handle) -> returns i64 in rax
+    pub fn genListByteSize(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+        if (args.len < 1) return;
+
+        try self.spillCallerSaved();
+
+        // Load handle to rdi
+        const handle_mcv = self.getValue(args[0]);
+        try self.loadToReg(.rdi, handle_mcv);
+
+        // Call cot_list_byte_size(handle)
+        const func_name = if (self.os == .macos) "_cot_list_byte_size" else "cot_list_byte_size";
+        try x86.callSymbol(self.buf, func_name);
+
+        // Result in rax
+        self.reg_manager.markUsed(.rax, value.id);
+        try self.setResult(value.id, .{ .register = .rax });
+    }
+
     /// Generate code for alloc: allocate space on stack (returns address)
     /// aux_int = size to allocate, or uses local slot
     pub fn genAlloc(self: *CodeGen, value: *ssa.Value) !void {
@@ -1991,16 +2158,43 @@ pub const CodeGen = struct {
 
         const local = self.func.locals[@intCast(local_idx)];
         const field_offset: i32 = @intCast(value.aux_int);
+        const size = self.type_reg.sizeOf(value.type_idx);
 
-        const dest = try self.allocReg(value.id);
+        const local_type = self.type_reg.get(local.type_idx);
+        const is_struct_copy = (local_type == .struct_type);
 
-        // Load pointer from local
-        try x86.movRegMem(self.buf, scratch0, .rbp, local.offset);
+        if (is_struct_copy) {
+            // Local is a struct (passed by pointer but copied to stack)
+            // Field is at local.offset + field_offset
+            const total_offset = local.offset + field_offset;
 
-        // Load from ptr + field_offset
-        try x86.movRegMem(self.buf, dest, scratch0, field_offset);
+            // For multi-word fields (>8 bytes), record stack location instead of loading
+            if (size > 8) {
+                try self.setResult(value.id, .{ .stack = total_offset });
+                return;
+            }
 
-        try self.setResult(value.id, .{ .register = dest });
+            const dest = try self.allocReg(value.id);
+            switch (size) {
+                1 => try x86.movzxRegMem8(self.buf, dest, .rbp, total_offset),
+                else => try x86.movRegMem(self.buf, dest, .rbp, total_offset),
+            }
+            try self.setResult(value.id, .{ .register = dest });
+        } else {
+            // Local is a pointer, dereference to access field
+            const dest = try self.allocReg(value.id);
+
+            // Load pointer from local
+            try x86.movRegMem(self.buf, scratch0, .rbp, local.offset);
+
+            // Load from ptr + field_offset
+            switch (size) {
+                1 => try x86.movzxRegMem8(self.buf, dest, scratch0, field_offset),
+                else => try x86.movRegMem(self.buf, dest, scratch0, field_offset),
+            }
+
+            try self.setResult(value.id, .{ .register = dest });
+        }
     }
 
     pub fn genPtrFieldStore(self: *CodeGen, value: *ssa.Value) !void {
@@ -2241,6 +2435,12 @@ pub const CodeGen = struct {
             .list_len => try self.genListLen(value),
             .list_free => try self.genListFree(value),
             .str_concat => try self.genStrConcat(value),
+            .file_read => try self.genFileRead(value),
+            .file_write => try self.genFileWrite(value),
+            .file_exists => try self.genFileExists(value),
+            .file_free => try self.genFileFree(value),
+            .list_data_ptr => try self.genListDataPtr(value),
+            .list_byte_size => try self.genListByteSize(value),
             .arg => try self.genArg(value),
             .retain, .release, .@"unreachable" => {}, // TODO: implement
         }

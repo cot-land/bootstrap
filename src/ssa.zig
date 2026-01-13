@@ -218,6 +218,20 @@ pub const Op = enum(u8) {
     // Concatenate two strings. args[0] = str1, args[1] = str2
     str_concat,
 
+    // File I/O operations (for bootstrap compiler)
+    // Read file contents. args[0] = path (string). Returns string (ptr, len).
+    file_read,
+    // Write data to file. args[0] = path (string), args[1] = data_ptr, args[2] = data_len. Returns i64.
+    file_write,
+    // Check if file exists. args[0] = path (string). Returns i64.
+    file_exists,
+    // Free memory from file_read. args[0] = ptr.
+    file_free,
+    // Get list's raw data pointer. args[0] = handle. Returns i64.
+    list_data_ptr,
+    // Get list's total byte size. args[0] = handle. Returns i64.
+    list_byte_size,
+
     // Function
     call,
     arg,

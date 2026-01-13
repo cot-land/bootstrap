@@ -1,0 +1,60 @@
+// Test file I/O builtins
+
+fn main() int {
+    // Test @fileExists on a known file
+    var exists: int = @fileExists("build.zig")
+    if exists != 1 {
+        return 1
+    }
+
+    // Test @fileExists on a non-existent file
+    var not_exists: int = @fileExists("nonexistent_file_12345.txt")
+    if not_exists != 0 {
+        return 2
+    }
+
+    // Test @fileRead and @fileWrite
+    var test_path: string = "/tmp/cot_file_io_test.txt"
+    var test_data: string = "Hello from Cot!"
+
+    // Write test data using a List<int> as byte buffer
+    var buf: List<int> = new List<int>()
+    var i: int = 0
+    while i < len(test_data) {
+        buf.push(test_data[i])
+        i = i + 1
+    }
+
+    // Get raw data pointer and size for writing
+    var data_ptr: int = @listDataPtr(buf)
+    var data_len: int = @listByteSize(buf)
+
+    // Write to file
+    var write_result: int = @fileWrite(test_path, data_ptr, data_len)
+    if write_result != 1 {
+        return 3
+    }
+
+    // Verify the file exists now
+    var wrote_exists: int = @fileExists(test_path)
+    if wrote_exists != 1 {
+        return 4
+    }
+
+    // Read it back
+    var content: string = @fileRead(test_path)
+    if len(content) != len(test_data) {
+        return 5
+    }
+
+    // Verify content matches
+    i = 0
+    while i < len(content) {
+        if content[i] != test_data[i] {
+            return 6
+        }
+        i = i + 1
+    }
+
+    return 42
+}
