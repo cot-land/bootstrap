@@ -1,3 +1,53 @@
+// Test compile-time constant evaluation
+
+const null_val: int = 0 - 1
+const magic: int = 42
+const computed: int = 10 + 20 + 5
+const product: int = 6 * 7
+const quotient: int = 100 / 4
+const nested: int = (2 + 3) * (4 + 1)
+
 fn main() int {
-    return 42;
+    // Test negative constant
+    if null_val != 0 - 1 {
+        return 1
+    }
+
+    // Test simple constant
+    if magic != 42 {
+        return 2
+    }
+
+    // Test addition chain
+    if computed != 35 {
+        return 3
+    }
+
+    // Test multiplication
+    if product != 42 {
+        return 4
+    }
+
+    // Test division
+    if quotient != 25 {
+        return 5
+    }
+
+    // Test nested parentheses
+    if nested != 25 {
+        return 6
+    }
+
+    // Test constant in expression
+    var x: int = magic + 8
+    if x != 50 {
+        return 7
+    }
+
+    // Test constant comparison
+    if null_val >= 0 {
+        return 8
+    }
+
+    return 42
 }

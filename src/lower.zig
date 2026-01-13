@@ -394,6 +394,33 @@ pub const Lowerer = struct {
                 // Look up other const values
                 return self.const_values.get(ident.name);
             },
+            .binary => |bin| {
+                // Evaluate binary expressions with constant operands
+                const left_val = self.evalConstExpr(bin.left) orelse return null;
+                const right_val = self.evalConstExpr(bin.right) orelse return null;
+
+                return switch (bin.op) {
+                    .plus => left_val +% right_val,
+                    .minus => left_val -% right_val,
+                    .star => left_val *% right_val,
+                    .slash => if (right_val != 0) @divTrunc(left_val, right_val) else null,
+                    .percent => if (right_val != 0) @rem(left_val, right_val) else null,
+                    else => null,
+                };
+            },
+            .unary => |un| {
+                // Evaluate unary expressions
+                const operand_val = self.evalConstExpr(un.operand) orelse return null;
+
+                return switch (un.op) {
+                    .minus => -%operand_val,
+                    else => null,
+                };
+            },
+            .paren => |p| {
+                // Unwrap parenthesized expressions
+                return self.evalConstExpr(p.inner);
+            },
             else => null,
         };
     }

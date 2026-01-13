@@ -22,9 +22,7 @@ type BlockID = int
 type TypeIndex = int
 
 // Null value sentinel
-fn nullValue() ValueID {
-    return 0 - 1
-}
+const null_value: ValueID = 0 - 1
 
 // ============================================================================
 // Minimal SSA Types for Liveness (subset of ssa_boot.cot)
@@ -83,7 +81,7 @@ fn newBlock(id: BlockID) Block {
         .succs = new List<BlockID>(),
         .values = new List<ValueID>(),
         .kind = BlockKind.plain,
-        .control = nullValue(),
+        .control = null_value,
     }
 }
 
@@ -360,7 +358,7 @@ fn computeLiveness(func: *Func) LivenessInfo {
 
         // Also check block control value (branch condition)
         var control: ValueID = block.control
-        if control != nullValue() and control >= 0 and control < num_values {
+        if control != null_value and control >= 0 and control < num_values {
             var last_use_ctrl: int = getLastUse(&info, control)
             if last_use_ctrl == 0 {
                 // Control value's last use is at the end of the block
@@ -388,7 +386,7 @@ fn computeLiveness(func: *Func) LivenessInfo {
                 var arg_idx: int = 0
                 while arg_idx < num_args {
                     var arg_id: ValueID = value.args.get(arg_idx)
-                    if arg_id != nullValue() and arg_id >= 0 and arg_id < num_values {
+                    if arg_id != null_value and arg_id >= 0 and arg_id < num_values {
                         var arg_last_use: int = getLastUse(&info, arg_id)
                         if arg_last_use == 0 {
                             // First time seeing this arg (in backward order) = last use

@@ -93,3 +93,4 @@ test_sum
 test_import
 test_import_nested
 test_list_set
+test_const
