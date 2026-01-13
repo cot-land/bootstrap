@@ -1,0 +1,357 @@
+// Code generation backend types for cot bootstrap.
+// Simplified version - no VTable/function pointers.
+//
+// Changes from original backend.zig:
+// - No Backend interface (function pointers not supported)
+// - No StorageManager (simplified for bootstrap)
+// - Standalone functions instead of methods
+// - List<u8> for byte buffer instead of ArrayList
+
+// =============================================================================
+// String Literal Info (for rodata section)
+// =============================================================================
+
+struct StringInfo {
+    offset: int,        // Offset in rodata section
+    length: int,        // Length of string
+    symbol_name: string,// Symbol name for relocation
+}
+
+// =============================================================================
+// Registers (generic types)
+// =============================================================================
+
+type GeneralReg = int
+type FloatReg = int
+
+const no_reg: GeneralReg = 255
+const no_float_reg: FloatReg = 255
+
+// =============================================================================
+// Storage Location
+// =============================================================================
+
+enum StorageKind: u8 {
+    general_reg,
+    float_reg,
+    stack,
+    constant,
+    none,
+}
+
+struct Storage {
+    kind: StorageKind,
+    reg: int,           // Register number (for reg kinds)
+    offset: int,        // Stack offset (for stack kind)
+    value: int,         // Constant value (for constant kind)
+}
+
+fn storageReg(reg: int) Storage {
+    return Storage{
+        .kind = StorageKind.general_reg,
+        .reg = reg,
+        .offset = 0,
+        .value = 0,
+    }
+}
+
+fn storageFloatReg(reg: int) Storage {
+    return Storage{
+        .kind = StorageKind.float_reg,
+        .reg = reg,
+        .offset = 0,
+        .value = 0,
+    }
+}
+
+fn storageStack(offset: int) Storage {
+    return Storage{
+        .kind = StorageKind.stack,
+        .reg = 0,
+        .offset = offset,
+        .value = 0,
+    }
+}
+
+fn storageConst(value: int) Storage {
+    return Storage{
+        .kind = StorageKind.constant,
+        .reg = 0,
+        .offset = 0,
+        .value = value,
+    }
+}
+
+fn storageNone() Storage {
+    return Storage{
+        .kind = StorageKind.none,
+        .reg = 0,
+        .offset = 0,
+        .value = 0,
+    }
+}
+
+// =============================================================================
+// Relocation Types
+// =============================================================================
+
+enum RelocKind: u8 {
+    pc_rel_32,          // PC-relative 32-bit (call, jmp)
+    abs_64,             // Absolute 64-bit address
+    got_rel,            // GOT-relative (position independent)
+    plt_rel,            // PLT-relative (function calls)
+    aarch64_adrp,       // AArch64 ADRP page address
+    aarch64_add_lo12,   // AArch64 ADD low 12 bits
+}
+
+struct Relocation {
+    offset: int,        // Offset in code buffer
+    kind: RelocKind,
+    symbol: string,     // Symbol name
+    addend: int,        // Offset from symbol
+}
+
+// =============================================================================
+// Code Buffer
+// =============================================================================
+
+struct CodeBuffer {
+    bytes: List<int>,           // Use List<int> to store u8 values
+    relocations: List<Relocation>,
+}
+
+fn codeBufferInit() CodeBuffer {
+    return CodeBuffer{
+        .bytes = new List<int>(),
+        .relocations = new List<Relocation>(),
+    }
+}
+
+fn codeBufferPos(buf: CodeBuffer) int {
+    return len(buf.bytes)
+}
+
+fn codeBufferEmit8(buf: CodeBuffer, b: int) void {
+    buf.bytes.push(b)
+}
+
+fn codeBufferEmit16(buf: CodeBuffer, v: int) void {
+    var low: int = v % 256
+    var high: int = (v / 256) % 256
+    codeBufferEmit8(buf, low)
+    codeBufferEmit8(buf, high)
+}
+
+fn codeBufferEmit32(buf: CodeBuffer, v: int) void {
+    var b0: int = v % 256
+    var b1: int = (v / 256) % 256
+    var b2: int = (v / 65536) % 256
+    var b3: int = (v / 16777216) % 256
+    codeBufferEmit8(buf, b0)
+    codeBufferEmit8(buf, b1)
+    codeBufferEmit8(buf, b2)
+    codeBufferEmit8(buf, b3)
+}
+
+fn codeBufferEmit64(buf: CodeBuffer, v: int) void {
+    // Split into low and high 32-bit parts
+    var low: int = v % 4294967296
+    var high: int = v / 4294967296
+    codeBufferEmit32(buf, low)
+    codeBufferEmit32(buf, high)
+}
+
+fn codeBufferAddRelocation(buf: CodeBuffer, kind: RelocKind, symbol: string, addend: int) void {
+    var reloc: Relocation = Relocation{
+        .offset = codeBufferPos(buf),
+        .kind = kind,
+        .symbol = symbol,
+        .addend = addend,
+    }
+    buf.relocations.push(reloc)
+}
+
+fn codeBufferPatch32(buf: CodeBuffer, offset: int, v: int) void {
+    buf.bytes[offset] = v % 256
+    buf.bytes[offset + 1] = (v / 256) % 256
+    buf.bytes[offset + 2] = (v / 65536) % 256
+    buf.bytes[offset + 3] = (v / 16777216) % 256
+}
+
+fn codeBufferGetByte(buf: CodeBuffer, offset: int) int {
+    return buf.bytes.get(offset)
+}
+
+// =============================================================================
+// Target Architecture
+// =============================================================================
+
+enum Arch: u8 {
+    x86_64,
+    aarch64,
+}
+
+enum OS: u8 {
+    linux,
+    macos,
+    windows,
+}
+
+struct Target {
+    arch: Arch,
+    os: OS,
+}
+
+fn targetPtrSize(target: Target) int {
+    return 8   // Both x86_64 and aarch64 use 64-bit pointers
+}
+
+fn targetStackAlign(target: Target) int {
+    return 16  // Both architectures require 16-byte stack alignment
+}
+
+// =============================================================================
+// Calling Convention (simplified)
+// =============================================================================
+
+// AArch64 calling convention (AAPCS64)
+// Parameter registers: x0-x7
+// Return registers: x0, x1
+// Callee-saved: x19-x28, x29 (frame pointer)
+// Stack alignment: 16 bytes
+
+const AARCH64_PARAM_REG_COUNT: int = 8
+const AARCH64_RETURN_REG_COUNT: int = 2
+const AARCH64_CALLEE_SAVED_START: int = 19
+const AARCH64_CALLEE_SAVED_END: int = 28
+const AARCH64_FRAME_POINTER: int = 29
+const AARCH64_LINK_REGISTER: int = 30
+const AARCH64_STACK_POINTER: int = 31
+
+fn aarch64ParamReg(index: int) int {
+    if index < AARCH64_PARAM_REG_COUNT {
+        return index
+    }
+    return no_reg
+}
+
+fn aarch64ReturnReg(index: int) int {
+    if index < AARCH64_RETURN_REG_COUNT {
+        return index
+    }
+    return no_reg
+}
+
+fn aarch64IsCalleeSaved(reg: int) bool {
+    return reg >= AARCH64_CALLEE_SAVED_START and reg <= AARCH64_CALLEE_SAVED_END
+}
+
+// System V AMD64 ABI (for future x86_64 support)
+// Parameter registers: rdi, rsi, rdx, rcx, r8, r9 (indices 7, 6, 2, 1, 8, 9)
+// Return registers: rax, rdx (indices 0, 2)
+
+const X86_64_PARAM_REG_COUNT: int = 6
+const X86_64_RETURN_REG_COUNT: int = 2
+
+fn x86_64ParamReg(index: int) int {
+    if index == 0 { return 7 }  // rdi
+    if index == 1 { return 6 }  // rsi
+    if index == 2 { return 2 }  // rdx
+    if index == 3 { return 1 }  // rcx
+    if index == 4 { return 8 }  // r8
+    if index == 5 { return 9 }  // r9
+    return no_reg
+}
+
+fn x86_64ReturnReg(index: int) int {
+    if index == 0 { return 0 }  // rax
+    if index == 1 { return 2 }  // rdx
+    return no_reg
+}
+
+// =============================================================================
+// Simple test
+// =============================================================================
+
+fn main() int {
+    // Test storage creation
+    var s1: Storage = storageReg(5)
+    if s1.kind != StorageKind.general_reg {
+        return 1
+    }
+    if s1.reg != 5 {
+        return 2
+    }
+
+    var s2: Storage = storageStack(0 - 16)
+    if s2.kind != StorageKind.stack {
+        return 3
+    }
+    if s2.offset != 0 - 16 {
+        return 4
+    }
+
+    var s3: Storage = storageConst(42)
+    if s3.kind != StorageKind.constant {
+        return 5
+    }
+    if s3.value != 42 {
+        return 6
+    }
+
+    // Test code buffer - basic creation
+    var buf: CodeBuffer = codeBufferInit()
+
+    // Simple emit test
+    codeBufferEmit8(buf, 72)  // 0x48
+    codeBufferEmit8(buf, 137) // 0x89
+    codeBufferEmit8(buf, 229) // 0xE5
+
+    if codeBufferPos(buf) != 3 {
+        return 7
+    }
+
+    // Test emit16 function
+    codeBufferEmit16(buf, 256)  // Should push 0, 1
+    if codeBufferPos(buf) != 5 {
+        return 8
+    }
+
+    // Test emit32 function
+    codeBufferEmit32(buf, 305419896)  // 0x12345678 -> 0x78, 0x56, 0x34, 0x12
+    if codeBufferPos(buf) != 9 {
+        return 9
+    }
+
+    // Test target
+    var target: Target = Target{
+        .arch = Arch.aarch64,
+        .os = OS.macos,
+    }
+    if targetPtrSize(target) != 8 {
+        return 12
+    }
+    if targetStackAlign(target) != 16 {
+        return 13
+    }
+
+    // Test calling convention helpers
+    if aarch64ParamReg(0) != 0 {
+        return 14
+    }
+    if aarch64ParamReg(7) != 7 {
+        return 15
+    }
+    if aarch64ParamReg(8) != no_reg {
+        return 16
+    }
+
+    if not aarch64IsCalleeSaved(19) {
+        return 17
+    }
+    if aarch64IsCalleeSaved(0) {
+        return 18
+    }
+
+    return 42
+}

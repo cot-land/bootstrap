@@ -1,0 +1,508 @@
+// Type Context utilities for cot bootstrap.
+// Provides type lookup and resolution functions used by the lowerer.
+//
+// Changes from original type_context.zig:
+// - Standalone functions instead of methods
+// - No Ast container - works with declarations directly
+// - Inlined type constants and structures
+
+// =============================================================================
+// Type Indices (must match types_boot.cot)
+// =============================================================================
+
+type TypeIndex = int
+const invalid_type: int = @maxInt(i64)
+
+const TYPE_INVALID: TypeIndex = 0
+const TYPE_BOOL: TypeIndex = 1
+const TYPE_I8: TypeIndex = 2
+const TYPE_I16: TypeIndex = 3
+const TYPE_I32: TypeIndex = 4
+const TYPE_I64: TypeIndex = 5
+const TYPE_U8: TypeIndex = 6
+const TYPE_U16: TypeIndex = 7
+const TYPE_U32: TypeIndex = 8
+const TYPE_U64: TypeIndex = 9
+const TYPE_F32: TypeIndex = 10
+const TYPE_F64: TypeIndex = 11
+const TYPE_VOID: TypeIndex = 12
+const TYPE_STRING: TypeIndex = 13
+const TYPE_INT: TypeIndex = 5
+const TYPE_FLOAT: TypeIndex = 11
+
+// =============================================================================
+// Type structures (must match types_boot.cot)
+// =============================================================================
+
+struct PointerType {
+    elem: TypeIndex,
+}
+
+struct OptionalType {
+    elem: TypeIndex,
+}
+
+struct SliceType {
+    elem: TypeIndex,
+}
+
+struct ArrayType {
+    elem: TypeIndex,
+    length: int,
+}
+
+struct StructField {
+    name: string,
+    type_idx: TypeIndex,
+    offset: int,
+}
+
+struct StructType {
+    name: string,
+    fields: []StructField,
+    size: int,
+    alignment: int,
+}
+
+struct EnumVariant {
+    name: string,
+    value: int,
+}
+
+struct EnumType {
+    name: string,
+    backing_type: TypeIndex,
+    variants: []EnumVariant,
+}
+
+struct UnionVariant {
+    name: string,
+    type_idx: TypeIndex,
+}
+
+struct UnionType {
+    name: string,
+    variants: []UnionVariant,
+    tag_type: TypeIndex,
+}
+
+struct MapType {
+    key: TypeIndex,
+    value: TypeIndex,
+}
+
+struct ListType {
+    elem: TypeIndex,
+}
+
+struct FuncParam {
+    name: string,
+    type_idx: TypeIndex,
+}
+
+struct FuncType {
+    params: []FuncParam,
+    return_type: TypeIndex,
+}
+
+struct NamedType {
+    name: string,
+    underlying: TypeIndex,
+}
+
+struct AlphaType {
+    length: int,
+}
+
+struct DecimalType {
+    precision: int,
+    scale: int,
+}
+
+// =============================================================================
+// Type Union (must match types_boot.cot)
+// =============================================================================
+
+union Type {
+    basic: int,
+    alpha_type: AlphaType,
+    decimal_type: DecimalType,
+    pointer: PointerType,
+    optional: OptionalType,
+    slice: SliceType,
+    array: ArrayType,
+    struct_type: StructType,
+    enum_type: EnumType,
+    union_type: UnionType,
+    func: FuncType,
+    named: NamedType,
+    map_type: MapType,
+    list_type: ListType,
+}
+
+// =============================================================================
+// Type Registry (minimal interface)
+// =============================================================================
+
+struct TypeRegistry {
+    types: List<Type>,
+}
+
+// =============================================================================
+// Named Type Resolution
+// =============================================================================
+
+// Resolve a named type (int, u8, bool, etc.) to its TypeIndex
+fn resolveNamedType(name: string) TypeIndex {
+    if name == "i64" { return TYPE_I64 }
+    if name == "int" { return TYPE_INT }
+    if name == "i32" { return TYPE_I32 }
+    if name == "i16" { return TYPE_I16 }
+    if name == "i8" { return TYPE_I8 }
+    if name == "u64" { return TYPE_U64 }
+    if name == "u32" { return TYPE_U32 }
+    if name == "u16" { return TYPE_U16 }
+    if name == "u8" { return TYPE_U8 }
+    if name == "f64" { return TYPE_F64 }
+    if name == "float" { return TYPE_FLOAT }
+    if name == "f32" { return TYPE_F32 }
+    if name == "bool" { return TYPE_BOOL }
+    if name == "void" { return TYPE_VOID }
+    if name == "string" { return TYPE_STRING }
+    return invalid_type
+}
+
+// =============================================================================
+// Type Registry Query Functions
+// =============================================================================
+
+fn typeRegistryGet(reg: TypeRegistry, idx: TypeIndex) Type {
+    if idx == invalid_type {
+        return Type.basic(0)
+    }
+    if idx >= len(reg.types) {
+        return Type.basic(0)
+    }
+    return reg.types.get(idx)
+}
+
+fn typeRegistryAdd(reg: TypeRegistry, t: Type) TypeIndex {
+    var idx: TypeIndex = len(reg.types)
+    reg.types.push(t)
+    return idx
+}
+
+// Get a struct field's type by field name
+fn getFieldType(reg: TypeRegistry, struct_type_idx: TypeIndex, field_name: string) TypeIndex {
+    var t: Type = typeRegistryGet(reg, struct_type_idx)
+    var result: TypeIndex = switch t {
+        .struct_type |st| => getFieldFromStruct(st, field_name),
+        else => invalid_type,
+    }
+    return result
+}
+
+fn getFieldFromStruct(st: StructType, field_name: string) TypeIndex {
+    for field in st.fields {
+        if field.name == field_name {
+            return field.type_idx
+        }
+    }
+    return invalid_type
+}
+
+// Get the element type of an array, slice, or list
+fn getElementType(reg: TypeRegistry, type_idx: TypeIndex) TypeIndex {
+    var t: Type = typeRegistryGet(reg, type_idx)
+    return switch t {
+        .array |a| => a.elem,
+        .slice |s| => s.elem,
+        .list_type |l| => l.elem,
+        else => invalid_type,
+    }
+}
+
+// Get the key type of a Map
+fn getMapKeyType(reg: TypeRegistry, type_idx: TypeIndex) TypeIndex {
+    var t: Type = typeRegistryGet(reg, type_idx)
+    return switch t {
+        .map_type |m| => m.key,
+        else => invalid_type,
+    }
+}
+
+// Get the value type of a Map
+fn getMapValueType(reg: TypeRegistry, type_idx: TypeIndex) TypeIndex {
+    var t: Type = typeRegistryGet(reg, type_idx)
+    return switch t {
+        .map_type |m| => m.value,
+        else => invalid_type,
+    }
+}
+
+// Get the element type of a List<T>
+fn getListElementType(reg: TypeRegistry, type_idx: TypeIndex) TypeIndex {
+    var t: Type = typeRegistryGet(reg, type_idx)
+    return switch t {
+        .list_type |l| => l.elem,
+        else => invalid_type,
+    }
+}
+
+// Check if a type is a struct type
+fn isStructType(reg: TypeRegistry, type_idx: TypeIndex) bool {
+    var t: Type = typeRegistryGet(reg, type_idx)
+    return switch t {
+        .struct_type |st| => true,
+        else => false,
+    }
+}
+
+// Get struct field count (returns 0 if not a struct)
+fn getStructFieldCount(reg: TypeRegistry, type_idx: TypeIndex) int {
+    var t: Type = typeRegistryGet(reg, type_idx)
+    return switch t {
+        .struct_type |st| => len(st.fields),
+        else => 0,
+    }
+}
+
+// Get struct name (returns empty string if not a struct)
+fn getStructName(reg: TypeRegistry, type_idx: TypeIndex) string {
+    var t: Type = typeRegistryGet(reg, type_idx)
+    return switch t {
+        .struct_type |st| => st.name,
+        else => "",
+    }
+}
+
+// Get struct size (returns 0 if not a struct)
+fn getStructSize(reg: TypeRegistry, type_idx: TypeIndex) int {
+    var t: Type = typeRegistryGet(reg, type_idx)
+    return switch t {
+        .struct_type |st| => st.size,
+        else => 0,
+    }
+}
+
+// Get enum backing type
+fn getEnumBackingType(reg: TypeRegistry, type_idx: TypeIndex) TypeIndex {
+    var t: Type = typeRegistryGet(reg, type_idx)
+    return switch t {
+        .enum_type |e| => e.backing_type,
+        else => invalid_type,
+    }
+}
+
+// Check if a type is a union type
+fn isUnionType(reg: TypeRegistry, type_idx: TypeIndex) bool {
+    var t: Type = typeRegistryGet(reg, type_idx)
+    return switch t {
+        .union_type |u| => true,
+        else => false,
+    }
+}
+
+// Get union variant count (returns 0 if not a union)
+fn getUnionVariantCount(reg: TypeRegistry, type_idx: TypeIndex) int {
+    var t: Type = typeRegistryGet(reg, type_idx)
+    return switch t {
+        .union_type |u| => len(u.variants),
+        else => 0,
+    }
+}
+
+// Get union name (returns empty string if not a union)
+fn getUnionName(reg: TypeRegistry, type_idx: TypeIndex) string {
+    var t: Type = typeRegistryGet(reg, type_idx)
+    return switch t {
+        .union_type |u| => u.name,
+        else => "",
+    }
+}
+
+// Get union tag type
+fn getUnionTagType(reg: TypeRegistry, type_idx: TypeIndex) TypeIndex {
+    var t: Type = typeRegistryGet(reg, type_idx)
+    return switch t {
+        .union_type |u| => u.tag_type,
+        else => invalid_type,
+    }
+}
+
+// Get a union variant's payload type by variant name
+fn getUnionPayloadType(reg: TypeRegistry, union_type_idx: TypeIndex, variant_name: string) TypeIndex {
+    var t: Type = typeRegistryGet(reg, union_type_idx)
+    return switch t {
+        .union_type |u| => getPayloadFromUnion(u, variant_name),
+        else => invalid_type,
+    }
+}
+
+fn getPayloadFromUnion(u: UnionType, variant_name: string) TypeIndex {
+    for variant in u.variants {
+        if variant.name == variant_name {
+            return variant.type_idx
+        }
+    }
+    return invalid_type
+}
+
+// Get the inner type of a pointer
+fn getPointerElementType(reg: TypeRegistry, type_idx: TypeIndex) TypeIndex {
+    var t: Type = typeRegistryGet(reg, type_idx)
+    return switch t {
+        .pointer |p| => p.elem,
+        else => invalid_type,
+    }
+}
+
+// Get the inner type of an optional
+fn getOptionalElementType(reg: TypeRegistry, type_idx: TypeIndex) TypeIndex {
+    var t: Type = typeRegistryGet(reg, type_idx)
+    return switch t {
+        .optional |o| => o.elem,
+        else => invalid_type,
+    }
+}
+
+// =============================================================================
+// Type Construction
+// =============================================================================
+
+// Create a pointer type
+fn makePointerTo(reg: TypeRegistry, elem_type: TypeIndex) TypeIndex {
+    return typeRegistryAdd(reg, Type.pointer(PointerType{ .elem = elem_type }))
+}
+
+// Create an optional type
+fn makeOptional(reg: TypeRegistry, elem_type: TypeIndex) TypeIndex {
+    return typeRegistryAdd(reg, Type.optional(OptionalType{ .elem = elem_type }))
+}
+
+// Create a slice type
+fn makeSlice(reg: TypeRegistry, elem_type: TypeIndex) TypeIndex {
+    return typeRegistryAdd(reg, Type.slice(SliceType{ .elem = elem_type }))
+}
+
+// Create an array type
+fn makeArray(reg: TypeRegistry, elem_type: TypeIndex, length: int) TypeIndex {
+    return typeRegistryAdd(reg, Type.array(ArrayType{ .elem = elem_type, .length = length }))
+}
+
+// Create a map type
+fn makeMap(reg: TypeRegistry, key_type: TypeIndex, value_type: TypeIndex) TypeIndex {
+    return typeRegistryAdd(reg, Type.map_type(MapType{ .key = key_type, .value = value_type }))
+}
+
+// Create a list type
+fn makeList(reg: TypeRegistry, elem_type: TypeIndex) TypeIndex {
+    return typeRegistryAdd(reg, Type.list_type(ListType{ .elem = elem_type }))
+}
+
+// =============================================================================
+// Type Registry Initialization
+// =============================================================================
+
+fn typeRegistryInit() TypeRegistry {
+    var reg: TypeRegistry = TypeRegistry{
+        .types = new List<Type>(),
+    }
+
+    // Pre-register basic types in order (indices 0-13)
+    reg.types.push(Type.basic(0))   // 0 = invalid
+    reg.types.push(Type.basic(1))   // 1 = bool
+    reg.types.push(Type.basic(2))   // 2 = i8
+    reg.types.push(Type.basic(3))   // 3 = i16
+    reg.types.push(Type.basic(4))   // 4 = i32
+    reg.types.push(Type.basic(5))   // 5 = i64
+    reg.types.push(Type.basic(6))   // 6 = u8
+    reg.types.push(Type.basic(7))   // 7 = u16
+    reg.types.push(Type.basic(8))   // 8 = u32
+    reg.types.push(Type.basic(9))   // 9 = u64
+    reg.types.push(Type.basic(10))  // 10 = f32
+    reg.types.push(Type.basic(11))  // 11 = f64
+    reg.types.push(Type.basic(12))  // 12 = void
+    reg.types.push(Type.slice(SliceType{ .elem = TYPE_U8 }))  // 13 = string
+
+    return reg
+}
+
+// =============================================================================
+// Simple test
+// =============================================================================
+
+fn main() int {
+    // Test type registry initialization
+    var reg: TypeRegistry = typeRegistryInit()
+
+    // Test named type resolution
+    var int_idx: TypeIndex = resolveNamedType("int")
+    if int_idx != TYPE_INT {
+        return 1
+    }
+
+    var bool_idx: TypeIndex = resolveNamedType("bool")
+    if bool_idx != TYPE_BOOL {
+        return 2
+    }
+
+    var void_idx: TypeIndex = resolveNamedType("void")
+    if void_idx != TYPE_VOID {
+        return 3
+    }
+
+    // Test unknown type returns invalid
+    var unknown_idx: TypeIndex = resolveNamedType("unknown")
+    if unknown_idx != invalid_type {
+        return 4
+    }
+
+    // Test makePointerTo
+    var ptr_int: TypeIndex = makePointerTo(reg, TYPE_INT)
+    var ptr_elem: TypeIndex = getPointerElementType(reg, ptr_int)
+    if ptr_elem != TYPE_INT {
+        return 5
+    }
+
+    // Test makeSlice
+    var slice_u8: TypeIndex = makeSlice(reg, TYPE_U8)
+    var slice_elem: TypeIndex = getElementType(reg, slice_u8)
+    if slice_elem != TYPE_U8 {
+        return 6
+    }
+
+    // Test makeMap
+    var map_type: TypeIndex = makeMap(reg, TYPE_STRING, TYPE_INT)
+    var key_type: TypeIndex = getMapKeyType(reg, map_type)
+    var val_type: TypeIndex = getMapValueType(reg, map_type)
+    if key_type != TYPE_STRING {
+        return 7
+    }
+    if val_type != TYPE_INT {
+        return 8
+    }
+
+    // Test makeList
+    var list_type: TypeIndex = makeList(reg, TYPE_I64)
+    var list_elem: TypeIndex = getListElementType(reg, list_type)
+    if list_elem != TYPE_I64 {
+        return 9
+    }
+
+    // Test makeArray
+    var arr_type: TypeIndex = makeArray(reg, TYPE_U8, 10)
+    var arr_elem: TypeIndex = getElementType(reg, arr_type)
+    if arr_elem != TYPE_U8 {
+        return 10
+    }
+
+    // Test makeOptional
+    var opt_type: TypeIndex = makeOptional(reg, TYPE_INT)
+    var opt_elem: TypeIndex = getOptionalElementType(reg, opt_type)
+    if opt_elem != TYPE_INT {
+        return 11
+    }
+
+    return 42
+}

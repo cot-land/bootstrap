@@ -94,3 +94,7 @@ test_import
 test_import_nested
 test_list_set
 test_const
+type_context_boot
+debug_boot
+backend_boot
+aarch64_boot

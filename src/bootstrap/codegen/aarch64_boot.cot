@@ -1,0 +1,639 @@
+// AArch64 (ARM64) instruction encoding for cot bootstrap.
+// Simplified version - essential instructions only.
+//
+// Changes from original aarch64.zig:
+// - No VTable/Backend interface
+// - Standalone functions
+// - Uses CodeBuffer from backend_boot.cot
+
+// =============================================================================
+// AArch64 Registers
+// =============================================================================
+
+// General-purpose registers (64-bit: X0-X30, SP)
+const REG_X0: int = 0
+const REG_X1: int = 1
+const REG_X2: int = 2
+const REG_X3: int = 3
+const REG_X4: int = 4
+const REG_X5: int = 5
+const REG_X6: int = 6
+const REG_X7: int = 7
+const REG_X8: int = 8   // Indirect result
+const REG_X9: int = 9
+const REG_X10: int = 10
+const REG_X11: int = 11
+const REG_X12: int = 12
+const REG_X13: int = 13
+const REG_X14: int = 14
+const REG_X15: int = 15
+const REG_X16: int = 16  // IP0 (scratch)
+const REG_X17: int = 17  // IP1
+const REG_X18: int = 18  // Platform register
+const REG_X19: int = 19  // Callee-saved start
+const REG_X20: int = 20
+const REG_X21: int = 21
+const REG_X22: int = 22
+const REG_X23: int = 23
+const REG_X24: int = 24
+const REG_X25: int = 25
+const REG_X26: int = 26
+const REG_X27: int = 27
+const REG_X28: int = 28
+const REG_FP: int = 29   // Frame pointer (X29)
+const REG_LR: int = 30   // Link register (X30)
+const REG_SP: int = 31   // Stack pointer (also XZR in some encodings)
+const REG_XZR: int = 31  // Zero register (same encoding as SP)
+
+// =============================================================================
+// Condition Codes
+// =============================================================================
+
+const COND_EQ: int = 0   // Equal (Z=1)
+const COND_NE: int = 1   // Not equal (Z=0)
+const COND_CS: int = 2   // Carry set / unsigned >=
+const COND_CC: int = 3   // Carry clear / unsigned <
+const COND_MI: int = 4   // Minus / negative
+const COND_PL: int = 5   // Plus / positive or zero
+const COND_VS: int = 6   // Overflow
+const COND_VC: int = 7   // No overflow
+const COND_HI: int = 8   // Unsigned higher
+const COND_LS: int = 9   // Unsigned lower or same
+const COND_GE: int = 10  // Signed >=
+const COND_LT: int = 11  // Signed <
+const COND_GT: int = 12  // Signed >
+const COND_LE: int = 13  // Signed <=
+const COND_AL: int = 14  // Always
+
+// =============================================================================
+// CodeBuffer (inline from backend_boot.cot types)
+// =============================================================================
+
+struct CodeBuffer {
+    bytes: List<int>,
+    relocations: List<int>,  // Simplified - just store offsets
+}
+
+fn codeBufferInit() CodeBuffer {
+    return CodeBuffer{
+        .bytes = new List<int>(),
+        .relocations = new List<int>(),
+    }
+}
+
+fn codeBufferPos(buf: CodeBuffer) int {
+    return len(buf.bytes)
+}
+
+fn codeBufferEmit8(buf: CodeBuffer, b: int) void {
+    buf.bytes.push(b)
+}
+
+// Emit 32-bit instruction (little-endian)
+fn emit32(buf: CodeBuffer, inst: int) void {
+    var b0: int = inst % 256
+    var b1: int = (inst / 256) % 256
+    var b2: int = (inst / 65536) % 256
+    var b3: int = (inst / 16777216) % 256
+    codeBufferEmit8(buf, b0)
+    codeBufferEmit8(buf, b1)
+    codeBufferEmit8(buf, b2)
+    codeBufferEmit8(buf, b3)
+}
+
+fn codeBufferGetByte(buf: CodeBuffer, offset: int) int {
+    return buf.bytes.get(offset)
+}
+
+// Patch 32-bit value at offset (for branch fixups)
+fn patch32(buf: CodeBuffer, offset: int, inst: int) void {
+    buf.bytes[offset] = inst % 256
+    buf.bytes[offset + 1] = (inst / 256) % 256
+    buf.bytes[offset + 2] = (inst / 65536) % 256
+    buf.bytes[offset + 3] = (inst / 16777216) % 256
+}
+
+// =============================================================================
+// Instruction Encoding Helpers
+// =============================================================================
+
+// Data processing (shifted register): ADD/SUB Xd, Xn, Xm
+// Format: sf|op|S|01011|shift|0|Rm|imm6|Rn|Rd
+fn encodeDataProcShifted(sf: int, op: int, s: int, rm: int, rn: int, rd: int) int {
+    var inst: int = 0
+    inst = inst + (sf * 2147483648)       // bit 31
+    inst = inst + (op * 1073741824)       // bit 30
+    inst = inst + (s * 536870912)         // bit 29
+    inst = inst + (11 * 16777216)         // bits 28-24 = 01011
+    // shift = 00, imm6 = 0
+    inst = inst + (rm * 65536)            // bits 20-16
+    inst = inst + (rn * 32)               // bits 9-5
+    inst = inst + rd                       // bits 4-0
+    return inst
+}
+
+// Data processing (immediate): ADD/SUB Xd, Xn, #imm12
+// Format: sf|op|S|100010|sh|imm12|Rn|Rd
+fn encodeDataProcImm(sf: int, op: int, s: int, imm12: int, rn: int, rd: int) int {
+    var inst: int = 0
+    inst = inst + (sf * 2147483648)       // bit 31
+    inst = inst + (op * 1073741824)       // bit 30
+    inst = inst + (s * 536870912)         // bit 29
+    inst = inst + (34 * 8388608)          // bits 28-23 = 100010
+    // sh = 0 (no shift)
+    inst = inst + (imm12 * 1024)          // bits 21-10
+    inst = inst + (rn * 32)               // bits 9-5
+    inst = inst + rd                       // bits 4-0
+    return inst
+}
+
+// Logical (shifted register): ORR/AND/EOR Xd, Xn, Xm
+// Format: sf|opc|01010|shift|N|Rm|imm6|Rn|Rd
+fn encodeLogicalShifted(sf: int, opc: int, n: int, rm: int, rn: int, rd: int) int {
+    var inst: int = 0
+    inst = inst + (sf * 2147483648)       // bit 31
+    inst = inst + (opc * 536870912)       // bits 30-29
+    inst = inst + (10 * 16777216)         // bits 28-24 = 01010
+    // shift = 00
+    inst = inst + (n * 2097152)           // bit 21
+    inst = inst + (rm * 65536)            // bits 20-16
+    // imm6 = 0
+    inst = inst + (rn * 32)               // bits 9-5
+    inst = inst + rd                       // bits 4-0
+    return inst
+}
+
+// Move wide immediate: MOVZ/MOVK Xd, #imm16, LSL #shift
+// Format: sf|opc|100101|hw|imm16|Rd
+fn encodeMoveWide(sf: int, opc: int, hw: int, imm16: int, rd: int) int {
+    var inst: int = 0
+    inst = inst + (sf * 2147483648)       // bit 31
+    inst = inst + (opc * 536870912)       // bits 30-29
+    inst = inst + (37 * 8388608)          // bits 28-23 = 100101
+    inst = inst + (hw * 2097152)          // bits 22-21
+    inst = inst + (imm16 * 32)            // bits 20-5
+    inst = inst + rd                       // bits 4-0
+    return inst
+}
+
+// Load/store (unsigned offset): LDR/STR Xd, [Xn, #imm]
+// Format: size|111|V|01|opc|imm12|Rn|Rt
+fn encodeLoadStoreUnsigned(size: int, opc: int, imm12: int, rn: int, rt: int) int {
+    var inst: int = 0
+    inst = inst + (size * 1073741824)     // bits 31-30
+    inst = inst + (7 * 134217728)         // bits 29-27 = 111
+    // V = 0 (not SIMD)
+    inst = inst + (1 * 16777216)          // bit 24 = 1
+    inst = inst + (opc * 4194304)         // bits 23-22
+    inst = inst + (imm12 * 1024)          // bits 21-10
+    inst = inst + (rn * 32)               // bits 9-5
+    inst = inst + rt                       // bits 4-0
+    return inst
+}
+
+// Load/store pair: STP/LDP Xd, Xd2, [Xn, #imm]
+// Format: opc|101|V|type|L|imm7|Rt2|Rn|Rt
+fn encodeLoadStorePair(opc: int, indexType: int, load: int, imm7: int, rt2: int, rn: int, rt: int) int {
+    var inst: int = 0
+    inst = inst + (opc * 1073741824)      // bits 31-30
+    inst = inst + (5 * 134217728)         // bits 29-27 = 101
+    // V = 0
+    inst = inst + (indexType * 8388608)   // bits 25-23
+    inst = inst + (load * 4194304)        // bit 22
+    inst = inst + ((imm7 % 128) * 32768)  // bits 21-15 (7 bits, handle negative)
+    inst = inst + (rt2 * 1024)            // bits 14-10
+    inst = inst + (rn * 32)               // bits 9-5
+    inst = inst + rt                       // bits 4-0
+    return inst
+}
+
+// Branch (immediate): B/BL offset
+// Format: op|00101|imm26
+fn encodeBranchImm(link: int, imm26: int) int {
+    var inst: int = 0
+    inst = inst + (link * 2147483648)     // bit 31
+    inst = inst + (5 * 67108864)          // bits 30-26 = 00101
+    inst = inst + (imm26 % 67108864)      // bits 25-0 (26 bits)
+    return inst
+}
+
+// Branch (register): BR/BLR/RET Xn
+// Format: 1101011|opc|11111|000000|Rn|00000
+fn encodeBranchReg(opc: int, rn: int) int {
+    var inst: int = 0
+    inst = inst + (107 * 33554432)        // bits 31-25 = 1101011
+    inst = inst + (opc * 2097152)         // bits 24-21
+    inst = inst + (31 * 65536)            // bits 20-16 = 11111
+    inst = inst + (rn * 32)               // bits 9-5
+    return inst
+}
+
+// Conditional branch: B.cond offset
+// Format: 01010100|imm19|0|cond
+fn encodeBranchCond(cond: int, imm19: int) int {
+    var inst: int = 0
+    inst = inst + (84 * 16777216)         // bits 31-24 = 01010100
+    inst = inst + ((imm19 % 524288) * 32) // bits 23-5 (19 bits)
+    inst = inst + cond                     // bits 3-0
+    return inst
+}
+
+// =============================================================================
+// Arithmetic Instructions
+// =============================================================================
+
+// ADD Xd, Xn, Xm
+fn addRegReg(buf: CodeBuffer, rd: int, rn: int, rm: int) void {
+    emit32(buf, encodeDataProcShifted(1, 0, 0, rm, rn, rd))
+}
+
+// ADD Xd, Xn, #imm12
+fn addRegImm12(buf: CodeBuffer, rd: int, rn: int, imm12: int) void {
+    emit32(buf, encodeDataProcImm(1, 0, 0, imm12, rn, rd))
+}
+
+// SUB Xd, Xn, Xm
+fn subRegReg(buf: CodeBuffer, rd: int, rn: int, rm: int) void {
+    emit32(buf, encodeDataProcShifted(1, 1, 0, rm, rn, rd))
+}
+
+// SUB Xd, Xn, #imm12
+fn subRegImm12(buf: CodeBuffer, rd: int, rn: int, imm12: int) void {
+    emit32(buf, encodeDataProcImm(1, 1, 0, imm12, rn, rd))
+}
+
+// SUBS Xd, Xn, Xm (set flags)
+fn subsRegReg(buf: CodeBuffer, rd: int, rn: int, rm: int) void {
+    emit32(buf, encodeDataProcShifted(1, 1, 1, rm, rn, rd))
+}
+
+// CMP Xn, Xm (SUBS XZR, Xn, Xm)
+fn cmpRegReg(buf: CodeBuffer, rn: int, rm: int) void {
+    subsRegReg(buf, REG_XZR, rn, rm)
+}
+
+// CMP Xn, #imm12
+fn cmpRegImm12(buf: CodeBuffer, rn: int, imm12: int) void {
+    emit32(buf, encodeDataProcImm(1, 1, 1, imm12, rn, REG_XZR))
+}
+
+// NEG Xd, Xm (SUB Xd, XZR, Xm)
+fn negReg(buf: CodeBuffer, rd: int, rm: int) void {
+    subRegReg(buf, rd, REG_XZR, rm)
+}
+
+// MUL Xd, Xn, Xm (MADD Xd, Xn, Xm, XZR)
+fn mulRegReg(buf: CodeBuffer, rd: int, rn: int, rm: int) void {
+    // MADD: 1|00|11011|000|Rm|0|Ra=XZR|Rn|Rd
+    var inst: int = 0
+    inst = inst + 2147483648              // sf=1
+    inst = inst + (27 * 16777216)         // 11011
+    inst = inst + (rm * 65536)
+    inst = inst + (31 * 1024)             // Ra=XZR
+    inst = inst + (rn * 32)
+    inst = inst + rd
+    emit32(buf, inst)
+}
+
+// SDIV Xd, Xn, Xm
+fn sdivRegReg(buf: CodeBuffer, rd: int, rn: int, rm: int) void {
+    // SDIV: 1|0|0|11010110|Rm|000011|Rn|Rd
+    var inst: int = 0
+    inst = inst + 2147483648              // sf=1
+    inst = inst + (214 * 2097152)         // 11010110
+    inst = inst + (rm * 65536)
+    inst = inst + (3 * 1024)              // opcode=000011
+    inst = inst + (rn * 32)
+    inst = inst + rd
+    emit32(buf, inst)
+}
+
+// =============================================================================
+// Logical Instructions
+// =============================================================================
+
+// AND Xd, Xn, Xm
+fn andRegReg(buf: CodeBuffer, rd: int, rn: int, rm: int) void {
+    emit32(buf, encodeLogicalShifted(1, 0, 0, rm, rn, rd))
+}
+
+// ORR Xd, Xn, Xm
+fn orrRegReg(buf: CodeBuffer, rd: int, rn: int, rm: int) void {
+    emit32(buf, encodeLogicalShifted(1, 1, 0, rm, rn, rd))
+}
+
+// EOR Xd, Xn, Xm (XOR)
+fn eorRegReg(buf: CodeBuffer, rd: int, rn: int, rm: int) void {
+    emit32(buf, encodeLogicalShifted(1, 2, 0, rm, rn, rd))
+}
+
+// =============================================================================
+// Move Instructions
+// =============================================================================
+
+// MOV Xd, Xm (ORR Xd, XZR, Xm)
+fn movRegReg(buf: CodeBuffer, rd: int, rm: int) void {
+    orrRegReg(buf, rd, REG_XZR, rm)
+}
+
+// MOV Xd, SP (ADD Xd, SP, #0)
+fn movFromSp(buf: CodeBuffer, rd: int) void {
+    addRegImm12(buf, rd, REG_SP, 0)
+}
+
+// MOV SP, Xn (ADD SP, Xn, #0)
+fn movToSp(buf: CodeBuffer, rn: int) void {
+    addRegImm12(buf, REG_SP, rn, 0)
+}
+
+// MOVZ Xd, #imm16, LSL #(hw*16)
+fn movzImm16(buf: CodeBuffer, rd: int, imm16: int, hw: int) void {
+    emit32(buf, encodeMoveWide(1, 2, hw, imm16, rd))
+}
+
+// MOVK Xd, #imm16, LSL #(hw*16)
+fn movkImm16(buf: CodeBuffer, rd: int, imm16: int, hw: int) void {
+    emit32(buf, encodeMoveWide(1, 3, hw, imm16, rd))
+}
+
+// MOV Xd, #imm64 (using MOVZ + MOVK sequence)
+fn movRegImm64(buf: CodeBuffer, rd: int, imm: int) void {
+    if imm == 0 {
+        movRegReg(buf, rd, REG_XZR)
+        return
+    }
+
+    // Extract 16-bit chunks
+    var chunk0: int = imm % 65536
+    var chunk1: int = (imm / 65536) % 65536
+    var chunk2: int = (imm / 4294967296) % 65536
+    var chunk3: int = (imm / 281474976710656) % 65536
+
+    // Find first non-zero chunk for MOVZ
+    if chunk0 != 0 {
+        movzImm16(buf, rd, chunk0, 0)
+        if chunk1 != 0 { movkImm16(buf, rd, chunk1, 1) }
+        if chunk2 != 0 { movkImm16(buf, rd, chunk2, 2) }
+        if chunk3 != 0 { movkImm16(buf, rd, chunk3, 3) }
+    } else if chunk1 != 0 {
+        movzImm16(buf, rd, chunk1, 1)
+        if chunk2 != 0 { movkImm16(buf, rd, chunk2, 2) }
+        if chunk3 != 0 { movkImm16(buf, rd, chunk3, 3) }
+    } else if chunk2 != 0 {
+        movzImm16(buf, rd, chunk2, 2)
+        if chunk3 != 0 { movkImm16(buf, rd, chunk3, 3) }
+    } else {
+        movzImm16(buf, rd, chunk3, 3)
+    }
+}
+
+// =============================================================================
+// Load/Store Instructions
+// =============================================================================
+
+// LDR Xd, [Xn, #imm] (byte offset, scaled by 8)
+fn ldrRegImm(buf: CodeBuffer, rt: int, rn: int, offset: int) void {
+    var scaled: int = offset / 8
+    emit32(buf, encodeLoadStoreUnsigned(3, 1, scaled, rn, rt))
+}
+
+// STR Xd, [Xn, #imm] (byte offset, scaled by 8)
+fn strRegImm(buf: CodeBuffer, rt: int, rn: int, offset: int) void {
+    var scaled: int = offset / 8
+    emit32(buf, encodeLoadStoreUnsigned(3, 0, scaled, rn, rt))
+}
+
+// LDRB Wd, [Xn, #imm] (byte load)
+fn ldrbRegImm(buf: CodeBuffer, rt: int, rn: int, offset: int) void {
+    emit32(buf, encodeLoadStoreUnsigned(0, 1, offset, rn, rt))
+}
+
+// STRB Wd, [Xn, #imm] (byte store)
+fn strbRegImm(buf: CodeBuffer, rt: int, rn: int, offset: int) void {
+    emit32(buf, encodeLoadStoreUnsigned(0, 0, offset, rn, rt))
+}
+
+// LDR Wd, [Xn, #imm] (32-bit load, scaled by 4)
+fn ldrwRegImm(buf: CodeBuffer, rt: int, rn: int, offset: int) void {
+    var scaled: int = offset / 4
+    emit32(buf, encodeLoadStoreUnsigned(2, 1, scaled, rn, rt))
+}
+
+// STR Wd, [Xn, #imm] (32-bit store, scaled by 4)
+fn strwRegImm(buf: CodeBuffer, rt: int, rn: int, offset: int) void {
+    var scaled: int = offset / 4
+    emit32(buf, encodeLoadStoreUnsigned(2, 0, scaled, rn, rt))
+}
+
+// STP Xt1, Xt2, [Xn, #imm]! (pre-index)
+fn stpPreIndex(buf: CodeBuffer, rt: int, rt2: int, rn: int, imm7: int) void {
+    emit32(buf, encodeLoadStorePair(2, 3, 0, imm7, rt2, rn, rt))
+}
+
+// LDP Xt1, Xt2, [Xn], #imm (post-index)
+fn ldpPostIndex(buf: CodeBuffer, rt: int, rt2: int, rn: int, imm7: int) void {
+    emit32(buf, encodeLoadStorePair(2, 1, 1, imm7, rt2, rn, rt))
+}
+
+// =============================================================================
+// Branch Instructions
+// =============================================================================
+
+// B offset (unconditional branch)
+fn branch(buf: CodeBuffer, offset: int) void {
+    emit32(buf, encodeBranchImm(0, offset))
+}
+
+// BL offset (branch with link - call)
+fn branchLink(buf: CodeBuffer, offset: int) void {
+    emit32(buf, encodeBranchImm(1, offset))
+}
+
+// BR Xn (branch to register)
+fn branchReg(buf: CodeBuffer, rn: int) void {
+    emit32(buf, encodeBranchReg(0, rn))
+}
+
+// BLR Xn (branch with link to register)
+fn branchLinkReg(buf: CodeBuffer, rn: int) void {
+    emit32(buf, encodeBranchReg(1, rn))
+}
+
+// RET (return via X30)
+fn ret(buf: CodeBuffer) void {
+    emit32(buf, encodeBranchReg(2, REG_LR))
+}
+
+// B.cond offset (conditional branch)
+fn branchCond(buf: CodeBuffer, cond: int, offset: int) void {
+    emit32(buf, encodeBranchCond(cond, offset))
+}
+
+// =============================================================================
+// Miscellaneous
+// =============================================================================
+
+// NOP
+fn nop(buf: CodeBuffer) void {
+    emit32(buf, 3573751839)  // 0xD503201F
+}
+
+// SVC #imm16 (syscall)
+fn svc(buf: CodeBuffer, imm: int) void {
+    // SVC: 11010100|000|imm16|00001
+    var inst: int = 3556769825  // 0xD4000001 base
+    inst = inst + (imm * 32)
+    emit32(buf, inst)
+}
+
+// =============================================================================
+// Prologue/Epilogue Helpers
+// =============================================================================
+
+// Standard function prologue
+fn emitPrologue(buf: CodeBuffer, stack_size: int) void {
+    // STP X29, X30, [SP, #-16]! (save FP and LR)
+    stpPreIndex(buf, REG_FP, REG_LR, REG_SP, 0 - 2)  // -2 * 8 = -16
+
+    // MOV X29, SP (set up frame pointer)
+    movFromSp(buf, REG_FP)
+
+    // Reserve stack space if needed
+    if stack_size > 0 {
+        var aligned: int = ((stack_size + 15) / 16) * 16
+        subRegImm12(buf, REG_SP, REG_SP, aligned)
+    }
+}
+
+// Standard function epilogue
+fn emitEpilogue(buf: CodeBuffer) void {
+    // MOV SP, X29 (restore stack pointer)
+    movToSp(buf, REG_FP)
+
+    // LDP X29, X30, [SP], #16 (restore FP and LR)
+    ldpPostIndex(buf, REG_FP, REG_LR, REG_SP, 2)  // 2 * 8 = 16
+
+    // RET
+    ret(buf)
+}
+
+// =============================================================================
+// Simple test
+// =============================================================================
+
+fn main() int {
+    var buf: CodeBuffer = codeBufferInit()
+
+    // Test NOP first (simple known value)
+    // NOP = 0xD503201F
+    // bytes (little-endian): 31, 32, 3, 213
+    nop(buf)
+    if codeBufferPos(buf) != 4 {
+        return 1
+    }
+    if codeBufferGetByte(buf, 0) != 31 {   // 0x1F
+        return 2
+    }
+    if codeBufferGetByte(buf, 1) != 32 {   // 0x20
+        return 3
+    }
+    if codeBufferGetByte(buf, 3) != 213 {  // 0xD5
+        return 4
+    }
+
+    // Test RET encoding
+    // RET = 0xD65F03C0
+    // bytes: 192, 3, 95, 214
+    ret(buf)
+    if codeBufferPos(buf) != 8 {
+        return 5
+    }
+    if codeBufferGetByte(buf, 4) != 192 {  // 0xC0
+        return 6
+    }
+    if codeBufferGetByte(buf, 7) != 214 {  // 0xD6
+        return 7
+    }
+
+    // Test ADD encoding
+    // ADD X0, X1, X2 = 0x8B020020
+    // bytes: 32, 0, 2, 139
+    addRegReg(buf, REG_X0, REG_X1, REG_X2)
+    if codeBufferPos(buf) != 12 {
+        return 8
+    }
+    if codeBufferGetByte(buf, 8) != 32 {   // 0x20
+        return 9
+    }
+    if codeBufferGetByte(buf, 11) != 139 { // 0x8B
+        return 10
+    }
+
+    // Test SUB encoding
+    // SUB X0, X1, X2 = 0xCB020020
+    // bytes: 32, 0, 2, 203
+    subRegReg(buf, REG_X0, REG_X1, REG_X2)
+    if codeBufferPos(buf) != 16 {
+        return 11
+    }
+    if codeBufferGetByte(buf, 15) != 203 { // 0xCB
+        return 12
+    }
+
+    // Test MOV (ORR) encoding
+    // MOV X0, X1 = ORR X0, XZR, X1 = 0xAA0103E0
+    // bytes: 224, 3, 1, 170
+    movRegReg(buf, REG_X0, REG_X1)
+    if codeBufferPos(buf) != 20 {
+        return 13
+    }
+    if codeBufferGetByte(buf, 16) != 224 { // 0xE0
+        return 14
+    }
+    if codeBufferGetByte(buf, 19) != 170 { // 0xAA
+        return 15
+    }
+
+    // Test MOVZ encoding
+    // MOVZ X0, #0x1234, LSL #0 = 0xD2824680
+    // bytes: 128, 70, 130, 210 (0x80, 0x46, 0x82, 0xD2)
+    // Actually let me compute: movz with imm16=0x1234=4660, hw=0, rd=0
+    // Formula: sf=1, opc=2 (movz), bits 28-23 = 100101
+    // Let me use a simpler value: MOVZ X0, #1
+    movzImm16(buf, REG_X0, 1, 0)
+    if codeBufferPos(buf) != 24 {
+        return 16
+    }
+    // MOVZ X0, #1 = 0xD2800020
+    // bytes: 32, 0, 128, 210 (0x20, 0x00, 0x80, 0xD2)
+    if codeBufferGetByte(buf, 20) != 32 {  // 0x20
+        return 17
+    }
+    if codeBufferGetByte(buf, 23) != 210 { // 0xD2
+        return 18
+    }
+
+    // Test LDR encoding
+    // LDR X0, [X1, #8]
+    // size=3, opc=1, scaled_imm=1 (8/8), rn=1, rt=0
+    ldrRegImm(buf, REG_X0, REG_X1, 8)
+    if codeBufferPos(buf) != 28 {
+        return 19
+    }
+
+    // Test STR encoding
+    // STR X0, [X1, #16]
+    strRegImm(buf, REG_X0, REG_X1, 16)
+    if codeBufferPos(buf) != 32 {
+        return 20
+    }
+
+    // Test branch encoding
+    // B +4 (offset in instructions = 1)
+    branch(buf, 1)
+    if codeBufferPos(buf) != 36 {
+        return 21
+    }
+
+    return 42
+}

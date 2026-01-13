@@ -1,0 +1,206 @@
+// Debug utilities for cot bootstrap.
+// Simplified version - most debug features are no-ops in bootstrap.
+//
+// The bootstrap compiler doesn't need extensive debugging features.
+// This file provides type definitions and stub functions to satisfy
+// any code that references debug utilities.
+
+// =============================================================================
+// Debug Categories
+// =============================================================================
+
+enum Category: u8 {
+    scanner,
+    parser,
+    types,
+    checker,
+    ir,
+    ssa,
+    regalloc,
+    codegen,
+    object,
+    pe_coff,
+}
+
+// Check if a debug category is enabled (always false in bootstrap)
+fn isEnabled(category: Category) bool {
+    return false
+}
+
+// =============================================================================
+// Dump Configuration
+// =============================================================================
+
+struct DumpConfig {
+    dump_ir: bool,
+    dump_func: string,
+    dump_dir: string,
+    validate_ir: bool,
+    trace_regalloc: bool,
+}
+
+fn dumpConfigInit() DumpConfig {
+    return DumpConfig{
+        .dump_ir = false,
+        .dump_func = "",
+        .dump_dir = "",
+        .validate_ir = false,
+        .trace_regalloc = false,
+    }
+}
+
+// Global config (bootstrap: all disabled)
+var global_config: DumpConfig = DumpConfig{
+    .dump_ir = false,
+    .dump_func = "",
+    .dump_dir = "",
+    .validate_ir = false,
+    .trace_regalloc = false,
+}
+
+fn initConfig() void {
+    // No-op in bootstrap - env vars not supported
+}
+
+// =============================================================================
+// Dump Context
+// =============================================================================
+
+struct DumpContext {
+    phase_num: int,
+    func_name: string,
+}
+
+fn dumpContextInit() DumpContext {
+    return DumpContext{
+        .phase_num = 0,
+        .func_name = "",
+    }
+}
+
+fn dumpContextEnterPhase(ctx: DumpContext, phase_name: string) void {
+    // No-op in bootstrap
+}
+
+fn dumpContextDumpIR(ctx: DumpContext, content: string) void {
+    // No-op in bootstrap
+}
+
+// =============================================================================
+// Register Allocation Tracing
+// =============================================================================
+
+enum RegAllocTraceLevel: u8 {
+    none,
+    spills,
+    allocations,
+    full,
+}
+
+fn regAllocTraceLevel() RegAllocTraceLevel {
+    return RegAllocTraceLevel.none
+}
+
+fn traceRegAlloc(level: RegAllocTraceLevel, msg: string) void {
+    // No-op in bootstrap
+}
+
+// =============================================================================
+// Debug Helpers
+// =============================================================================
+
+fn debugAssert(ok: bool, msg: string) void {
+    // In bootstrap, just return - no panic capability
+}
+
+fn debugPrint(msg: string) void {
+    // No-op in bootstrap - print/println not available
+}
+
+// =============================================================================
+// Scoped Logger (simplified)
+// =============================================================================
+
+// In Zig, scoped() returns a type with methods.
+// In bootstrap, we use a struct with category and no-op methods.
+
+struct ScopedLog {
+    category: Category,
+}
+
+fn scoped(category: Category) ScopedLog {
+    return ScopedLog{ .category = category }
+}
+
+fn logDebug(log: ScopedLog, msg: string) void {
+    // No-op in bootstrap
+}
+
+fn logInfo(log: ScopedLog, msg: string) void {
+    // No-op in bootstrap
+}
+
+fn logWarn(log: ScopedLog, msg: string) void {
+    // No-op in bootstrap - print/println not available
+}
+
+fn categoryName(cat: Category) string {
+    return switch cat {
+        .scanner => "scanner",
+        .parser => "parser",
+        .types => "types",
+        .checker => "checker",
+        .ir => "ir",
+        .ssa => "ssa",
+        .regalloc => "regalloc",
+        .codegen => "codegen",
+        .object => "object",
+        .pe_coff => "pe_coff",
+    }
+}
+
+// =============================================================================
+// Simple test
+// =============================================================================
+
+fn main() int {
+    // Test category enum
+    var cat: Category = Category.ir
+    if not isEnabled(cat) {
+        // Expected - debug is disabled in bootstrap
+    } else {
+        return 1
+    }
+
+    // Test dump config
+    var cfg: DumpConfig = dumpConfigInit()
+    if cfg.dump_ir {
+        return 2
+    }
+
+    // Test dump context
+    var ctx: DumpContext = dumpContextInit()
+    if ctx.phase_num != 0 {
+        return 3
+    }
+
+    // Test scoped logger
+    var log: ScopedLog = scoped(Category.ssa)
+    logDebug(log, "test message")
+    logInfo(log, "test info")
+    // logWarn would print, so skip in test
+
+    // Test trace level
+    var level: RegAllocTraceLevel = regAllocTraceLevel()
+    if @intFromEnum(level) != 0 {
+        return 4
+    }
+
+    // Test category name (just verify it returns non-empty)
+    var name: string = categoryName(Category.codegen)
+    if len(name) == 0 {
+        return 5
+    }
+
+    return 42
+}
