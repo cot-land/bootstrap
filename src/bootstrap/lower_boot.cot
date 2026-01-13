@@ -851,10 +851,9 @@ fn lowerFnDeclNode(l: *Lowerer, node_idx: NodeIndex) void {
     var span_start: int = node.span.start.offset
     var span_end: int = node.span.end.offset
 
+    // irFuncBuilderInit creates block 0 and sets current_block = 0
+    // No need to create another entry block (BUG-006 fix)
     var fb: IRFuncBuilder = irFuncBuilderInit(node.name, 0, TYPE_INT, span_start, span_end)
-
-    var entry_block: IRBlockIndex = irFuncBuilderNewBlock(&fb, "entry")
-    irFuncBuilderSetBlock(&fb, entry_block)
 
     if node.body != null_node {
         lowerStmtNode(l, &fb, node.body)

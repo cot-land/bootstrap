@@ -56,13 +56,13 @@ This is the ONLY way to achieve a stable self-hosting compiler.
 - **Note:** Deferred - cot0 currently only compiles simple programs. Struct init in bootstrap .cot files is compiled by Zig compiler, not cot0.
 
 ### BUG-006: Duplicate entry block in IR
-- **Status:** OPEN
+- **Status:** FIXED
 - **Discovered:** 2026-01-14
-- **Location:** `ir_boot.cot:534` and `main_boot.cot:544`
-- **Description:** `irFuncBuilderInit` creates block 0, then `lowerFnDecl` creates block 1
+- **Location:** `ir_boot.cot:534` and `lower_boot.cot:856`
+- **Description:** `irFuncBuilderInit` creates block 0, then `lowerFnDeclNode` created block 1
 - **Impact:** Wastes memory, block 0 unused
 - **Test:** N/A (not a correctness bug)
-- **Fix:** Remove one of the block creations
+- **Fix:** Removed duplicate block creation in `lowerFnDeclNode` - now uses block 0 from init
 
 ### BUG-007: Slice expression in struct init field returns wrong value
 - **Status:** OPEN (workaround applied)
@@ -101,6 +101,7 @@ return ParserState{ .tok_text = slice_text, ... }
 | BUG-002 | lowerVarStmtNode wrong field | 2026-01-14 |
 | BUG-003 | Call args not stored | 2026-01-14 |
 | BUG-004 | Fn params discarded | 2026-01-14 |
+| BUG-006 | Duplicate entry block in IR | 2026-01-14 |
 | BUG-008 | Chained pointer field access for strings | 2026-01-14 |
 
 ---
