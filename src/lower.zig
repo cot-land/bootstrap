@@ -366,7 +366,8 @@ pub const Lowerer = struct {
         return switch (expr) {
             .literal => |lit| {
                 if (lit.kind == .int) {
-                    return std.fmt.parseInt(i64, lit.value, 10) catch null;
+                    // Use base 0 to auto-detect: 0x for hex, 0b for binary, 0o for octal
+                    return std.fmt.parseInt(i64, lit.value, 0) catch null;
                 }
                 return null;
             },
@@ -1383,7 +1384,8 @@ pub const Lowerer = struct {
 
         return switch (lit.kind) {
             .int => {
-                const value = std.fmt.parseInt(i64, lit.value, 10) catch 0;
+                // Use base 0 to auto-detect: 0x for hex, 0b for binary, 0o for octal
+                const value = std.fmt.parseInt(i64, lit.value, 0) catch 0;
                 const node = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
                     .withAux(value);
                 log.debug("  const_int: {d}", .{value});
@@ -1765,72 +1767,41 @@ pub const Lowerer = struct {
                         }
                     },
                     .field_access => |fa| {
-                        // len(struct.field) - need to get field type and check if it's a list or slice
-                        // First, get base variable type
-                        const base_node = self.tree.getNode(fa.base);
-                        if (base_node == .expr and base_node.expr == .identifier) {
-                            const ident = base_node.expr.identifier;
-                            if (fb.lookupLocal(ident.name)) |local_idx| {
-                                const local = fb.locals.items[local_idx];
-                                const base_type = self.type_reg.get(local.type_idx);
+                        // len(struct.field) or len(outer.inner.field) - handle nested field access
+                        // Use resolveFieldAccessChain to properly handle chained field access
+                        const chain_info = self.resolveFieldAccessChain(fa);
 
-                                // Find the field type
-                                if (base_type == .struct_type) {
-                                    const st = base_type.struct_type;
-                                    for (st.fields) |f| {
-                                        if (std.mem.eql(u8, f.name, fa.field)) {
-                                            const field_type = self.type_reg.get(f.type_idx);
-                                            if (field_type == .list_type) {
-                                                // Lower the field access to get the list handle
-                                                const list_node = try self.lowerFieldAccess(fa);
-                                                const node = ir.Node.init(.list_len, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                                                    .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{list_node}));
-                                                log.debug("  len(struct.list_field) runtime: field={s}", .{fa.field});
-                                                return try fb.emit(node);
-                                            } else if (field_type == .slice) {
-                                                // For slice fields, the length is at offset field_offset + 8
-                                                // Use field_local with the cumulative offset to len
-                                                const len_offset: u32 = f.offset + 8;
-                                                const node = ir.Node.init(.field_local, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                                                    .withArgs(&.{@as(ir.NodeIndex, @intCast(local_idx))})
-                                                    .withAux(@intCast(len_offset));
-                                                log.debug("  len(struct.slice_field) runtime: local={d}, offset={d}", .{ local_idx, len_offset });
-                                                return try fb.emit(node);
-                                            }
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        } else if (base_node == .expr and base_node.expr == .deref) {
-                            // len(ptr.*.field) - field access through pointer dereference
-                            const d = base_node.expr.deref;
-                            const deref_base = self.tree.getNode(d.operand);
-                            if (deref_base == .expr and deref_base.expr == .identifier) {
-                                const ident = deref_base.expr.identifier;
-                                if (fb.lookupLocal(ident.name)) |local_idx| {
-                                    const local = fb.locals.items[local_idx];
-                                    const ptr_type = self.type_reg.get(local.type_idx);
-                                    if (ptr_type == .pointer) {
-                                        const elem_type = self.type_reg.get(ptr_type.pointer.elem);
-                                        if (elem_type == .struct_type) {
-                                            const st = elem_type.struct_type;
-                                            for (st.fields) |f| {
-                                                if (std.mem.eql(u8, f.name, fa.field)) {
-                                                    const field_type = self.type_reg.get(f.type_idx);
-                                                    if (field_type == .list_type) {
-                                                        // Lower the field access to get the list handle
-                                                        const list_node = try self.lowerFieldAccess(fa);
-                                                        const node = ir.Node.init(.list_len, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                                                            .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{list_node}));
-                                                        log.debug("  len(ptr.*.list_field) runtime: field={s}", .{fa.field});
-                                                        return try fb.emit(node);
-                                                    }
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
+                        if (chain_info.root_local_idx) |local_idx| {
+                            const field_type = self.type_reg.get(chain_info.field_type_idx);
+
+                            if (field_type == .list_type) {
+                                // Lower the field access to get the list handle, then call list_len
+                                const list_node = try self.lowerFieldAccess(fa);
+                                const node = ir.Node.init(.list_len, TypeRegistry.INT, Span.fromPos(Pos.zero))
+                                    .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{list_node}));
+                                log.debug("  len(chained.list_field) runtime: local={d}, offset={d}", .{ local_idx, chain_info.cumulative_offset });
+                                return try fb.emit(node);
+                            } else if (field_type == .slice) {
+                                // For slice fields, the length is at offset cumulative_offset + 8
+                                const len_offset: u32 = chain_info.cumulative_offset + 8;
+                                const local = fb.locals.items[local_idx];
+                                const root_type = self.type_reg.get(local.type_idx);
+                                const is_large_struct_param = local.is_param and
+                                    root_type == .struct_type and
+                                    self.type_reg.sizeOf(local.type_idx) > 16;
+
+                                if (chain_info.is_ptr_deref or is_large_struct_param) {
+                                    const node = ir.Node.init(.ptr_field, TypeRegistry.INT, Span.fromPos(Pos.zero))
+                                        .withArgs(&.{@as(ir.NodeIndex, @intCast(local_idx))})
+                                        .withAux(@intCast(len_offset));
+                                    log.debug("  len(chained.slice_field) ptr: local={d}, offset={d}", .{ local_idx, len_offset });
+                                    return try fb.emit(node);
+                                } else {
+                                    const node = ir.Node.init(.field_local, TypeRegistry.INT, Span.fromPos(Pos.zero))
+                                        .withArgs(&.{@as(ir.NodeIndex, @intCast(local_idx))})
+                                        .withAux(@intCast(len_offset));
+                                    log.debug("  len(chained.slice_field) local: local={d}, offset={d}", .{ local_idx, len_offset });
+                                    return try fb.emit(node);
                                 }
                             }
                         }
@@ -1859,7 +1830,8 @@ pub const Lowerer = struct {
                 switch (expr) {
                     .literal => |lit| {
                         if (lit.kind == .int) {
-                            return std.fmt.parseInt(i64, lit.value, 10) catch null;
+                            // Use base 0 to auto-detect: 0x for hex, 0b for binary, 0o for octal
+                            return std.fmt.parseInt(i64, lit.value, 0) catch null;
                         }
                     },
                     else => {},
@@ -2448,7 +2420,8 @@ pub const Lowerer = struct {
                         const lit = idx_ast_node.expr.literal;
                         if (lit.kind == .int) {
                             // Constant index - compute offset at compile time
-                            const idx_val = std.fmt.parseInt(u32, lit.value, 10) catch 0;
+                            // Use base 0 to auto-detect: 0x for hex, 0b for binary, 0o for octal
+                            const idx_val = std.fmt.parseInt(u32, lit.value, 0) catch 0;
                             const offset = idx_val * elem_size;
 
                             // Emit addr_field with computed offset (reusing struct field access pattern)

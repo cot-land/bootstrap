@@ -62,7 +62,7 @@ Every Zig source file needs a corresponding bootstrap .cot file that uses only s
 | `src/driver.zig` | `src/bootstrap/driver_boot.cot` | TODO | Compilation orchestration |
 | `src/main.zig` | `src/bootstrap/main_boot.cot` | TODO | Entry point |
 | `src/codegen/backend.zig` | `src/bootstrap/codegen/backend_boot.cot` | **Done** | Backend abstraction |
-| `src/codegen/arm64_codegen.zig` | `src/bootstrap/codegen/arm64_boot.cot` | TODO | ARM64 code generation |
+| `src/codegen/arm64_codegen.zig` | `src/bootstrap/codegen/arm64_boot.cot` | **Done** | ARM64 code generation |
 | `src/codegen/amd64_codegen.zig` | `src/bootstrap/codegen/amd64_boot.cot` | TODO | x86_64 code generation |
 | `src/codegen/aarch64.zig` | `src/bootstrap/codegen/aarch64_boot.cot` | **Done** | ARM64 instruction encoding |
 | `src/codegen/x86_64.zig` | `src/bootstrap/codegen/x86_64_boot.cot` | TODO | x86_64 instruction encoding |
@@ -71,7 +71,7 @@ Every Zig source file needs a corresponding bootstrap .cot file that uses only s
 | `src/debug.zig` | `src/bootstrap/debug_boot.cot` | **Done** | Debug output utilities |
 | `src/type_context.zig` | `src/bootstrap/type_context_boot.cot` | **Done** | Type context for checker |
 
-**Progress: 16/22 files complete**
+**Progress: 17/22 files complete**
 
 ---
 

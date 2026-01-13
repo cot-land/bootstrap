@@ -148,7 +148,8 @@ pub const TypeContext = struct {
             if (node.expr == .literal) {
                 const lit = node.expr.literal;
                 if (lit.kind == .int) {
-                    return std.fmt.parseInt(u32, lit.value, 10) catch 0;
+                    // Use base 0 to auto-detect: 0x for hex, 0b for binary, 0o for octal
+                    return std.fmt.parseInt(u32, lit.value, 0) catch 0;
                 }
             }
         }

@@ -254,7 +254,7 @@ pub const CodeGen = struct {
 
     // Liveness analysis for smart spill decisions
     liveness_info: ?liveness.LivenessInfo = null,
-    current_inst: u32 = 0,
+    current_inst: u32 = 1, // Start at 1 to match liveness analysis
 
     // Track which callee-saved registers are used (Go/Zig pattern)
     // Bit 0 = x19, bit 1 = x20, ..., bit 9 = x28
@@ -418,6 +418,14 @@ pub const CodeGen = struct {
 
         tracking.current = tracking.home;
         self.reg_manager.markFree(reg);
+    }
+
+    /// Ensure a register is free for use. If the register is currently holding
+    /// a value that will be needed later, spill it to the stack first.
+    fn ensureRegFree(self: *CodeGen, reg: aarch64.Reg) !void {
+        if (!self.reg_manager.isFree(reg)) {
+            try self.spillReg(reg);
+        }
     }
 
     pub fn getValue(self: *CodeGen, value_id: ssa.ValueID) MCValue {
@@ -701,6 +709,14 @@ pub const CodeGen = struct {
         const left_mcv = self.getValue(args[0]);
         const right_mcv = self.getValue(args[1]);
 
+        // If x0 holds a value that is NOT one of our operands, spill it first
+        // to avoid clobbering it when we use x0 for our result.
+        const left_in_x0 = left_mcv == .register and left_mcv.register == .x0;
+        const right_in_x0 = right_mcv == .register and right_mcv.register == .x0;
+        if (!left_in_x0 and !right_in_x0) {
+            try self.ensureRegFree(.x0);
+        }
+
         // If right is in x0, we MUST save it before loading left into x0,
         // otherwise loading left will clobber right before we can use it.
         if (right_mcv == .register and right_mcv.register == .x0) {
@@ -746,6 +762,13 @@ pub const CodeGen = struct {
         const left_mcv = self.getValue(args[0]);
         const right_mcv = self.getValue(args[1]);
 
+        // If x0 holds a value that is NOT one of our operands, spill it first
+        const left_in_x0 = left_mcv == .register and left_mcv.register == .x0;
+        const right_in_x0 = right_mcv == .register and right_mcv.register == .x0;
+        if (!left_in_x0 and !right_in_x0) {
+            try self.ensureRegFree(.x0);
+        }
+
         // If right is in x0, we MUST save it before loading left into x0
         if (right_mcv == .register and right_mcv.register == .x0) {
             // Choose scratch reg that doesn't conflict with left operand
@@ -786,6 +809,13 @@ pub const CodeGen = struct {
         const left_mcv = self.getValue(args[0]);
         const right_mcv = self.getValue(args[1]);
 
+        // If x0 holds a value that is NOT one of our operands, spill it first
+        const left_in_x0 = left_mcv == .register and left_mcv.register == .x0;
+        const right_in_x0 = right_mcv == .register and right_mcv.register == .x0;
+        if (!left_in_x0 and !right_in_x0) {
+            try self.ensureRegFree(.x0);
+        }
+
         // If right is in x0, we MUST save it before loading left into x0
         if (right_mcv == .register and right_mcv.register == .x0) {
             // Choose scratch reg that doesn't conflict with left operand
@@ -821,6 +851,13 @@ pub const CodeGen = struct {
         const args = value.args();
         const left_mcv = self.getValue(args[0]);
         const right_mcv = self.getValue(args[1]);
+
+        // If x0 holds a value that is NOT one of our operands, spill it first
+        const left_in_x0 = left_mcv == .register and left_mcv.register == .x0;
+        const right_in_x0 = right_mcv == .register and right_mcv.register == .x0;
+        if (!left_in_x0 and !right_in_x0) {
+            try self.ensureRegFree(.x0);
+        }
 
         // Choose scratch reg that doesn't conflict with left operand
         const scratch: aarch64.Reg = if (left_mcv == .register and left_mcv.register == .x9) .x10 else .x9;
@@ -1409,8 +1446,9 @@ pub const CodeGen = struct {
             return;
         }
 
-        // Always use x0 for field results (genStore expects this)
+        // Use x0 for field results (genStore expects this), but ensure it's free first
         const dest: aarch64.Reg = .x0;
+        try self.ensureRegFree(dest);
 
         // Use correct load width based on type size
         switch (size) {
@@ -2143,8 +2181,8 @@ pub const CodeGen = struct {
         const args = value.args();
         if (args.len < 2) return;
 
-        // Spill x0 before we overwrite it with the result
-        try self.spillReg(.x0);
+        // Spill all caller-saved registers before the function call
+        try self.spillCallerSaved();
 
         // Load handle into x0 via MCValue
         const handle_mcv = self.getValue(args[0]);
@@ -2204,8 +2242,25 @@ pub const CodeGen = struct {
 
             const func_name = if (self.os == .macos) "_cot_map_get_int" else "cot_map_get_int";
             try aarch64.callSymbol(self.buf, func_name);
-            self.reg_manager.markUsed(.x0, value.id);
-            try self.setResult(value.id, .{ .register = .x0 });
+
+            // Check value type size for proper result handling
+            const int_map_value_size = self.type_reg.sizeOf(value.type_idx);
+            if (int_map_value_size > 16) {
+                // Very large struct - would need special handling (not yet implemented)
+                self.reg_manager.markUsed(.x0, value.id);
+                try self.setResult(value.id, .{ .register = .x0 });
+            } else if (int_map_value_size > 8) {
+                // Medium struct (9-16 bytes) returned in x0+x1 - spill to stack
+                const result_offset = self.next_spill_offset;
+                try self.strSpOffset(.x0, result_offset);
+                try self.strSpOffset(.x1, result_offset + 8);
+                self.next_spill_offset += @intCast(alignTo(int_map_value_size, 8));
+                try self.setResult(value.id, .{ .stack = result_offset });
+            } else {
+                // Small value (≤ 8 bytes) - result in x0
+                self.reg_manager.markUsed(.x0, value.id);
+                try self.setResult(value.id, .{ .register = .x0 });
+            }
             return;
         }
 
@@ -2295,6 +2350,7 @@ pub const CodeGen = struct {
 
     /// Generate code for map_new: create new map via runtime call
     pub fn genMapNew(self: *CodeGen, value: *ssa.Value) !void {
+        try self.spillCallerSaved();
         try aarch64.callSymbol(self.buf, "_cot_map_new");
         self.reg_manager.markUsed(.x0, value.id);
         try self.setResult(value.id, .{ .register = .x0 });
@@ -2488,6 +2544,8 @@ pub const CodeGen = struct {
         const args = value.args();
         if (args.len == 0) return;
 
+        try self.spillCallerSaved();
+
         const handle_mcv = self.getValue(args[0]);
         try self.loadToReg(.x0, handle_mcv);
 
@@ -2501,6 +2559,8 @@ pub const CodeGen = struct {
         const args = value.args();
         if (args.len == 0) return;
 
+        try self.spillCallerSaved();
+
         const handle_mcv = self.getValue(args[0]);
         try self.loadToReg(.x0, handle_mcv);
 
@@ -2509,6 +2569,9 @@ pub const CodeGen = struct {
 
     /// Generate code for list_new: call cot_list_new(elem_size) runtime function
     pub fn genListNew(self: *CodeGen, value: *ssa.Value) !void {
+        // Spill all caller-saved registers before the function call
+        try self.spillCallerSaved();
+
         // Get element size from list type
         var elem_size: i64 = 8; // default to 8 bytes
         const list_type = self.type_reg.get(value.type_idx);
@@ -2531,6 +2594,9 @@ pub const CodeGen = struct {
     pub fn genListPush(self: *CodeGen, value: *ssa.Value) !void {
         const args = value.args();
         if (args.len < 2) return;
+
+        // Spill all caller-saved registers before the function call
+        try self.spillCallerSaved();
 
         // Get the value's type to determine element size
         const value_ssa = &self.func.values.items[args[1]];
@@ -2597,6 +2663,9 @@ pub const CodeGen = struct {
     pub fn genListSet(self: *CodeGen, value: *ssa.Value) !void {
         const args = value.args();
         if (args.len < 3) return;
+
+        // Spill all caller-saved registers before the function call
+        try self.spillCallerSaved();
 
         // Get the value's type to determine element size
         const value_ssa = &self.func.values.items[args[2]];
@@ -2677,6 +2746,9 @@ pub const CodeGen = struct {
         const args = value.args();
         if (args.len == 0) return;
 
+        // Spill all caller-saved registers before the function call
+        try self.spillCallerSaved();
+
         // Load handle into x0 via MCValue
         const handle_mcv = self.getValue(args[0]);
         try self.loadToReg(.x0, handle_mcv);
@@ -2691,6 +2763,9 @@ pub const CodeGen = struct {
     pub fn genListFree(self: *CodeGen, value: *ssa.Value) !void {
         const args = value.args();
         if (args.len == 0) return;
+
+        // Spill all caller-saved registers before the function call
+        try self.spillCallerSaved();
 
         // Load handle into x0 via MCValue
         const handle_mcv = self.getValue(args[0]);
@@ -3011,6 +3086,7 @@ pub const CodeGen = struct {
             .arg => try self.genArg(value),
             .retain, .release, .@"unreachable" => {}, // TODO: implement
         }
+        // Note: advanceInst is called by driver.zig after each genValue
     }
 
     pub fn genBlockEnd(self: *CodeGen, block: *ssa.Block) !void {

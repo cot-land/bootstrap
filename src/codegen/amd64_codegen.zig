@@ -1658,8 +1658,24 @@ pub const CodeGen = struct {
 
         try self.emitRuntimeCall("cot_map_get");
 
-        self.reg_manager.markUsed(.rax, value.id);
-        try self.setResult(value.id, .{ .register = .rax });
+        // Check value type size for proper result handling
+        const map_value_size = self.type_reg.sizeOf(value.type_idx);
+        if (map_value_size > 16) {
+            // Very large struct - would need special handling (not yet implemented)
+            self.reg_manager.markUsed(.rax, value.id);
+            try self.setResult(value.id, .{ .register = .rax });
+        } else if (map_value_size > 8) {
+            // Medium struct (9-16 bytes) returned in rax+rdx - spill to stack
+            const result_offset = self.next_spill_offset;
+            try x86.movMemReg(self.buf, .rbp, -@as(i32, @intCast(result_offset)), .rax);
+            try x86.movMemReg(self.buf, .rbp, -@as(i32, @intCast(result_offset)) - 8, .rdx);
+            self.next_spill_offset += @intCast(alignTo(map_value_size, 8));
+            try self.setResult(value.id, .{ .stack = result_offset });
+        } else {
+            // Small value (≤ 8 bytes) - result in rax
+            self.reg_manager.markUsed(.rax, value.id);
+            try self.setResult(value.id, .{ .register = .rax });
+        }
     }
 
     fn emitRuntimeCall(self: *CodeGen, name: []const u8) !void {

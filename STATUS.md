@@ -8,8 +8,8 @@
 
 | Platform | Status | Notes |
 |----------|--------|-------|
-| ARM64 (macOS) | ✅ 65/81 Pass | All tests pass, 16 skipped (no expected value) |
-| x86_64 (Linux) | ✅ 65/81 Pass | All tests pass, 16 skipped (no expected value) |
+| ARM64 (macOS) | ✅ 71/98 Pass | All tests pass, 27 skipped (no expected value) |
+| x86_64 (Linux) | ✅ 71/98 Pass | All tests pass, 27 skipped (no expected value) |
 
 ```bash
 # Fast validation (default - runs comprehensive test only)
@@ -33,10 +33,10 @@ zig build test                    # 135+ embedded tests
 
 | Progress | Count | Status |
 |----------|-------|--------|
-| Bootstrap .cot files done | 16/22 | 73% |
+| Bootstrap .cot files done | 17/22 | 77% |
 | Zig source files | 22 | Reference implementation |
 
-**Completed:** `token_boot.cot`, `source_boot.cot`, `scanner_boot.cot`, `ast_boot.cot`, `types_boot.cot`, `errors_boot.cot`, `parser_boot.cot`, `check_boot.cot`, `ir_boot.cot`, `lower_boot.cot`, `ssa_boot.cot`, `liveness_boot.cot`, `type_context_boot.cot`, `debug_boot.cot`, `backend_boot.cot`, `aarch64_boot.cot`
+**Completed:** `token_boot.cot`, `source_boot.cot`, `scanner_boot.cot`, `ast_boot.cot`, `types_boot.cot`, `errors_boot.cot`, `parser_boot.cot`, `check_boot.cot`, `ir_boot.cot`, `lower_boot.cot`, `ssa_boot.cot`, `liveness_boot.cot`, `type_context_boot.cot`, `debug_boot.cot`, `backend_boot.cot`, `aarch64_boot.cot`, `arm64_boot.cot`
 
 ---
 

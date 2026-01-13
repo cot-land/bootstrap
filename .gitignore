@@ -98,3 +98,8 @@ type_context_boot
 debug_boot
 backend_boot
 aarch64_boot
+arm64_boot
+arm64_boot_test
+
+# Any test binary in root
+/test_*

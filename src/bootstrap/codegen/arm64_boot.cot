@@ -1,0 +1,1462 @@
+// ARM64 Code Generation for cot bootstrap.
+// Simplified version - basic register allocation and core operations.
+//
+// Changes from original arm64_codegen.zig:
+// - Simplified register management (no complex tracking)
+// - Core operations only (enough for bootstrap)
+// - Uses aarch64_boot.cot for instruction encoding
+// - No liveness analysis (simpler spilling)
+
+// =============================================================================
+// Imports would go here in full compiler
+// This file assumes aarch64_boot.cot and backend_boot.cot are available
+// =============================================================================
+
+// =============================================================================
+// MCValue - Where a value lives
+// =============================================================================
+
+enum MCValueKind: u8 {
+    none,
+    dead,
+    immediate,
+    register,
+    stack,
+}
+
+struct MCValue {
+    kind: MCValueKind,
+    reg: int,           // Register number (for register kind)
+    imm: int,           // Immediate value
+    stack_offset: int,  // Stack offset (for stack kind)
+}
+
+fn mcvNone() MCValue {
+    return MCValue{
+        .kind = MCValueKind.none,
+        .reg = 0,
+        .imm = 0,
+        .stack_offset = 0,
+    }
+}
+
+fn mcvImmediate(val: int) MCValue {
+    return MCValue{
+        .kind = MCValueKind.immediate,
+        .reg = 0,
+        .imm = val,
+        .stack_offset = 0,
+    }
+}
+
+fn mcvRegister(r: int) MCValue {
+    return MCValue{
+        .kind = MCValueKind.register,
+        .reg = r,
+        .imm = 0,
+        .stack_offset = 0,
+    }
+}
+
+fn mcvStack(offset: int) MCValue {
+    return MCValue{
+        .kind = MCValueKind.stack,
+        .reg = 0,
+        .imm = 0,
+        .stack_offset = offset,
+    }
+}
+
+fn mcvIsRegister(mcv: MCValue) bool {
+    return mcv.kind == MCValueKind.register
+}
+
+// =============================================================================
+// Register Constants
+// =============================================================================
+
+const REG_X0: int = 0
+const REG_X1: int = 1
+const REG_X2: int = 2
+const REG_X3: int = 3
+const REG_X4: int = 4
+const REG_X5: int = 5
+const REG_X6: int = 6
+const REG_X7: int = 7
+const REG_X8: int = 8
+const REG_X9: int = 9
+const REG_X10: int = 10
+const REG_X11: int = 11
+const REG_X12: int = 12
+const REG_X13: int = 13
+const REG_X14: int = 14
+const REG_X15: int = 15
+const REG_X16: int = 16   // IP0 scratch
+const REG_X17: int = 17   // IP1 scratch
+const REG_FP: int = 29
+const REG_LR: int = 30
+const REG_SP: int = 31
+const REG_XZR: int = 31
+
+// Scratch registers (not allocated, used for temporaries)
+const SCRATCH0: int = 16  // x16/IP0
+const SCRATCH1: int = 17  // x17/IP1
+
+// =============================================================================
+// Register Manager
+// =============================================================================
+
+struct RegisterManager {
+    // Track which registers hold which values (-1 = free)
+    reg_values: List<int>,
+    // Track which registers are locked (can't be allocated)
+    locked: List<bool>,
+}
+
+// Sentinel values for register tracking
+const REG_FREE: int = 0 - 1  // -1 means register is free
+const REG_NONE: int = 0 - 2  // -2 means no register available
+
+fn regManagerInit() RegisterManager {
+    var rm: RegisterManager = RegisterManager{
+        .reg_values = new List<int>(),
+        .locked = new List<bool>(),
+    }
+    // Initialize 18 allocatable registers (x0-x15, x19-x28 = 24, but we use 18)
+    var i: int = 0
+    while i < 18 {
+        rm.reg_values.push(REG_FREE)
+        rm.locked.push(false)
+        i = i + 1
+    }
+    return rm
+}
+
+fn regManagerIsFree(rm: RegisterManager, reg: int) bool {
+    if reg >= 18 {
+        return false
+    }
+    var val: int = rm.reg_values.get(reg)
+    return val == REG_FREE
+}
+
+fn regManagerMarkUsed(rm: RegisterManager, reg: int, value_id: int) void {
+    if reg < 18 {
+        rm.reg_values[reg] = value_id
+    }
+}
+
+fn regManagerMarkFree(rm: RegisterManager, reg: int) void {
+    if reg < 18 {
+        rm.reg_values[reg] = REG_FREE
+    }
+}
+
+fn regManagerLock(rm: RegisterManager, reg: int) void {
+    if reg < 18 {
+        rm.locked[reg] = true
+    }
+}
+
+fn regManagerUnlock(rm: RegisterManager, reg: int) void {
+    if reg < 18 {
+        rm.locked[reg] = false
+    }
+}
+
+fn regManagerTryAlloc(rm: RegisterManager, value_id: int) int {
+    // Try to find a free, unlocked register
+    // Prefer caller-saved (x9-x15) first
+    var i: int = 9
+    while i < 16 {
+        if regManagerIsFree(rm, i) and not rm.locked.get(i) {
+            regManagerMarkUsed(rm, i, value_id)
+            return i
+        }
+        i = i + 1
+    }
+    // Try x0-x7
+    i = 0
+    while i < 8 {
+        if regManagerIsFree(rm, i) and not rm.locked.get(i) {
+            regManagerMarkUsed(rm, i, value_id)
+            return i
+        }
+        i = i + 1
+    }
+    // No free register found
+    return REG_NONE
+}
+
+// =============================================================================
+// CodeGen State
+// =============================================================================
+
+// Note: Full CodeGen struct would include CodeBuffer from backend_boot.cot
+// For bootstrap testing, we use a simplified version
+
+struct CodeGen {
+    reg_manager: RegisterManager,
+    // Value ID to MCValue lookup - use List where index = value_id
+    // Pre-allocate enough slots for typical function (256 values)
+    value_locations: List<MCValue>,
+    stack_size: int,
+    next_spill_offset: int,
+}
+
+fn codeGenInit(stack_size: int) CodeGen {
+    var cg: CodeGen = CodeGen{
+        .reg_manager = regManagerInit(),
+        .value_locations = new List<MCValue>(),
+        .stack_size = stack_size,
+        .next_spill_offset = 96,  // After fp/lr and callee-saved area
+    }
+    // Pre-allocate MCValue slots - initialize with mcvNone()
+    var i: int = 0
+    while i < 256 {
+        cg.value_locations.push(mcvNone())
+        i = i + 1
+    }
+    return cg
+}
+
+// =============================================================================
+// Value Access
+// =============================================================================
+
+fn getValue(cg: CodeGen, value_id: int) MCValue {
+    if value_id >= 0 and value_id < len(cg.value_locations) {
+        return cg.value_locations.get(value_id)
+    }
+    return mcvNone()
+}
+
+fn setResult(cg: CodeGen, value_id: int, mcv: MCValue) void {
+    if value_id >= 0 and value_id < len(cg.value_locations) {
+        cg.value_locations[value_id] = mcv
+    }
+}
+
+fn allocReg(cg: CodeGen, value_id: int) int {
+    var reg: int = regManagerTryAlloc(cg.reg_manager, value_id)
+    if reg != REG_NONE {
+        return reg
+    }
+    // Need to spill - find first unlocked register
+    var i: int = 9
+    while i < 16 {
+        if not cg.reg_manager.locked.get(i) {
+            // Spill would happen here with CodeBuffer
+            regManagerMarkUsed(cg.reg_manager, i, value_id)
+            return i
+        }
+        i = i + 1
+    }
+    return REG_X9  // Fallback
+}
+
+// =============================================================================
+// Code Buffer (inline - would be imported from backend_boot.cot)
+// =============================================================================
+
+struct CodeBuffer {
+    bytes: List<int>,
+    relocations: List<int>,
+}
+
+fn codeBufferInit() CodeBuffer {
+    return CodeBuffer{
+        .bytes = new List<int>(),
+        .relocations = new List<int>(),
+    }
+}
+
+fn codeBufferPos(buf: CodeBuffer) int {
+    return len(buf.bytes)
+}
+
+fn codeBufferEmit8(buf: CodeBuffer, b: int) void {
+    buf.bytes.push(b)
+}
+
+fn emit32(buf: CodeBuffer, inst: int) void {
+    var b0: int = inst % 256
+    var b1: int = (inst / 256) % 256
+    var b2: int = (inst / 65536) % 256
+    var b3: int = (inst / 16777216) % 256
+    codeBufferEmit8(buf, b0)
+    codeBufferEmit8(buf, b1)
+    codeBufferEmit8(buf, b2)
+    codeBufferEmit8(buf, b3)
+}
+
+// =============================================================================
+// Instruction Encoding (subset from aarch64_boot.cot)
+// =============================================================================
+
+fn encodeDataProcShifted(sf: int, op: int, s: int, rm: int, rn: int, rd: int) int {
+    var inst: int = 0
+    inst = inst + (sf * 2147483648)
+    inst = inst + (op * 1073741824)
+    inst = inst + (s * 536870912)
+    inst = inst + (11 * 16777216)
+    inst = inst + (rm * 65536)
+    inst = inst + (rn * 32)
+    inst = inst + rd
+    return inst
+}
+
+fn encodeDataProcImm(sf: int, op: int, s: int, imm12: int, rn: int, rd: int) int {
+    var inst: int = 0
+    inst = inst + (sf * 2147483648)
+    inst = inst + (op * 1073741824)
+    inst = inst + (s * 536870912)
+    inst = inst + (34 * 8388608)
+    inst = inst + (imm12 * 1024)
+    inst = inst + (rn * 32)
+    inst = inst + rd
+    return inst
+}
+
+fn encodeLogicalShifted(sf: int, opc: int, n: int, rm: int, rn: int, rd: int) int {
+    var inst: int = 0
+    inst = inst + (sf * 2147483648)
+    inst = inst + (opc * 536870912)
+    inst = inst + (10 * 16777216)
+    inst = inst + (n * 2097152)
+    inst = inst + (rm * 65536)
+    inst = inst + (rn * 32)
+    inst = inst + rd
+    return inst
+}
+
+fn encodeMoveWide(sf: int, opc: int, hw: int, imm16: int, rd: int) int {
+    var inst: int = 0
+    inst = inst + (sf * 2147483648)
+    inst = inst + (opc * 536870912)
+    inst = inst + (37 * 8388608)
+    inst = inst + (hw * 2097152)
+    inst = inst + (imm16 * 32)
+    inst = inst + rd
+    return inst
+}
+
+fn encodeLoadStoreUnsigned(size: int, opc: int, imm12: int, rn: int, rt: int) int {
+    var inst: int = 0
+    inst = inst + (size * 1073741824)
+    inst = inst + (7 * 134217728)
+    inst = inst + (1 * 16777216)
+    inst = inst + (opc * 4194304)
+    inst = inst + (imm12 * 1024)
+    inst = inst + (rn * 32)
+    inst = inst + rt
+    return inst
+}
+
+fn encodeBranchReg(opc: int, rn: int) int {
+    var inst: int = 0
+    inst = inst + (107 * 33554432)
+    inst = inst + (opc * 2097152)
+    inst = inst + (31 * 65536)
+    inst = inst + (rn * 32)
+    return inst
+}
+
+// =============================================================================
+// Basic Instructions
+// =============================================================================
+
+fn addRegReg(buf: CodeBuffer, rd: int, rn: int, rm: int) void {
+    emit32(buf, encodeDataProcShifted(1, 0, 0, rm, rn, rd))
+}
+
+fn addRegImm12(buf: CodeBuffer, rd: int, rn: int, imm12: int) void {
+    emit32(buf, encodeDataProcImm(1, 0, 0, imm12, rn, rd))
+}
+
+fn subRegReg(buf: CodeBuffer, rd: int, rn: int, rm: int) void {
+    emit32(buf, encodeDataProcShifted(1, 1, 0, rm, rn, rd))
+}
+
+fn subRegImm12(buf: CodeBuffer, rd: int, rn: int, imm12: int) void {
+    emit32(buf, encodeDataProcImm(1, 1, 0, imm12, rn, rd))
+}
+
+fn orrRegReg(buf: CodeBuffer, rd: int, rn: int, rm: int) void {
+    emit32(buf, encodeLogicalShifted(1, 1, 0, rm, rn, rd))
+}
+
+fn movRegReg(buf: CodeBuffer, rd: int, rm: int) void {
+    orrRegReg(buf, rd, REG_XZR, rm)
+}
+
+fn movzImm16(buf: CodeBuffer, rd: int, imm16: int, hw: int) void {
+    emit32(buf, encodeMoveWide(1, 2, hw, imm16, rd))
+}
+
+fn movkImm16(buf: CodeBuffer, rd: int, imm16: int, hw: int) void {
+    emit32(buf, encodeMoveWide(1, 3, hw, imm16, rd))
+}
+
+fn movRegImm64(buf: CodeBuffer, rd: int, imm: int) void {
+    if imm == 0 {
+        movRegReg(buf, rd, REG_XZR)
+        return
+    }
+    var chunk0: int = imm % 65536
+    var chunk1: int = (imm / 65536) % 65536
+    var chunk2: int = (imm / 4294967296) % 65536
+    var chunk3: int = (imm / 281474976710656) % 65536
+
+    if chunk0 != 0 {
+        movzImm16(buf, rd, chunk0, 0)
+        if chunk1 != 0 { movkImm16(buf, rd, chunk1, 1) }
+        if chunk2 != 0 { movkImm16(buf, rd, chunk2, 2) }
+        if chunk3 != 0 { movkImm16(buf, rd, chunk3, 3) }
+    } else if chunk1 != 0 {
+        movzImm16(buf, rd, chunk1, 1)
+        if chunk2 != 0 { movkImm16(buf, rd, chunk2, 2) }
+        if chunk3 != 0 { movkImm16(buf, rd, chunk3, 3) }
+    } else if chunk2 != 0 {
+        movzImm16(buf, rd, chunk2, 2)
+        if chunk3 != 0 { movkImm16(buf, rd, chunk3, 3) }
+    } else {
+        movzImm16(buf, rd, chunk3, 3)
+    }
+}
+
+fn ldrRegImm(buf: CodeBuffer, rt: int, rn: int, offset: int) void {
+    var scaled: int = offset / 8
+    emit32(buf, encodeLoadStoreUnsigned(3, 1, scaled, rn, rt))
+}
+
+fn strRegImm(buf: CodeBuffer, rt: int, rn: int, offset: int) void {
+    var scaled: int = offset / 8
+    emit32(buf, encodeLoadStoreUnsigned(3, 0, scaled, rn, rt))
+}
+
+fn retInst(buf: CodeBuffer) void {
+    emit32(buf, encodeBranchReg(2, REG_LR))
+}
+
+// =============================================================================
+// CodeGen with CodeBuffer
+// =============================================================================
+
+struct FullCodeGen {
+    reg_manager: RegisterManager,
+    value_locations: List<MCValue>,
+    buf: CodeBuffer,
+    stack_size: int,
+    next_spill_offset: int,
+}
+
+fn fullCodeGenInit(stack_size: int) FullCodeGen {
+    var cg: FullCodeGen = FullCodeGen{
+        .reg_manager = regManagerInit(),
+        .value_locations = new List<MCValue>(),
+        .buf = codeBufferInit(),
+        .stack_size = stack_size,
+        .next_spill_offset = 96,
+    }
+    var i: int = 0
+    while i < 256 {
+        cg.value_locations.push(mcvNone())
+        i = i + 1
+    }
+    return cg
+}
+
+fn cgGetValue(cg: FullCodeGen, value_id: int) MCValue {
+    if value_id >= 0 and value_id < len(cg.value_locations) {
+        return cg.value_locations.get(value_id)
+    }
+    return mcvNone()
+}
+
+fn cgSetResult(cg: FullCodeGen, value_id: int, mcv: MCValue) void {
+    if value_id >= 0 and value_id < len(cg.value_locations) {
+        cg.value_locations[value_id] = mcv
+    }
+}
+
+// Load an MCValue into a register
+fn cgLoadToReg(cg: FullCodeGen, dest: int, mcv: MCValue) void {
+    if mcv.kind == MCValueKind.register {
+        if mcv.reg != dest {
+            movRegReg(cg.buf, dest, mcv.reg)
+        }
+    } else if mcv.kind == MCValueKind.immediate {
+        movRegImm64(cg.buf, dest, mcv.imm)
+    } else if mcv.kind == MCValueKind.stack {
+        // Load from [SP + offset]
+        addRegImm12(cg.buf, SCRATCH0, REG_SP, mcv.stack_offset)
+        ldrRegImm(cg.buf, dest, SCRATCH0, 0)
+    }
+}
+
+// Spill a register to stack
+fn cgSpillReg(cg: FullCodeGen, reg: int) void {
+    // Get value_id in this register
+    var value_id: int = cg.reg_manager.reg_values.get(reg)
+    if value_id == REG_FREE {
+        return
+    }
+
+    // Store to stack
+    var offset: int = cg.next_spill_offset
+    cg.next_spill_offset = cg.next_spill_offset + 8
+
+    addRegImm12(cg.buf, SCRATCH0, REG_SP, offset)
+    strRegImm(cg.buf, reg, SCRATCH0, 0)
+
+    // Update tracking
+    cgSetResult(cg, value_id, mcvStack(offset))
+    regManagerMarkFree(cg.reg_manager, reg)
+}
+
+// Ensure a register is free
+fn cgEnsureRegFree(cg: FullCodeGen, reg: int) void {
+    if not regManagerIsFree(cg.reg_manager, reg) {
+        cgSpillReg(cg, reg)
+    }
+}
+
+// Spill caller-saved registers before a call
+fn cgSpillCallerSaved(cg: FullCodeGen) void {
+    var i: int = 0
+    while i < 16 {
+        if not regManagerIsFree(cg.reg_manager, i) {
+            cgSpillReg(cg, i)
+        }
+        i = i + 1
+    }
+}
+
+// Generate ADD: result = left + right
+fn cgGenAdd(cg: FullCodeGen, value_id: int, left_id: int, right_id: int) void {
+    cgEnsureRegFree(cg, REG_X0)
+
+    var left_mcv: MCValue = cgGetValue(cg, left_id)
+    var right_mcv: MCValue = cgGetValue(cg, right_id)
+
+    cgLoadToReg(cg, REG_X0, left_mcv)
+    cgLoadToReg(cg, SCRATCH1, right_mcv)
+    addRegReg(cg.buf, REG_X0, REG_X0, SCRATCH1)
+
+    regManagerMarkUsed(cg.reg_manager, REG_X0, value_id)
+    cgSetResult(cg, value_id, mcvRegister(REG_X0))
+}
+
+// Generate SUB: result = left - right
+fn cgGenSub(cg: FullCodeGen, value_id: int, left_id: int, right_id: int) void {
+    cgEnsureRegFree(cg, REG_X0)
+
+    var left_mcv: MCValue = cgGetValue(cg, left_id)
+    var right_mcv: MCValue = cgGetValue(cg, right_id)
+
+    cgLoadToReg(cg, REG_X0, left_mcv)
+    cgLoadToReg(cg, SCRATCH1, right_mcv)
+    subRegReg(cg.buf, REG_X0, REG_X0, SCRATCH1)
+
+    regManagerMarkUsed(cg.reg_manager, REG_X0, value_id)
+    cgSetResult(cg, value_id, mcvRegister(REG_X0))
+}
+
+// Generate constant integer
+fn cgGenConstInt(cg: FullCodeGen, value_id: int, val: int) void {
+    // Small constants stored as immediate
+    if val >= 0 and val < 4096 {
+        cgSetResult(cg, value_id, mcvImmediate(val))
+    } else {
+        // Larger constants need a register
+        var reg: int = regManagerTryAlloc(cg.reg_manager, value_id)
+        if reg == REG_NONE {
+            reg = REG_X9
+            cgSpillReg(cg, reg)
+            regManagerMarkUsed(cg.reg_manager, reg, value_id)
+        }
+        movRegImm64(cg.buf, reg, val)
+        cgSetResult(cg, value_id, mcvRegister(reg))
+    }
+}
+
+// Generate return
+fn cgGenReturn(cg: FullCodeGen, ret_value_id: int) void {
+    var ret_mcv: MCValue = cgGetValue(cg, ret_value_id)
+    cgLoadToReg(cg, REG_X0, ret_mcv)
+    retInst(cg.buf)
+}
+
+// =============================================================================
+// Additional Instruction Encoding
+// =============================================================================
+
+fn encodeMulDiv(sf: int, op: int, rm: int, rn: int, rd: int) int {
+    // Data processing (3 source) - covers madd, msub, smulh, umull, sdiv, udiv
+    var inst: int = 0
+    inst = inst + (sf * 2147483648)
+    inst = inst + (op * 536870912)
+    inst = inst + (27 * 16777216)   // Bits 24-27 = 0b11011
+    inst = inst + (rm * 65536)
+    inst = inst + (rn * 32)
+    inst = inst + rd
+    return inst
+}
+
+fn encodeDivide(sf: int, o1: int, rm: int, rn: int, rd: int) int {
+    // SDIV/UDIV encoding
+    var inst: int = 0
+    inst = inst + (sf * 2147483648)
+    inst = inst + (13 * 67108864)   // Bits 21-28
+    inst = inst + (54 * 1024)       // Bits 10-15
+    inst = inst + (o1 * 1024)
+    inst = inst + (rm * 65536)
+    inst = inst + (rn * 32)
+    inst = inst + rd
+    return inst
+}
+
+fn encodeCondBranch(cond: int, imm19: int) int {
+    // B.cond encoding
+    var inst: int = 0
+    inst = inst + (84 * 16777216)  // Bits 24-31 = 0b01010100
+    inst = inst + (imm19 * 32)
+    inst = inst + cond
+    return inst
+}
+
+fn encodeUnconditionalBranch(imm26: int) int {
+    // B encoding
+    var inst: int = 0
+    inst = inst + (5 * 67108864)   // Bits 26-31 = 0b000101
+    inst = inst + imm26
+    return inst
+}
+
+fn encodeCallBranch(imm26: int) int {
+    // BL encoding
+    var inst: int = 0
+    inst = inst + (37 * 67108864)  // Bits 26-31 = 0b100101
+    inst = inst + imm26
+    return inst
+}
+
+fn encodeCondSelect(sf: int, op: int, rm: int, cond: int, rn: int, rd: int) int {
+    // CSEL, CSINC, CSET etc.
+    var inst: int = 0
+    inst = inst + (sf * 2147483648)
+    inst = inst + (op * 1073741824)
+    inst = inst + (26 * 16777216)
+    inst = inst + (rm * 65536)
+    inst = inst + (cond * 4096)
+    inst = inst + (rn * 32)
+    inst = inst + rd
+    return inst
+}
+
+// Compare (SUBS with rd=xzr)
+fn encodeCompare(sf: int, rm: int, rn: int) int {
+    return encodeDataProcShifted(sf, 1, 1, rm, rn, REG_XZR)
+}
+
+// Compare immediate
+fn encodeCompareImm(sf: int, imm12: int, rn: int) int {
+    return encodeDataProcImm(sf, 1, 1, imm12, rn, REG_XZR)
+}
+
+// =============================================================================
+// Additional Instructions
+// =============================================================================
+
+// Multiply: rd = rn * rm
+fn mulRegReg(buf: CodeBuffer, rd: int, rn: int, rm: int) void {
+    // MADD rd, rn, rm, xzr (which is mul)
+    var inst: int = 0
+    inst = inst + (1 * 2147483648)    // sf=1 for 64-bit
+    inst = inst + (27 * 16777216)     // 0b11011 in bits 24-28
+    inst = inst + (rm * 65536)
+    inst = inst + (REG_XZR * 1024)    // ra = xzr
+    inst = inst + (rn * 32)
+    inst = inst + rd
+    emit32(buf, inst)
+}
+
+// Signed divide: rd = rn / rm
+fn sdivRegReg(buf: CodeBuffer, rd: int, rn: int, rm: int) void {
+    var inst: int = 0
+    inst = inst + (1 * 2147483648)    // sf=1 for 64-bit
+    inst = inst + (13 * 67108864)     // Bits 21-28 = 0b00011010110
+    inst = inst + (rm * 65536)
+    inst = inst + (3 * 1024)          // Bits 10-15 for sdiv
+    inst = inst + (rn * 32)
+    inst = inst + rd
+    emit32(buf, inst)
+}
+
+// Compare registers
+fn cmpRegReg(buf: CodeBuffer, rn: int, rm: int) void {
+    emit32(buf, encodeCompare(1, rm, rn))
+}
+
+// Compare with immediate
+fn cmpRegImm(buf: CodeBuffer, rn: int, imm12: int) void {
+    emit32(buf, encodeCompareImm(1, imm12, rn))
+}
+
+// Conditional set (cset rd, cond)
+fn csetCond(buf: CodeBuffer, rd: int, cond: int) void {
+    // CSET is CSINC rd, xzr, xzr, invert(cond)
+    var inv_cond: int = cond
+    if cond % 2 == 0 {
+        inv_cond = cond + 1
+    } else {
+        inv_cond = cond - 1
+    }
+    emit32(buf, encodeCondSelect(1, 0, REG_XZR, inv_cond, REG_XZR, rd) + 1024)
+}
+
+// Conditional branch
+fn bCond(buf: CodeBuffer, cond: int, offset: int) void {
+    var imm19: int = offset / 4
+    emit32(buf, encodeCondBranch(cond, imm19))
+}
+
+// Unconditional branch
+fn branch(buf: CodeBuffer, offset: int) void {
+    var imm26: int = offset / 4
+    emit32(buf, encodeUnconditionalBranch(imm26))
+}
+
+// Branch with link (call)
+fn blCall(buf: CodeBuffer, offset: int) void {
+    var imm26: int = offset / 4
+    emit32(buf, encodeCallBranch(imm26))
+}
+
+// Branch to register
+fn brReg(buf: CodeBuffer, rn: int) void {
+    emit32(buf, encodeBranchReg(0, rn))
+}
+
+// Branch link to register
+fn blrReg(buf: CodeBuffer, rn: int) void {
+    emit32(buf, encodeBranchReg(1, rn))
+}
+
+// AND registers
+fn andRegReg(buf: CodeBuffer, rd: int, rn: int, rm: int) void {
+    emit32(buf, encodeLogicalShifted(1, 0, 0, rm, rn, rd))
+}
+
+// EOR (XOR) registers
+fn eorRegReg(buf: CodeBuffer, rd: int, rn: int, rm: int) void {
+    emit32(buf, encodeLogicalShifted(1, 2, 0, rm, rn, rd))
+}
+
+// =============================================================================
+// Condition Code Constants
+// =============================================================================
+
+const COND_EQ: int = 0   // Equal
+const COND_NE: int = 1   // Not equal
+const COND_CS: int = 2   // Carry set / unsigned higher or same
+const COND_CC: int = 3   // Carry clear / unsigned lower
+const COND_MI: int = 4   // Minus / negative
+const COND_PL: int = 5   // Plus / positive or zero
+const COND_VS: int = 6   // Overflow
+const COND_VC: int = 7   // No overflow
+const COND_HI: int = 8   // Unsigned higher
+const COND_LS: int = 9   // Unsigned lower or same
+const COND_GE: int = 10  // Signed greater or equal
+const COND_LT: int = 11  // Signed less than
+const COND_GT: int = 12  // Signed greater than
+const COND_LE: int = 13  // Signed less or equal
+const COND_AL: int = 14  // Always
+
+// =============================================================================
+// More CodeGen Operations
+// =============================================================================
+
+// Generate MUL: result = left * right
+fn cgGenMul(cg: FullCodeGen, value_id: int, left_id: int, right_id: int) void {
+    cgEnsureRegFree(cg, REG_X0)
+
+    var left_mcv: MCValue = cgGetValue(cg, left_id)
+    var right_mcv: MCValue = cgGetValue(cg, right_id)
+
+    cgLoadToReg(cg, REG_X0, left_mcv)
+    cgLoadToReg(cg, SCRATCH1, right_mcv)
+    mulRegReg(cg.buf, REG_X0, REG_X0, SCRATCH1)
+
+    regManagerMarkUsed(cg.reg_manager, REG_X0, value_id)
+    cgSetResult(cg, value_id, mcvRegister(REG_X0))
+}
+
+// Generate DIV: result = left / right
+fn cgGenDiv(cg: FullCodeGen, value_id: int, left_id: int, right_id: int) void {
+    cgEnsureRegFree(cg, REG_X0)
+
+    var left_mcv: MCValue = cgGetValue(cg, left_id)
+    var right_mcv: MCValue = cgGetValue(cg, right_id)
+
+    cgLoadToReg(cg, REG_X0, left_mcv)
+    cgLoadToReg(cg, SCRATCH1, right_mcv)
+    sdivRegReg(cg.buf, REG_X0, REG_X0, SCRATCH1)
+
+    regManagerMarkUsed(cg.reg_manager, REG_X0, value_id)
+    cgSetResult(cg, value_id, mcvRegister(REG_X0))
+}
+
+// Generate MOD: result = left % right (using a / b * b subtraction)
+fn cgGenMod(cg: FullCodeGen, value_id: int, left_id: int, right_id: int) void {
+    cgEnsureRegFree(cg, REG_X0)
+
+    var left_mcv: MCValue = cgGetValue(cg, left_id)
+    var right_mcv: MCValue = cgGetValue(cg, right_id)
+
+    // x0 = left, x17 = right
+    cgLoadToReg(cg, REG_X0, left_mcv)
+    cgLoadToReg(cg, SCRATCH1, right_mcv)
+
+    // x16 = x0 / x17
+    sdivRegReg(cg.buf, SCRATCH0, REG_X0, SCRATCH1)
+    // x16 = x16 * x17
+    mulRegReg(cg.buf, SCRATCH0, SCRATCH0, SCRATCH1)
+    // x0 = x0 - x16
+    subRegReg(cg.buf, REG_X0, REG_X0, SCRATCH0)
+
+    regManagerMarkUsed(cg.reg_manager, REG_X0, value_id)
+    cgSetResult(cg, value_id, mcvRegister(REG_X0))
+}
+
+// Generate AND: result = left & right
+fn cgGenAnd(cg: FullCodeGen, value_id: int, left_id: int, right_id: int) void {
+    cgEnsureRegFree(cg, REG_X0)
+
+    var left_mcv: MCValue = cgGetValue(cg, left_id)
+    var right_mcv: MCValue = cgGetValue(cg, right_id)
+
+    cgLoadToReg(cg, REG_X0, left_mcv)
+    cgLoadToReg(cg, SCRATCH1, right_mcv)
+    andRegReg(cg.buf, REG_X0, REG_X0, SCRATCH1)
+
+    regManagerMarkUsed(cg.reg_manager, REG_X0, value_id)
+    cgSetResult(cg, value_id, mcvRegister(REG_X0))
+}
+
+// Generate XOR: result = left ^ right
+fn cgGenXor(cg: FullCodeGen, value_id: int, left_id: int, right_id: int) void {
+    cgEnsureRegFree(cg, REG_X0)
+
+    var left_mcv: MCValue = cgGetValue(cg, left_id)
+    var right_mcv: MCValue = cgGetValue(cg, right_id)
+
+    cgLoadToReg(cg, REG_X0, left_mcv)
+    cgLoadToReg(cg, SCRATCH1, right_mcv)
+    eorRegReg(cg.buf, REG_X0, REG_X0, SCRATCH1)
+
+    regManagerMarkUsed(cg.reg_manager, REG_X0, value_id)
+    cgSetResult(cg, value_id, mcvRegister(REG_X0))
+}
+
+// Generate OR: result = left | right
+fn cgGenOr(cg: FullCodeGen, value_id: int, left_id: int, right_id: int) void {
+    cgEnsureRegFree(cg, REG_X0)
+
+    var left_mcv: MCValue = cgGetValue(cg, left_id)
+    var right_mcv: MCValue = cgGetValue(cg, right_id)
+
+    cgLoadToReg(cg, REG_X0, left_mcv)
+    cgLoadToReg(cg, SCRATCH1, right_mcv)
+    orrRegReg(cg.buf, REG_X0, REG_X0, SCRATCH1)
+
+    regManagerMarkUsed(cg.reg_manager, REG_X0, value_id)
+    cgSetResult(cg, value_id, mcvRegister(REG_X0))
+}
+
+// Generate compare and set flag
+fn cgGenCmp(cg: FullCodeGen, left_id: int, right_id: int) void {
+    var left_mcv: MCValue = cgGetValue(cg, left_id)
+    var right_mcv: MCValue = cgGetValue(cg, right_id)
+
+    cgLoadToReg(cg, SCRATCH0, left_mcv)
+    cgLoadToReg(cg, SCRATCH1, right_mcv)
+    cmpRegReg(cg.buf, SCRATCH0, SCRATCH1)
+}
+
+// Generate compare equal: result = (left == right)
+fn cgGenCmpEq(cg: FullCodeGen, value_id: int, left_id: int, right_id: int) void {
+    cgEnsureRegFree(cg, REG_X0)
+    cgGenCmp(cg, left_id, right_id)
+    csetCond(cg.buf, REG_X0, COND_EQ)
+    regManagerMarkUsed(cg.reg_manager, REG_X0, value_id)
+    cgSetResult(cg, value_id, mcvRegister(REG_X0))
+}
+
+// Generate compare not equal: result = (left != right)
+fn cgGenCmpNe(cg: FullCodeGen, value_id: int, left_id: int, right_id: int) void {
+    cgEnsureRegFree(cg, REG_X0)
+    cgGenCmp(cg, left_id, right_id)
+    csetCond(cg.buf, REG_X0, COND_NE)
+    regManagerMarkUsed(cg.reg_manager, REG_X0, value_id)
+    cgSetResult(cg, value_id, mcvRegister(REG_X0))
+}
+
+// Generate compare less than: result = (left < right)
+fn cgGenCmpLt(cg: FullCodeGen, value_id: int, left_id: int, right_id: int) void {
+    cgEnsureRegFree(cg, REG_X0)
+    cgGenCmp(cg, left_id, right_id)
+    csetCond(cg.buf, REG_X0, COND_LT)
+    regManagerMarkUsed(cg.reg_manager, REG_X0, value_id)
+    cgSetResult(cg, value_id, mcvRegister(REG_X0))
+}
+
+// Generate compare less or equal: result = (left <= right)
+fn cgGenCmpLe(cg: FullCodeGen, value_id: int, left_id: int, right_id: int) void {
+    cgEnsureRegFree(cg, REG_X0)
+    cgGenCmp(cg, left_id, right_id)
+    csetCond(cg.buf, REG_X0, COND_LE)
+    regManagerMarkUsed(cg.reg_manager, REG_X0, value_id)
+    cgSetResult(cg, value_id, mcvRegister(REG_X0))
+}
+
+// Generate compare greater than: result = (left > right)
+fn cgGenCmpGt(cg: FullCodeGen, value_id: int, left_id: int, right_id: int) void {
+    cgEnsureRegFree(cg, REG_X0)
+    cgGenCmp(cg, left_id, right_id)
+    csetCond(cg.buf, REG_X0, COND_GT)
+    regManagerMarkUsed(cg.reg_manager, REG_X0, value_id)
+    cgSetResult(cg, value_id, mcvRegister(REG_X0))
+}
+
+// Generate compare greater or equal: result = (left >= right)
+fn cgGenCmpGe(cg: FullCodeGen, value_id: int, left_id: int, right_id: int) void {
+    cgEnsureRegFree(cg, REG_X0)
+    cgGenCmp(cg, left_id, right_id)
+    csetCond(cg.buf, REG_X0, COND_GE)
+    regManagerMarkUsed(cg.reg_manager, REG_X0, value_id)
+    cgSetResult(cg, value_id, mcvRegister(REG_X0))
+}
+
+// =============================================================================
+// Memory Operations
+// =============================================================================
+
+// Store pre-index encoding (for stp with writeback)
+fn encodeStorePairPre(opc: int, imm7: int, rt2: int, rn: int, rt: int) int {
+    var inst: int = 0
+    inst = inst + (opc * 1073741824)   // bits 30-31
+    inst = inst + (41 * 8388608)        // bits 23-29 = 0b0101001
+    inst = inst + (6 * 4194304)         // pre-index mode
+    inst = inst + (imm7 * 32768)
+    inst = inst + (rt2 * 1024)
+    inst = inst + (rn * 32)
+    inst = inst + rt
+    return inst
+}
+
+// Load pair post-index encoding (for ldp with writeback)
+fn encodeLoadPairPost(opc: int, imm7: int, rt2: int, rn: int, rt: int) int {
+    var inst: int = 0
+    inst = inst + (opc * 1073741824)
+    inst = inst + (40 * 8388608)        // bits 23-29 = 0b0101000
+    inst = inst + (3 * 4194304)         // post-index mode
+    inst = inst + (imm7 * 32768)
+    inst = inst + (rt2 * 1024)
+    inst = inst + (rn * 32)
+    inst = inst + rt
+    return inst
+}
+
+// STP x29, x30, [sp, #imm]! (pre-index)
+fn stpPreFpLr(buf: CodeBuffer, imm: int) void {
+    var imm7: int = imm / 8
+    if imm7 < 0 {
+        imm7 = imm7 + 128  // Sign-extend for negative
+    }
+    emit32(buf, encodeStorePairPre(2, imm7, REG_LR, REG_SP, REG_FP))
+}
+
+// LDP x29, x30, [sp], #imm (post-index)
+fn ldpPostFpLr(buf: CodeBuffer, imm: int) void {
+    var imm7: int = imm / 8
+    emit32(buf, encodeLoadPairPost(2, imm7, REG_LR, REG_SP, REG_FP))
+}
+
+// Store byte
+fn strbRegImm(buf: CodeBuffer, rt: int, rn: int, offset: int) void {
+    emit32(buf, encodeLoadStoreUnsigned(0, 0, offset, rn, rt))
+}
+
+// Load byte (unsigned)
+fn ldrbRegImm(buf: CodeBuffer, rt: int, rn: int, offset: int) void {
+    emit32(buf, encodeLoadStoreUnsigned(0, 1, offset, rn, rt))
+}
+
+// Store halfword
+fn strhRegImm(buf: CodeBuffer, rt: int, rn: int, offset: int) void {
+    var scaled: int = offset / 2
+    emit32(buf, encodeLoadStoreUnsigned(1, 0, scaled, rn, rt))
+}
+
+// Load halfword (unsigned)
+fn ldrhRegImm(buf: CodeBuffer, rt: int, rn: int, offset: int) void {
+    var scaled: int = offset / 2
+    emit32(buf, encodeLoadStoreUnsigned(1, 1, scaled, rn, rt))
+}
+
+// Store word (32-bit)
+fn strwRegImm(buf: CodeBuffer, rt: int, rn: int, offset: int) void {
+    var scaled: int = offset / 4
+    emit32(buf, encodeLoadStoreUnsigned(2, 0, scaled, rn, rt))
+}
+
+// Load word (32-bit unsigned)
+fn ldrwRegImm(buf: CodeBuffer, rt: int, rn: int, offset: int) void {
+    var scaled: int = offset / 4
+    emit32(buf, encodeLoadStoreUnsigned(2, 1, scaled, rn, rt))
+}
+
+// =============================================================================
+// Function Prologue/Epilogue
+// =============================================================================
+
+fn cgGenPrologue(cg: FullCodeGen, frame_size: int) void {
+    // STP x29, x30, [sp, -frame_size]!
+    stpPreFpLr(cg.buf, 0 - frame_size)
+    // MOV x29, sp
+    movRegReg(cg.buf, REG_FP, REG_SP)
+}
+
+fn cgGenEpilogue(cg: FullCodeGen, frame_size: int) void {
+    // LDP x29, x30, [sp], #frame_size
+    ldpPostFpLr(cg.buf, frame_size)
+    // RET
+    retInst(cg.buf)
+}
+
+// =============================================================================
+// Load/Store Operations
+// =============================================================================
+
+// Load from stack offset into register
+fn cgGenLoadStack(cg: FullCodeGen, value_id: int, offset: int, size: int) void {
+    cgEnsureRegFree(cg, REG_X0)
+
+    if size == 1 {
+        ldrbRegImm(cg.buf, REG_X0, REG_SP, offset)
+    } else if size == 2 {
+        ldrhRegImm(cg.buf, REG_X0, REG_SP, offset)
+    } else if size == 4 {
+        ldrwRegImm(cg.buf, REG_X0, REG_SP, offset)
+    } else {
+        ldrRegImm(cg.buf, REG_X0, REG_SP, offset)
+    }
+
+    regManagerMarkUsed(cg.reg_manager, REG_X0, value_id)
+    cgSetResult(cg, value_id, mcvRegister(REG_X0))
+}
+
+// Store value to stack offset
+fn cgGenStoreStack(cg: FullCodeGen, src_id: int, offset: int, size: int) void {
+    var src_mcv: MCValue = cgGetValue(cg, src_id)
+    cgLoadToReg(cg, SCRATCH0, src_mcv)
+
+    if size == 1 {
+        strbRegImm(cg.buf, SCRATCH0, REG_SP, offset)
+    } else if size == 2 {
+        strhRegImm(cg.buf, SCRATCH0, REG_SP, offset)
+    } else if size == 4 {
+        strwRegImm(cg.buf, SCRATCH0, REG_SP, offset)
+    } else {
+        strRegImm(cg.buf, SCRATCH0, REG_SP, offset)
+    }
+}
+
+// Load from pointer (base + offset)
+fn cgGenLoadPtr(cg: FullCodeGen, value_id: int, base_id: int, offset: int, size: int) void {
+    cgEnsureRegFree(cg, REG_X0)
+
+    var base_mcv: MCValue = cgGetValue(cg, base_id)
+    cgLoadToReg(cg, SCRATCH0, base_mcv)
+
+    if size == 1 {
+        ldrbRegImm(cg.buf, REG_X0, SCRATCH0, offset)
+    } else if size == 2 {
+        ldrhRegImm(cg.buf, REG_X0, SCRATCH0, offset / 2)
+    } else if size == 4 {
+        ldrwRegImm(cg.buf, REG_X0, SCRATCH0, offset / 4)
+    } else {
+        ldrRegImm(cg.buf, REG_X0, SCRATCH0, offset / 8)
+    }
+
+    regManagerMarkUsed(cg.reg_manager, REG_X0, value_id)
+    cgSetResult(cg, value_id, mcvRegister(REG_X0))
+}
+
+// Store to pointer (base + offset)
+fn cgGenStorePtr(cg: FullCodeGen, base_id: int, offset: int, src_id: int, size: int) void {
+    var base_mcv: MCValue = cgGetValue(cg, base_id)
+    var src_mcv: MCValue = cgGetValue(cg, src_id)
+
+    cgLoadToReg(cg, SCRATCH0, base_mcv)
+    cgLoadToReg(cg, SCRATCH1, src_mcv)
+
+    if size == 1 {
+        strbRegImm(cg.buf, SCRATCH1, SCRATCH0, offset)
+    } else if size == 2 {
+        strhRegImm(cg.buf, SCRATCH1, SCRATCH0, offset / 2)
+    } else if size == 4 {
+        strwRegImm(cg.buf, SCRATCH1, SCRATCH0, offset / 4)
+    } else {
+        strRegImm(cg.buf, SCRATCH1, SCRATCH0, offset / 8)
+    }
+}
+
+// =============================================================================
+// Function Calls
+// =============================================================================
+
+// Prepare argument in register (x0-x7)
+fn cgPrepareArg(cg: FullCodeGen, arg_idx: int, arg_id: int) void {
+    var arg_mcv: MCValue = cgGetValue(cg, arg_id)
+    var dest_reg: int = arg_idx  // x0, x1, x2, ... x7
+
+    if dest_reg < 8 {
+        cgEnsureRegFree(cg, dest_reg)
+        cgLoadToReg(cg, dest_reg, arg_mcv)
+    }
+}
+
+// Generate function call via register (for indirect/PLT calls)
+fn cgGenCallReg(cg: FullCodeGen, target_reg: int) void {
+    // Spill caller-saved registers first
+    cgSpillCallerSaved(cg)
+    // BLR target_reg
+    blrReg(cg.buf, target_reg)
+}
+
+// After call, mark x0 as containing the return value
+fn cgMarkReturnValue(cg: FullCodeGen, value_id: int) void {
+    regManagerMarkUsed(cg.reg_manager, REG_X0, value_id)
+    cgSetResult(cg, value_id, mcvRegister(REG_X0))
+}
+
+// =============================================================================
+// Allocate register for value
+// =============================================================================
+
+fn cgAllocReg(cg: FullCodeGen, value_id: int) int {
+    var reg: int = regManagerTryAlloc(cg.reg_manager, value_id)
+    if reg == REG_NONE {
+        // Need to spill - find first unlocked register
+        var i: int = 9
+        while i < 16 {
+            if not cg.reg_manager.locked.get(i) {
+                cgSpillReg(cg, i)
+                regManagerMarkUsed(cg.reg_manager, i, value_id)
+                return i
+            }
+            i = i + 1
+        }
+        // Fallback
+        cgSpillReg(cg, REG_X9)
+        regManagerMarkUsed(cg.reg_manager, REG_X9, value_id)
+        return REG_X9
+    }
+    return reg
+}
+
+// =============================================================================
+// Branch and Block Management
+// =============================================================================
+
+struct BlockInfo {
+    start_offset: int,
+    end_offset: int,
+}
+
+// Create a placeholder for a forward branch (will be patched later)
+fn cgEmitBranchPlaceholder(cg: FullCodeGen) int {
+    var offset: int = codeBufferPos(cg.buf)
+    emit32(cg.buf, 0)  // Placeholder
+    return offset
+}
+
+// Patch a branch at given offset to jump to current position
+fn cgPatchBranch(cg: FullCodeGen, branch_offset: int) void {
+    var current: int = codeBufferPos(cg.buf)
+    var delta: int = current - branch_offset
+    var imm26: int = delta / 4
+
+    // Calculate B instruction
+    var inst: int = (5 * 67108864) + imm26
+
+    // Patch the instruction in the buffer
+    var b0: int = inst % 256
+    var b1: int = (inst / 256) % 256
+    var b2: int = (inst / 65536) % 256
+    var b3: int = (inst / 16777216) % 256
+
+    cg.buf.bytes[branch_offset] = b0
+    cg.buf.bytes[branch_offset + 1] = b1
+    cg.buf.bytes[branch_offset + 2] = b2
+    cg.buf.bytes[branch_offset + 3] = b3
+}
+
+// Patch a conditional branch at given offset to jump to current position
+fn cgPatchCondBranch(cg: FullCodeGen, branch_offset: int, cond: int) void {
+    var current: int = codeBufferPos(cg.buf)
+    var delta: int = current - branch_offset
+    var imm19: int = delta / 4
+
+    // Calculate B.cond instruction
+    var inst: int = (84 * 16777216) + (imm19 * 32) + cond
+
+    // Patch the instruction
+    var b0: int = inst % 256
+    var b1: int = (inst / 256) % 256
+    var b2: int = (inst / 65536) % 256
+    var b3: int = (inst / 16777216) % 256
+
+    cg.buf.bytes[branch_offset] = b0
+    cg.buf.bytes[branch_offset + 1] = b1
+    cg.buf.bytes[branch_offset + 2] = b2
+    cg.buf.bytes[branch_offset + 3] = b3
+}
+
+// Generate conditional branch: if condition is false, branch to else
+fn cgGenCondBranch(cg: FullCodeGen, cond_id: int) int {
+    var cond_mcv: MCValue = cgGetValue(cg, cond_id)
+    cgLoadToReg(cg, SCRATCH0, cond_mcv)
+
+    // Compare condition with 0
+    cmpRegImm(cg.buf, SCRATCH0, 0)
+
+    // Emit CBZ placeholder (branch if zero = condition is false)
+    var branch_offset: int = codeBufferPos(cg.buf)
+    emit32(cg.buf, 0)  // Placeholder for B.EQ
+    return branch_offset
+}
+
+// Generate unconditional branch placeholder
+fn cgGenBranchPlaceholder(cg: FullCodeGen) int {
+    var offset: int = codeBufferPos(cg.buf)
+    emit32(cg.buf, 0)  // Placeholder
+    return offset
+}
+
+// =============================================================================
+// Negation and Boolean Operations
+// =============================================================================
+
+// Generate NOT: result = !operand (boolean not)
+fn cgGenNot(cg: FullCodeGen, value_id: int, operand_id: int) void {
+    cgEnsureRegFree(cg, REG_X0)
+
+    var op_mcv: MCValue = cgGetValue(cg, operand_id)
+    cgLoadToReg(cg, REG_X0, op_mcv)
+
+    // Compare with 0
+    cmpRegImm(cg.buf, REG_X0, 0)
+    // CSET x0, EQ (set to 1 if operand was 0)
+    csetCond(cg.buf, REG_X0, COND_EQ)
+
+    regManagerMarkUsed(cg.reg_manager, REG_X0, value_id)
+    cgSetResult(cg, value_id, mcvRegister(REG_X0))
+}
+
+// Generate NEG: result = -operand (arithmetic negation)
+fn cgGenNeg(cg: FullCodeGen, value_id: int, operand_id: int) void {
+    cgEnsureRegFree(cg, REG_X0)
+
+    var op_mcv: MCValue = cgGetValue(cg, operand_id)
+    cgLoadToReg(cg, SCRATCH0, op_mcv)
+
+    // NEG x0, x16 is SUB x0, xzr, x16
+    subRegReg(cg.buf, REG_X0, REG_XZR, SCRATCH0)
+
+    regManagerMarkUsed(cg.reg_manager, REG_X0, value_id)
+    cgSetResult(cg, value_id, mcvRegister(REG_X0))
+}
+
+// =============================================================================
+// Address Operations
+// =============================================================================
+
+// Get address of stack slot
+fn cgGenStackAddr(cg: FullCodeGen, value_id: int, offset: int) void {
+    cgEnsureRegFree(cg, REG_X0)
+    addRegImm12(cg.buf, REG_X0, REG_SP, offset)
+    regManagerMarkUsed(cg.reg_manager, REG_X0, value_id)
+    cgSetResult(cg, value_id, mcvRegister(REG_X0))
+}
+
+// Generate get element pointer for arrays
+fn cgGenGep(cg: FullCodeGen, value_id: int, base_id: int, index_id: int, elem_size: int) void {
+    cgEnsureRegFree(cg, REG_X0)
+
+    var base_mcv: MCValue = cgGetValue(cg, base_id)
+    var index_mcv: MCValue = cgGetValue(cg, index_id)
+
+    // base + index * elem_size
+    cgLoadToReg(cg, REG_X0, base_mcv)
+    cgLoadToReg(cg, SCRATCH1, index_mcv)
+
+    // Multiply index by element size
+    movRegImm64(cg.buf, SCRATCH0, elem_size)
+    mulRegReg(cg.buf, SCRATCH1, SCRATCH1, SCRATCH0)
+
+    // Add to base
+    addRegReg(cg.buf, REG_X0, REG_X0, SCRATCH1)
+
+    regManagerMarkUsed(cg.reg_manager, REG_X0, value_id)
+    cgSetResult(cg, value_id, mcvRegister(REG_X0))
+}
+
+// =============================================================================
+// Simple test
+// =============================================================================
+
+fn main() int {
+    // Test MCValue creation
+    var mcv1: MCValue = mcvNone()
+    if mcv1.kind != MCValueKind.none {
+        return 1
+    }
+
+    var mcv2: MCValue = mcvImmediate(42)
+    if mcv2.kind != MCValueKind.immediate {
+        return 2
+    }
+    if mcv2.imm != 42 {
+        return 3
+    }
+
+    var mcv3: MCValue = mcvRegister(5)
+    if not mcvIsRegister(mcv3) {
+        return 4
+    }
+    if mcv3.reg != 5 {
+        return 5
+    }
+
+    var mcv4: MCValue = mcvStack(16)
+    if mcv4.kind != MCValueKind.stack {
+        return 6
+    }
+    if mcv4.stack_offset != 16 {
+        return 7
+    }
+
+    // Test register manager
+    var rm: RegisterManager = regManagerInit()
+    if not regManagerIsFree(rm, 9) {
+        return 8
+    }
+
+    var reg: int = regManagerTryAlloc(rm, 100)
+    if reg != 9 {
+        return 9
+    }
+    if regManagerIsFree(rm, 9) {
+        return 10
+    }
+
+    regManagerMarkFree(rm, 9)
+    if not regManagerIsFree(rm, 9) {
+        return 11
+    }
+
+    // Test CodeGen init
+    var cg: CodeGen = codeGenInit(128)
+    if cg.stack_size != 128 {
+        return 12
+    }
+
+    // Test value storage
+    setResult(cg, 1, mcvRegister(REG_X0))
+    var v: MCValue = getValue(cg, 1)
+    if not mcvIsRegister(v) {
+        return 13
+    }
+    if v.reg != REG_X0 {
+        return 14
+    }
+
+    // Test FullCodeGen and CodeBuffer
+    var fcg: FullCodeGen = fullCodeGenInit(128)
+    if fcg.stack_size != 128 {
+        return 15
+    }
+    if len(fcg.buf.bytes) != 0 {
+        return 16
+    }
+
+    // Test instruction emission
+    emit32(fcg.buf, 0x12345678)
+    if len(fcg.buf.bytes) != 4 {
+        return 17
+    }
+    // Little-endian: 0x78, 0x56, 0x34, 0x12
+    if fcg.buf.bytes.get(0) != 0x78 {
+        return 18
+    }
+    if fcg.buf.bytes.get(3) != 0x12 {
+        return 19
+    }
+
+    // Test cgGenConstInt (small immediate)
+    cgGenConstInt(fcg, 1, 100)
+    var mcv_const: MCValue = cgGetValue(fcg, 1)
+    if mcv_const.kind != MCValueKind.immediate {
+        return 20
+    }
+    if mcv_const.imm != 100 {
+        return 21
+    }
+
+    // Test cgGenAdd
+    cgSetResult(fcg, 10, mcvImmediate(5))
+    cgSetResult(fcg, 11, mcvImmediate(3))
+    cgGenAdd(fcg, 12, 10, 11)
+    var mcv_add: MCValue = cgGetValue(fcg, 12)
+    if mcv_add.kind != MCValueKind.register {
+        return 22
+    }
+
+    // Test lock/unlock
+    regManagerLock(fcg.reg_manager, REG_X0)
+    if not fcg.reg_manager.locked.get(REG_X0) {
+        return 23
+    }
+    regManagerUnlock(fcg.reg_manager, REG_X0)
+    if fcg.reg_manager.locked.get(REG_X0) {
+        return 24
+    }
+
+    // Test condition codes are correct values
+    if COND_EQ != 0 {
+        return 25
+    }
+    if COND_NE != 1 {
+        return 26
+    }
+    if COND_LT != 11 {
+        return 27
+    }
+
+    // Test register constants
+    if REG_FP != 29 {
+        return 28
+    }
+    if REG_LR != 30 {
+        return 29
+    }
+    if SCRATCH0 != 16 {
+        return 30
+    }
+
+    return 42
+}

@@ -1737,8 +1737,9 @@ pub const Checker = struct {
                 const size_node = self.tree.getNode(a.size);
                 const size: usize = switch (size_node) {
                     .expr => |e| switch (e) {
+                        // Use base 0 to auto-detect: 0x for hex, 0b for binary, 0o for octal
                         .literal => |lit| if (lit.kind == .int)
-                            std.fmt.parseInt(usize, lit.value, 10) catch 0
+                            std.fmt.parseInt(usize, lit.value, 0) catch 0
                         else
                             0,
                         else => 0,
@@ -1859,7 +1860,8 @@ pub const Checker = struct {
                     switch (expr) {
                         .literal => |lit| {
                             if (lit.kind == .int) {
-                                value = std.fmt.parseInt(i64, lit.value, 10) catch 0;
+                                // Use base 0 to auto-detect: 0x for hex, 0b for binary, 0o for octal
+                                value = std.fmt.parseInt(i64, lit.value, 0) catch 0;
                             }
                         },
                         else => {},
