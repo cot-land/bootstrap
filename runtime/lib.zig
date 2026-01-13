@@ -11,6 +11,7 @@ const list = @import("list.zig");
 const string = @import("string.zig");
 const file = @import("file.zig");
 const args = @import("args.zig");
+const print_mod = @import("print.zig");
 
 // Reference the modules to ensure they're not optimized away
 comptime {
@@ -19,6 +20,7 @@ comptime {
     _ = string;
     _ = file;
     _ = args;
+    _ = print_mod;
 }
 
 test {
@@ -28,4 +30,5 @@ test {
     _ = @import("string.zig");
     _ = @import("file.zig");
     _ = @import("args.zig");
+    _ = @import("print.zig");
 }

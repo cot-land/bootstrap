@@ -56,6 +56,15 @@ pub fn classifyType(type_reg: *const types.TypeRegistry, type_idx: types.TypeInd
     }
 }
 
+/// Returns number of registers needed to pass a type.
+pub fn regsNeeded(class: ABIClass) usize {
+    return switch (class) {
+        .single_reg => 1,
+        .double_reg, .slice => 2,
+        .by_pointer => 1, // pointer uses 1 reg
+    };
+}
+
 // ============================================================================
 // MCValue - Machine Code Value (where a value lives)
 // ============================================================================
@@ -314,8 +323,12 @@ pub const CodeGen = struct {
         const spill_start: i32 = if (has_sret) sret_slot - 8 else base_offset - 8;
 
         // Stack size: locals + sret slot (if any) + estimated spill space
+        // Note: we need extra space for calls to functions with large struct returns.
+        // Each such call needs up to 128 bytes (large struct + padding).
+        // As a conservative estimate, add extra 256 bytes per potential spill value.
         const sret_space: u32 = if (has_sret) 8 else 0;
-        const stack_size = func.frame_size + sret_space + @as(u32, @intCast(func.values.items.len)) * 8;
+        const spill_space = @as(u32, @intCast(func.values.items.len)) * 16 + 256;
+        const stack_size = func.frame_size + sret_space + spill_space;
 
         return .{
             .allocator = allocator,
@@ -954,6 +967,13 @@ pub const CodeGen = struct {
         const local = self.func.locals[@intCast(local_idx)];
         const size = self.type_reg.sizeOf(value.type_idx);
 
+        // For large values (>8 bytes), don't load into a register - just record stack location
+        // The consumer (e.g., genStore) will access the value from the stack via memcpy
+        if (size > 8) {
+            try self.setResult(value.id, .{ .stack = local.offset });
+            return;
+        }
+
         const dest = try self.allocReg(value.id);
 
         switch (size) {
@@ -965,6 +985,8 @@ pub const CodeGen = struct {
                     try x86.movzxRegMem8(self.buf, dest, .rbp, local.offset);
                 }
             },
+            2 => try x86.movzxRegMem16(self.buf, dest, .rbp, local.offset),
+            4 => try x86.movRegMem32(self.buf, dest, .rbp, local.offset),
             else => try x86.movRegMem(self.buf, dest, .rbp, local.offset),
         }
 
@@ -999,11 +1021,74 @@ pub const CodeGen = struct {
             return;
         }
 
-        // Standard value store
+        // Standard value store - use MCValue-based approach (Go/Zig pattern)
+        // Key principle: use DESTINATION type for store size, not source type
+        // This ensures u8 variables get 1-byte stores even when assigned from int literals
+        //
+        // For struct locals, we need to distinguish between:
+        // 1. Whole-struct store: `var current: S = other_struct` - use full struct size
+        // 2. Field store: `s.field = value` - use field size
+        // Check if source type matches local type (whole-struct store) or not (field store)
+        const local_type = self.type_reg.get(local.type_idx);
+        const src_type_idx = src_value.type_idx;
+        const dest_type_idx = if (local_type == .struct_type and src_type_idx != local.type_idx)
+            // Struct field store - source type differs from local type, look up field type
+            self.type_reg.getFieldTypeAtOffset(local.type_idx, @intCast(field_offset)) orelse local.type_idx
+        else
+            // Whole value store (scalar or whole struct) - use local's type
+            local.type_idx;
+        const size = self.type_reg.sizeOf(dest_type_idx);
         const src_mcv = self.getValue(src_id);
-        const size = self.type_reg.sizeOf(src_value.type_idx);
-        // For ops that leave result in rax (call, field, slice_index, etc.)
+
+        // Special case: call with by_pointer return (sret)
+        // The result is already on the stack, not in rax
+        if (src_value.op == .call) {
+            const ret_class = classifyType(self.type_reg, src_value.type_idx);
+            if (ret_class == .by_pointer) {
+                // Result is on stack - use memcpy if needed, or it's already in place
+                switch (src_mcv) {
+                    .stack => |src_offset| {
+                        // If source and dest are the same location, nothing to do
+                        if (src_offset == total_offset) {
+                            return;
+                        }
+                        // Otherwise copy using memcpy
+                        try x86.leaRegMem(self.buf, .rdi, .rbp, total_offset);
+                        try x86.leaRegMem(self.buf, .rsi, .rbp, src_offset);
+                        try x86.movRegImm64(self.buf, .rdx, size);
+                        try self.emitRuntimeCall("memcpy");
+                        return;
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        // Special case: map_get with large struct return (>16 bytes)
+        // The result is already on the stack via cot_map_get_struct
+        if (src_value.op == .map_get) {
+            const map_value_size = self.type_reg.sizeOf(src_value.type_idx);
+            if (map_value_size > 16) {
+                // Result is on stack - use memcpy
+                switch (src_mcv) {
+                    .stack => |src_offset| {
+                        if (src_offset == total_offset) {
+                            return;
+                        }
+                        try x86.leaRegMem(self.buf, .rdi, .rbp, total_offset);
+                        try x86.leaRegMem(self.buf, .rsi, .rbp, src_offset);
+                        try x86.movRegImm64(self.buf, .rdx, map_value_size);
+                        try self.emitRuntimeCall("memcpy");
+                        return;
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        // For ops that leave result in rax (call with small return, field, slice_index, etc.)
         // NOTE: .index is NOT in this list because genIndex uses allocReg (not rax)
+        // NOTE: .call is only here for non-sret returns (handled above for sret)
         const uses_rax = switch (src_value.op) {
             .add, .sub, .mul, .div, .call, .field, .slice_index,
             .union_payload, .map_new, .map_get, .map_has, .map_size,
@@ -1014,6 +1099,7 @@ pub const CodeGen = struct {
         if (uses_rax) {
             switch (size) {
                 1 => try x86.movMem8Reg(self.buf, .rbp, total_offset, .rax),
+                2, 4 => try x86.movMem32Reg(self.buf, .rbp, total_offset, .rax),
                 else => try x86.movMemReg(self.buf, .rbp, total_offset, .rax),
             }
             return;
@@ -1023,6 +1109,7 @@ pub const CodeGen = struct {
             .register => |reg| {
                 switch (size) {
                     1 => try x86.movMem8Reg(self.buf, .rbp, total_offset, reg),
+                    2, 4 => try x86.movMem32Reg(self.buf, .rbp, total_offset, reg),
                     else => try x86.movMemReg(self.buf, .rbp, total_offset, reg),
                 }
             },
@@ -1030,6 +1117,7 @@ pub const CodeGen = struct {
                 try x86.movRegImm64(self.buf, scratch0, imm);
                 switch (size) {
                     1 => try x86.movMem8Reg(self.buf, .rbp, total_offset, scratch0),
+                    2, 4 => try x86.movMem32Reg(self.buf, .rbp, total_offset, scratch0),
                     else => try x86.movMemReg(self.buf, .rbp, total_offset, scratch0),
                 }
             },
@@ -1045,6 +1133,7 @@ pub const CodeGen = struct {
                     try x86.movRegMem(self.buf, scratch0, .rbp, offset);
                     switch (size) {
                         1 => try x86.movMem8Reg(self.buf, .rbp, total_offset, scratch0),
+                        2, 4 => try x86.movMem32Reg(self.buf, .rbp, total_offset, scratch0),
                         else => try x86.movMemReg(self.buf, .rbp, total_offset, scratch0),
                     }
                 }
@@ -1212,8 +1301,11 @@ pub const CodeGen = struct {
             }
 
             const dest = try self.allocReg(value.id);
+            // Use correct load width based on type size
             switch (size) {
                 1 => try x86.movzxRegMem8(self.buf, dest, .rbp, total_offset),
+                2 => try x86.movzxRegMem16(self.buf, dest, .rbp, total_offset),
+                4 => try x86.movRegMem32(self.buf, dest, .rbp, total_offset),
                 else => try x86.movRegMem(self.buf, dest, .rbp, total_offset),
             }
             try self.setResult(value.id, .{ .register = dest });
@@ -1235,12 +1327,82 @@ pub const CodeGen = struct {
             }
 
             const dest = try self.allocReg(value.id);
+            // Use correct load width based on type size
             switch (size) {
                 1 => try x86.movzxRegMem8(self.buf, dest, .rax, field_offset),
+                2 => try x86.movzxRegMem16(self.buf, dest, .rax, field_offset),
+                4 => try x86.movRegMem32(self.buf, dest, .rax, field_offset),
                 else => try x86.movRegMem(self.buf, dest, .rax, field_offset),
             }
             try self.setResult(value.id, .{ .register = dest });
         }
+    }
+
+    /// Generate code for field_value: args[0] = base SSA value, aux_int = field offset
+    /// This is different from genField which handles local indices
+    pub fn genFieldValue(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+        if (args.len == 0) return;
+
+        const field_offset: i32 = @intCast(value.aux_int);
+        const size = self.type_reg.sizeOf(value.type_idx);
+
+        // Get the base value's location - args[0] is an SSA value reference
+        const base_mcv = self.getValue(args[0]);
+
+        // For multi-word fields (>8 bytes), compute stack address and return stack MCValue
+        if (size > 8) {
+            switch (base_mcv) {
+                .stack => |stack_offset| {
+                    const field_sp_offset = stack_offset + field_offset;
+                    try self.setResult(value.id, .{ .stack = field_sp_offset });
+                },
+                else => {
+                    // Base is in register - load it and use as address
+                    const dest: x86.Reg = .rax;
+                    try self.loadToReg(dest, base_mcv);
+                    self.reg_manager.markUsed(.rax, value.id);
+                    try self.setResult(value.id, .{ .register = dest });
+                },
+            }
+            return;
+        }
+
+        const dest = try self.allocReg(value.id);
+
+        switch (base_mcv) {
+            .register => |reg| {
+                // Base address is in a register - load field from [reg + offset]
+                switch (size) {
+                    1 => try x86.movzxRegMem8(self.buf, dest, reg, field_offset),
+                    2 => try x86.movzxRegMem16(self.buf, dest, reg, field_offset),
+                    4 => try x86.movRegMem32(self.buf, dest, reg, field_offset),
+                    else => try x86.movRegMem(self.buf, dest, reg, field_offset),
+                }
+            },
+            .stack => |stack_offset| {
+                // Base struct IS on stack at [rbp + stack_offset]
+                // Directly load field from [rbp + stack_offset + field_offset]
+                const total_offset = stack_offset + field_offset;
+                switch (size) {
+                    1 => try x86.movzxRegMem8(self.buf, dest, .rbp, total_offset),
+                    2 => try x86.movzxRegMem16(self.buf, dest, .rbp, total_offset),
+                    4 => try x86.movRegMem32(self.buf, dest, .rbp, total_offset),
+                    else => try x86.movRegMem(self.buf, dest, .rbp, total_offset),
+                }
+            },
+            else => {
+                // Fallback - assume base is in rax
+                switch (size) {
+                    1 => try x86.movzxRegMem8(self.buf, dest, .rax, field_offset),
+                    2 => try x86.movzxRegMem16(self.buf, dest, .rax, field_offset),
+                    4 => try x86.movRegMem32(self.buf, dest, .rax, field_offset),
+                    else => try x86.movRegMem(self.buf, dest, .rax, field_offset),
+                }
+            },
+        }
+
+        try self.setResult(value.id, .{ .register = dest });
     }
 
     /// Generate code for logical NOT: XOR with 1 to flip boolean
@@ -1352,6 +1514,84 @@ pub const CodeGen = struct {
         try x86.movRegMem(self.buf, dest, scratch0, 0);
 
         try self.setResult(value.id, .{ .register = dest });
+    }
+
+    /// Generate code for index_value: args[0] = base ptr (SSA value), args[1] = index (SSA)
+    /// This is different from genIndex which expects args[0] to be a local index
+    pub fn genIndexValue(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+        if (args.len < 2) return;
+
+        const elem_size: i64 = if (value.aux_int != 0) value.aux_int else 8;
+
+        // Get base and index MCValues - args are SSA value references, not local indices
+        const base_mcv = self.getValue(args[0]);
+        const idx_mcv = self.getValue(args[1]);
+
+        // Check if base is in scratch0 - if so, save it first
+        if (base_mcv == .register and base_mcv.register == scratch0) {
+            try x86.movRegReg(self.buf, scratch1, scratch0);
+            // Load index into scratch0
+            try self.loadToReg(scratch0, idx_mcv);
+            // Calculate offset: index * elem_size
+            if (elem_size > 1 and elem_size <= 0x7FFFFFFF) {
+                try x86.imulRegRegImm(self.buf, scratch0, scratch0, @intCast(elem_size));
+            }
+            // Add: scratch1 = scratch1 + scratch0
+            try x86.addRegReg(self.buf, scratch1, scratch0);
+            // Load from [scratch1]
+            if (elem_size == 1) {
+                try x86.movzxRegMem8(self.buf, .rax, scratch1, 0);
+            } else {
+                try x86.movRegMem(self.buf, .rax, scratch1, 0);
+            }
+            self.reg_manager.markUsed(.rax, value.id);
+            try self.setResult(value.id, .{ .register = .rax });
+            return;
+        }
+
+        // Load index into scratch0
+        try self.loadToReg(scratch0, idx_mcv);
+
+        // Calculate offset: index * elem_size
+        if (elem_size > 1 and elem_size <= 0x7FFFFFFF) {
+            try x86.imulRegRegImm(self.buf, scratch0, scratch0, @intCast(elem_size));
+        }
+
+        switch (base_mcv) {
+            .stack => |stack_offset| {
+                // Slice/string is on stack: ptr at stack_offset
+                // Load ptr into scratch1
+                try x86.movRegMem(self.buf, scratch1, .rbp, stack_offset);
+                // Add index offset: scratch1 = scratch1 + scratch0
+                try x86.addRegReg(self.buf, scratch1, scratch0);
+                // Load from [scratch1]
+                if (elem_size == 1) {
+                    try x86.movzxRegMem8(self.buf, .rax, scratch1, 0);
+                } else {
+                    try x86.movRegMem(self.buf, .rax, scratch1, 0);
+                }
+            },
+            .register => |reg| {
+                // Base ptr is in a register
+                // Add index offset: scratch1 = reg + scratch0
+                try x86.movRegReg(self.buf, scratch1, reg);
+                try x86.addRegReg(self.buf, scratch1, scratch0);
+                // Load from [scratch1]
+                if (elem_size == 1) {
+                    try x86.movzxRegMem8(self.buf, .rax, scratch1, 0);
+                } else {
+                    try x86.movRegMem(self.buf, .rax, scratch1, 0);
+                }
+            },
+            else => {
+                // Fallback - shouldn't happen
+                try x86.movRegImm64(self.buf, .rax, 0);
+            },
+        }
+
+        self.reg_manager.markUsed(.rax, value.id);
+        try self.setResult(value.id, .{ .register = .rax });
     }
 
     /// Generate code for address-of: LEA to get address of local
@@ -1503,6 +1743,55 @@ pub const CodeGen = struct {
         try self.loadToReg(.rdx, end_mcv);
         // rdx = end - start
         try x86.subRegReg(self.buf, .rdx, .r9);
+
+        // Result is in rax (ptr) and rdx (len)
+        self.reg_manager.markUsed(.rax, value.id);
+        try self.setResult(value.id, .{ .register = .rax });
+    }
+
+    /// Generate code for slice_value: args[0] = base ptr (SSA value), args[1] = start, args[2] = end
+    /// This is different from genSliceMake which expects args[0] to be a local index
+    pub fn genSliceValue(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+        if (args.len < 3) return;
+
+        const elem_size: i64 = if (value.aux_int != 0) value.aux_int else 8;
+        const base_mcv = self.getValue(args[0]);
+        const start_mcv = self.getValue(args[1]);
+        const end_mcv = self.getValue(args[2]);
+
+        // Load base ptr into rax
+        switch (base_mcv) {
+            .stack => |stack_offset| {
+                // Slice/string is on stack: ptr at stack_offset
+                try x86.movRegMem(self.buf, .rax, .rbp, stack_offset);
+            },
+            .register => |reg| {
+                // Base ptr is in a register
+                try x86.movRegReg(self.buf, .rax, reg);
+            },
+            else => {
+                // Fallback - shouldn't happen
+                try x86.movRegImm64(self.buf, .rax, 0);
+            },
+        }
+
+        // Get start value into r9
+        try self.loadToReg(.r9, start_mcv);
+
+        // Get end value into rdx
+        try self.loadToReg(.rdx, end_mcv);
+
+        // Compute len = end - start -> rdx
+        try x86.subRegReg(self.buf, .rdx, .r9);
+
+        // Compute ptr = base + start * elem_size -> rax
+        if (elem_size > 1 and elem_size <= 0x7FFFFFFF) {
+            try x86.imulRegRegImm(self.buf, .r10, .r9, @intCast(elem_size));
+        } else {
+            try x86.movRegReg(self.buf, .r10, .r9);
+        }
+        try x86.addRegReg(self.buf, .rax, .r10);
 
         // Result is in rax (ptr) and rdx (len)
         self.reg_manager.markUsed(.rax, value.id);
@@ -1718,23 +2007,40 @@ pub const CodeGen = struct {
         const handle_mcv = self.getValue(args[0]);
         try self.loadToReg(.rdi, handle_mcv);
 
-        try self.emitRuntimeCall("cot_map_get");
-
         // Check value type size for proper result handling
         const map_value_size = self.type_reg.sizeOf(value.type_idx);
+
         if (map_value_size > 16) {
-            // Very large struct - would need special handling (not yet implemented)
-            self.reg_manager.markUsed(.rax, value.id);
-            try self.setResult(value.id, .{ .register = .rax });
+            // Large struct: use cot_map_get_struct with destination pointer
+            // Allocate temp stack slot for the result (next_spill_offset is negative, subtract to allocate)
+            self.next_spill_offset -= @as(i32, @intCast(alignTo(map_value_size, 8)));
+            const spill_offset = self.next_spill_offset;
+
+            // rdi = handle (already loaded)
+            // rsi = key ptr (already loaded)
+            // rdx = key len (already loaded)
+            // rcx = destination pointer (our temp slot)
+            // r8 = value size
+            try x86.leaRegMem(self.buf, .rcx, .rbp, spill_offset);
+            try x86.movRegImm64(self.buf, .r8, @intCast(map_value_size));
+
+            try self.emitRuntimeCall("cot_map_get_struct");
+
+            // Result is now in the temp slot (offset is already negative)
+            try self.setResult(value.id, .{ .stack = spill_offset });
         } else if (map_value_size > 8) {
-            // Medium struct (9-16 bytes) returned in rax+rdx - spill to stack
+            // Medium struct (9-16 bytes) - use regular cot_map_get, result in rax+rdx
+            try self.emitRuntimeCall("cot_map_get");
+
             const result_offset = self.next_spill_offset;
             try x86.movMemReg(self.buf, .rbp, -@as(i32, @intCast(result_offset)), .rax);
             try x86.movMemReg(self.buf, .rbp, -@as(i32, @intCast(result_offset)) - 8, .rdx);
             self.next_spill_offset += @intCast(alignTo(map_value_size, 8));
             try self.setResult(value.id, .{ .stack = result_offset });
         } else {
-            // Small value (≤ 8 bytes) - result in rax
+            // Small value (≤ 8 bytes) - use regular cot_map_get, result in rax
+            try self.emitRuntimeCall("cot_map_get");
+
             self.reg_manager.markUsed(.rax, value.id);
             try self.setResult(value.id, .{ .register = .rax });
         }
@@ -1779,6 +2085,12 @@ pub const CodeGen = struct {
 
         try self.spillCallerSaved();
 
+        // Determine which arg is the value and check if it's a large struct
+        const val_arg_idx: usize = if (args.len >= 4) 3 else 2;
+        const val_value = &self.func.values.items[args[val_arg_idx]];
+        const val_size = self.type_reg.sizeOf(val_value.type_idx);
+        const is_large_struct = val_size > 8;
+
         // Load key FIRST to avoid clobbering
         const key_val = &self.func.values.items[args[1]];
         const key_type = self.type_reg.get(key_val.type_idx);
@@ -1807,18 +2119,36 @@ pub const CodeGen = struct {
             try self.loadToReg(.rsi, key_mcv);
         }
 
-        // Load value into rcx (4th arg for string key case)
-        // For string keys: args = [handle, key_ptr, key_len, value]
-        // For int keys: args = [handle, key, key, value] (key repeated for uniformity)
-        const val_arg_idx: usize = if (args.len >= 4) 3 else 2;
-        const val_mcv = self.getValue(args[val_arg_idx]);
-        try self.loadToReg(.rcx, val_mcv);
+        // Load value - for large structs, pass pointer + size
+        if (is_large_struct) {
+            // Large struct: pass value pointer + size
+            const val_mcv = self.getValue(args[val_arg_idx]);
+            switch (val_mcv) {
+                .stack => |offset| {
+                    // Value is on stack - compute its address
+                    try x86.leaRegMem(self.buf, .rcx, .rbp, offset);
+                },
+                else => {
+                    // Value in register (shouldn't happen for large struct, but handle it)
+                    try self.loadToReg(.rcx, val_mcv);
+                },
+            }
+            try x86.movRegImm64(self.buf, .r8, @intCast(val_size));
+        } else {
+            // Small value - load directly into rcx
+            const val_mcv = self.getValue(args[val_arg_idx]);
+            try self.loadToReg(.rcx, val_mcv);
+        }
 
         // Load handle LAST to avoid clobber
         const handle_mcv = self.getValue(args[0]);
         try self.loadToReg(.rdi, handle_mcv);
 
-        try self.emitRuntimeCall("cot_map_set");
+        if (is_large_struct) {
+            try self.emitRuntimeCall("cot_map_set_struct");
+        } else {
+            try self.emitRuntimeCall("cot_map_set");
+        }
     }
 
     /// Generate code for map_has: args[0]=handle, args[1]=key
@@ -2321,33 +2651,65 @@ pub const CodeGen = struct {
 
         if (ret_class == .by_pointer) {
             // Allocate stack space for large struct result
-            // Use a fixed location relative to frame size to avoid dynamic allocation issues
+            // IMPORTANT: Subtract FIRST to allocate space, then use the new offset
+            // Otherwise the struct would overlap with the frame pointer!
             const ret_size = self.type_reg.sizeOf(value.type_idx);
+            self.next_spill_offset -= @as(i32, @intCast(alignTo(ret_size, 8)));
             result_offset = self.next_spill_offset;
-            self.next_spill_offset -= @intCast(alignTo(ret_size, 8));
             // Load effective address of result space into rdi (hidden pointer)
             try x86.leaRegMem(self.buf, .rdi, .rbp, result_offset);
             // All other arguments shift right by 1
             reg_idx = 1;
         }
 
-        // Load arguments into registers
+        // Load arguments into registers using SysV ABI classification
         for (args) |arg_id| {
-            if (reg_idx >= arg_regs.len) break;
-
             const arg_val = &self.func.values.items[arg_id];
-            const arg_type = self.type_reg.get(arg_val.type_idx);
+            const arg_class = classifyType(self.type_reg, arg_val.type_idx);
+            const needed = regsNeeded(arg_class);
 
-            if (arg_type == .slice) {
-                // Slice argument: pass ptr in reg[i], len in reg[i+1]
-                if (reg_idx + 1 >= arg_regs.len) break;
-                try self.loadSliceToRegs(arg_val, arg_regs[reg_idx], arg_regs[reg_idx + 1]);
-                reg_idx += 2;
-            } else {
-                // Scalar argument
-                const arg_mcv = self.getValue(arg_id);
-                try self.loadToReg(arg_regs[reg_idx], arg_mcv);
-                reg_idx += 1;
+            if (reg_idx + needed > arg_regs.len) break;
+
+            switch (arg_class) {
+                .by_pointer => {
+                    // Large type (>16 bytes): pass pointer to storage location
+                    const arg_mcv = self.getValue(arg_id);
+                    if (arg_mcv == .stack) {
+                        // Value is on stack - pass pointer to that location
+                        try x86.leaRegMem(self.buf, arg_regs[reg_idx], .rbp, arg_mcv.stack);
+                    } else {
+                        // Fallback: try to pass pointer to local
+                        const arg_val_args = arg_val.args();
+                        if (arg_val_args.len > 0 and arg_val_args[0] < self.func.locals.len) {
+                            const local_idx: u32 = @intCast(arg_val_args[0]);
+                            const local = self.func.locals[local_idx];
+                            try x86.leaRegMem(self.buf, arg_regs[reg_idx], .rbp, local.offset);
+                        }
+                    }
+                    reg_idx += 1;
+                },
+                .double_reg => {
+                    // Medium type (9-16 bytes): pass in 2 consecutive registers
+                    const arg_mcv = self.getValue(arg_id);
+                    if (arg_mcv == .stack) {
+                        try x86.movRegMem(self.buf, arg_regs[reg_idx], .rbp, arg_mcv.stack);
+                        try x86.movRegMem(self.buf, arg_regs[reg_idx + 1], .rbp, arg_mcv.stack + 8);
+                    } else {
+                        try self.loadToReg(arg_regs[reg_idx], arg_mcv);
+                    }
+                    reg_idx += 2;
+                },
+                .slice => {
+                    // Slice: always 2 registers (ptr + len)
+                    try self.loadSliceToRegs(arg_val, arg_regs[reg_idx], arg_regs[reg_idx + 1]);
+                    reg_idx += 2;
+                },
+                .single_reg => {
+                    // Small type (≤8 bytes): pass in one register
+                    const arg_mcv = self.getValue(arg_id);
+                    try self.loadToReg(arg_regs[reg_idx], arg_mcv);
+                    reg_idx += 1;
+                },
             }
         }
 
@@ -2470,16 +2832,19 @@ pub const CodeGen = struct {
             .store => try self.genStore(value),
             .eq, .ne, .lt, .le, .gt, .ge => try self.genComparison(value),
             .call => try self.genCall(value),
-            .field_local, .field_value, .field => try self.genField(value),
+            .field_local, .field => try self.genField(value),
+            .field_value => try self.genFieldValue(value),
             .not => try self.genNot(value),
             .@"and" => try self.genAnd(value),
             .@"or" => try self.genOr(value),
             .select => try self.genSelect(value),
-            .index_local, .index_value, .index => try self.genIndex(value),
+            .index_local, .index => try self.genIndex(value),
+            .index_value => try self.genIndexValue(value),
             .addr => try self.genAddr(value),
             .ptr_load => try self.genPtrLoad(value),
             .ptr_store => try self.genPtrStore(value),
-            .slice_local, .slice_value, .slice_make => try self.genSliceMake(value),
+            .slice_local, .slice_make => try self.genSliceMake(value),
+            .slice_value => try self.genSliceValue(value),
             .slice_index => try self.genSliceIndex(value),
             .union_tag => try self.genUnionTag(value),
             .union_payload => try self.genUnionPayload(value),
@@ -2548,8 +2913,8 @@ pub const CodeGen = struct {
             try x86.pushReg(self.buf, .rdi);
             try x86.pushReg(self.buf, .rsi);
             // Call cot_args_init(rdi=argc, rsi=argv) - args already in right registers
-            try self.buf.addRelocation(.pc_rel_32, "cot_args_init", -4);
-            try x86.callRel32(self.buf, 0);
+            const init_func = if (self.os == .macos) "_cot_args_init" else "cot_args_init";
+            try x86.callSymbol(self.buf, init_func);
             // Restore rsi/rdi (reverse order of push)
             try x86.popReg(self.buf, .rsi);
             try x86.popReg(self.buf, .rdi);
@@ -2580,34 +2945,55 @@ pub const CodeGen = struct {
             reg_idx = 1; // Skip RDI for actual parameters
         }
 
-        // Spill parameters to local slots
+        // Spill parameters to local slots using ABIClass for consistent decisions
         for (0..num_params) |param_idx| {
-            if (param_idx >= self.func.locals.len or reg_idx >= param_regs.len) break;
+            if (param_idx >= self.func.locals.len) break;
 
             const local = self.func.locals[param_idx];
             const local_offset = local.offset;
-            const param_type = self.type_reg.get(local.type_idx);
+            const param_class = classifyType(self.type_reg, local.type_idx);
+            const needed = regsNeeded(param_class);
 
-            if (param_type == .slice) {
-                // Slice parameter: 2 registers (ptr + len)
-                if (reg_idx + 1 < param_regs.len) {
-                    // Store ptr at offset, len at offset+8
+            if (reg_idx + needed > param_regs.len) break;
+
+            switch (param_class) {
+                .by_pointer => {
+                    // Large type: register holds pointer to caller's copy
+                    // Copy entire value from that address to our local slot
+                    const src_addr = param_regs[reg_idx];
+                    const param_size = local.size;
+                    var copied: u32 = 0;
+                    while (copied < param_size) {
+                        const dst_offset = local.offset + @as(i32, @intCast(copied));
+                        // Load from src_addr + offset
+                        try x86.movRegMem(self.buf, scratch0, src_addr, @intCast(copied));
+                        // Store to local
+                        try x86.movMemReg(self.buf, .rbp, dst_offset, scratch0);
+                        copied += 8;
+                    }
+                    reg_idx += 1;
+                },
+                .double_reg => {
+                    // Medium type (9-16 bytes): 2 registers
                     try x86.movMemReg(self.buf, .rbp, local_offset, param_regs[reg_idx]);
                     try x86.movMemReg(self.buf, .rbp, local_offset + 8, param_regs[reg_idx + 1]);
                     reg_idx += 2;
-                } else {
-                    // Not enough registers, just store ptr
+                },
+                .slice => {
+                    // Slice: 2 registers (ptr + len)
                     try x86.movMemReg(self.buf, .rbp, local_offset, param_regs[reg_idx]);
+                    try x86.movMemReg(self.buf, .rbp, local_offset + 8, param_regs[reg_idx + 1]);
+                    reg_idx += 2;
+                },
+                .single_reg => {
+                    // Small type: single register
+                    const param_size = self.type_reg.sizeOf(local.type_idx);
+                    switch (param_size) {
+                        1 => try x86.movMem8Reg(self.buf, .rbp, local_offset, param_regs[reg_idx]),
+                        else => try x86.movMemReg(self.buf, .rbp, local_offset, param_regs[reg_idx]),
+                    }
                     reg_idx += 1;
-                }
-            } else {
-                // Use appropriate-sized store based on parameter type
-                const param_size = self.type_reg.sizeOf(local.type_idx);
-                switch (param_size) {
-                    1 => try x86.movMem8Reg(self.buf, .rbp, local_offset, param_regs[reg_idx]),
-                    else => try x86.movMemReg(self.buf, .rbp, local_offset, param_regs[reg_idx]),
-                }
-                reg_idx += 1;
+                },
             }
         }
     }

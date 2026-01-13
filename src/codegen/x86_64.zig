@@ -662,6 +662,115 @@ pub fn movsxRegMem8(buf: *CodeBuffer, dst: Reg, base: Reg, offset: i32) !void {
     }
 }
 
+/// MOVZX r64, word [base+offset] - Load 16-bit word with zero extension
+pub fn movzxRegMem16(buf: *CodeBuffer, dst: Reg, base: Reg, offset: i32) !void {
+    // REX.W + 0F B7 /r (zero-extend word to quadword)
+    try buf.emit8(rex(true, dst, base));
+    try buf.emit8(0x0F);
+    try buf.emit8(0xB7); // Zero-extend word
+
+    if (offset == 0 and base != .rbp and base != .r13) {
+        try buf.emit8(ModRM.regDisp(ModRM.indirect, dst, base));
+    } else if (offset >= -128 and offset <= 127) {
+        try buf.emit8(ModRM.regDisp(ModRM.disp8, dst, base));
+    } else {
+        try buf.emit8(ModRM.regDisp(ModRM.disp32, dst, base));
+    }
+
+    if (base == .rsp or base == .r12) {
+        try buf.emit8(0x24);
+    }
+
+    if (offset == 0 and base != .rbp and base != .r13) {
+        // No displacement
+    } else if (offset >= -128 and offset <= 127) {
+        try buf.emit8(@bitCast(@as(i8, @intCast(offset))));
+    } else {
+        try buf.emit32(@bitCast(offset));
+    }
+}
+
+/// MOV r32, dword [base+offset] - Load 32-bit value (zero-extends to 64-bit)
+pub fn movRegMem32(buf: *CodeBuffer, dst: Reg, base: Reg, offset: i32) !void {
+    // Without REX.W, 32-bit operand size (result zero-extended to 64-bit)
+    // REX prefix only for extended registers
+    if (dst.needsRex() or base.needsRex()) {
+        var rex_byte: u8 = 0x40;
+        if (dst.needsRex()) rex_byte |= REX_R;
+        if (base.needsRex()) rex_byte |= REX_B;
+        try buf.emit8(rex_byte);
+    }
+
+    try buf.emit8(0x8B); // MOV r32, r/m32 (without REX.W = 32-bit)
+
+    if (offset == 0 and base != .rbp and base != .r13) {
+        try buf.emit8(ModRM.regDisp(ModRM.indirect, dst, base));
+    } else if (offset >= -128 and offset <= 127) {
+        try buf.emit8(ModRM.regDisp(ModRM.disp8, dst, base));
+    } else {
+        try buf.emit8(ModRM.regDisp(ModRM.disp32, dst, base));
+    }
+
+    if (base == .rsp or base == .r12) {
+        try buf.emit8(0x24);
+    }
+
+    if (offset == 0 and base != .rbp and base != .r13) {
+        // No displacement
+    } else if (offset >= -128 and offset <= 127) {
+        try buf.emit8(@bitCast(@as(i8, @intCast(offset))));
+    } else {
+        try buf.emit32(@bitCast(offset));
+    }
+}
+
+/// MOV dword [base+offset], r32 - Store low 32 bits of register
+pub fn movMem32Reg(buf: *CodeBuffer, base: Reg, offset: i32, src: Reg) !void {
+    // REX prefix only for extended registers (no REX.W for 32-bit operand size)
+    if (src.needsRex() or base.needsRex()) {
+        var rex_byte: u8 = 0x40;
+        if (src.needsRex()) rex_byte |= REX_R;
+        if (base.needsRex()) rex_byte |= REX_B;
+        try buf.emit8(rex_byte);
+    }
+
+    try buf.emit8(0x89); // MOV r/m32, r32 (without REX.W = 32-bit)
+
+    // Handle addressing modes (same as movMemReg)
+    if (base == .rsp or base == .r12) {
+        if (offset == 0) {
+            try buf.emit8((src.low3() << 3) | 0x04);
+            try buf.emit8(0x24);
+        } else if (offset >= -128 and offset <= 127) {
+            try buf.emit8(0x44 | (src.low3() << 3));
+            try buf.emit8(0x24);
+            try buf.emit8(@bitCast(@as(i8, @intCast(offset))));
+        } else {
+            try buf.emit8(0x84 | (src.low3() << 3));
+            try buf.emit8(0x24);
+            try buf.emit32(@bitCast(offset));
+        }
+    } else if (base == .rbp or base == .r13) {
+        if (offset >= -128 and offset <= 127) {
+            try buf.emit8(0x45 | (src.low3() << 3));
+            try buf.emit8(@bitCast(@as(i8, @intCast(offset))));
+        } else {
+            try buf.emit8(0x85 | (src.low3() << 3));
+            try buf.emit32(@bitCast(offset));
+        }
+    } else {
+        if (offset == 0) {
+            try buf.emit8((src.low3() << 3) | base.low3());
+        } else if (offset >= -128 and offset <= 127) {
+            try buf.emit8(0x40 | (src.low3() << 3) | base.low3());
+            try buf.emit8(@bitCast(@as(i8, @intCast(offset))));
+        } else {
+            try buf.emit8(0x80 | (src.low3() << 3) | base.low3());
+            try buf.emit32(@bitCast(offset));
+        }
+    }
+}
+
 /// MOV byte [base+offset], r8 - Store low byte of register
 pub fn movMem8Reg(buf: *CodeBuffer, base: Reg, offset: i32, src: Reg) !void {
     // REX prefix for extended registers or to access low byte of RSI/RDI/RSP/RBP

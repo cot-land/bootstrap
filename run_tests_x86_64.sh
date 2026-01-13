@@ -158,6 +158,45 @@ get_expected() {
         test_string_slice) echo 42 ;;
         test_bool_or) echo 42 ;;
         test_bool_and) echo 42 ;;
+        test_break) echo 42 ;;
+        test_continue) echo 42 ;;
+        test_break_for) echo 42 ;;
+        test_continue_for) echo 42 ;;
+        # Additional tests with expected values
+        test_all_features) echo 42 ;;
+        test_args) echo 42 ;;
+        # test_args_debug - skip, just a debug print test
+        test_array_struct_list) echo 42 ;;
+        test_char_lit) echo 42 ;;
+        test_enum_field) echo 42 ;;
+        test_file_exists) echo 42 ;;
+        # test_file_io - skip, uses @listDataPtr/@listByteSize not implemented
+        test_file_read) echo 42 ;;
+        test_import) echo 42 ;;
+        test_import_nested) echo 42 ;;
+        test_keyword_lookup) echo 42 ;;
+        test_list_set) echo 42 ;;
+        test_map_large_struct) echo 42 ;;
+        test_map_struct_debug) echo 42 ;;
+        test_pointer_basic) echo 42 ;;
+        test_pointer_param) echo 42 ;;
+        test_print) echo 0 ;;
+        test_result_pattern) echo 4 ;;  # Iterates 4 times through loop
+        test_scanner_simple) echo 42 ;;
+        test_slice_cmp) echo 42 ;;
+        test_slice_lookup) echo 42 ;;
+        test_struct_enum_return) echo 42 ;;
+        test_struct_init_simple) echo 42 ;;
+        test_struct_list) echo 42 ;;
+        test_struct_map) echo 42 ;;
+        test_struct_union_list) echo 42 ;;
+        test_struct_union_map) echo 42 ;;
+        test_u8_literal) echo 42 ;;
+        test_u8_var) echo 42 ;;
+        test_interpolation2) echo 42 ;;
+        test_interpolation3) echo 42 ;;
+        # Helper files (no main function, not runnable)
+        # test_import_base, test_import_helper, test_import_nested_helper
         *) echo "" ;;
     esac
 }

@@ -63,7 +63,7 @@ Every Zig source file needs a corresponding bootstrap .cot file that uses only s
 | `src/main.zig` | `src/bootstrap/main_boot.cot` | **Done** | Entry point |
 | `src/codegen/backend.zig` | `src/bootstrap/codegen/backend_boot.cot` | **Done** | Backend abstraction |
 | `src/codegen/arm64_codegen.zig` | `src/bootstrap/codegen/arm64_boot.cot` | **Done** | ARM64 code generation |
-| `src/codegen/amd64_codegen.zig` | `src/bootstrap/codegen/amd64_boot.cot` | TODO | x86_64 code generation |
+| `src/codegen/amd64_codegen.zig` | `src/bootstrap/codegen/amd64_boot.cot` | TODO | x86_64 code generation (Zig impl done, .cot pending) |
 | `src/codegen/aarch64.zig` | `src/bootstrap/codegen/aarch64_boot.cot` | **Done** | ARM64 instruction encoding |
 | `src/codegen/x86_64.zig` | `src/bootstrap/codegen/x86_64_boot.cot` | TODO | x86_64 instruction encoding |
 | `src/codegen/object.zig` | `src/bootstrap/codegen/object_boot.cot` | **Done** | Mach-O output (ARM64) |

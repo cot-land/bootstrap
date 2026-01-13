@@ -8,8 +8,8 @@
 
 | Platform | Status | Notes |
 |----------|--------|-------|
-| ARM64 (macOS) | ✅ 71/98 Pass | All tests pass, 27 skipped (no expected value) |
-| x86_64 (Linux) | ✅ 71/98 Pass | All tests pass, 27 skipped (no expected value) |
+| ARM64 (macOS) | ✅ 99/99 Pass | All tests pass, 5 skipped (no expected value) |
+| x86_64 (Linux) | ✅ 99/99 Pass | All tests pass, 5 skipped (no expected value) |
 
 ```bash
 # Fast validation (default - runs comprehensive test only)
