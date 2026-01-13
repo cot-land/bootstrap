@@ -119,3 +119,8 @@ ptr_test
 t1
 t2
 t3
+cot0
+cot1
+
+# Bootstrap test artifacts
+tests/bootstrap/
