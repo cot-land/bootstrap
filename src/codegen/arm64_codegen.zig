@@ -720,11 +720,10 @@ pub const CodeGen = struct {
         // If right is in x0, we MUST save it before loading left into x0,
         // otherwise loading left will clobber right before we can use it.
         if (right_mcv == .register and right_mcv.register == .x0) {
-            // Choose scratch reg that doesn't conflict with left operand
-            const scratch: aarch64.Reg = if (left_mcv == .register and left_mcv.register == .x9) .x10 else .x9;
-            try aarch64.movRegReg(self.buf, scratch, .x0);
+            // Use scratch0 (x16) - avoids clobbering x9-x15 which may hold live values
+            try aarch64.movRegReg(self.buf, scratch0, .x0);
             try self.loadToReg(.x0, left_mcv);
-            try aarch64.addRegReg(self.buf, .x0, .x0, scratch);
+            try aarch64.addRegReg(self.buf, .x0, .x0, scratch0);
         } else {
             // Load left operand into x0
             try self.loadToReg(.x0, left_mcv);
@@ -738,13 +737,13 @@ pub const CodeGen = struct {
                     if (imm >= 0 and imm <= 4095) {
                         try aarch64.addRegImm12(self.buf, .x0, .x0, @intCast(imm));
                     } else {
-                        try aarch64.movRegImm64(self.buf, .x9, imm);
-                        try aarch64.addRegReg(self.buf, .x0, .x0, .x9);
+                        try aarch64.movRegImm64(self.buf, scratch0, imm);
+                        try aarch64.addRegReg(self.buf, .x0, .x0, scratch0);
                     }
                 },
                 .stack => |offset| {
-                    try self.ldrSpOffset(.x9, offset);
-                    try aarch64.addRegReg(self.buf, .x0, .x0, .x9);
+                    try self.ldrSpOffset(scratch0, offset);
+                    try aarch64.addRegReg(self.buf, .x0, .x0, scratch0);
                 },
                 else => {},
             }
@@ -771,11 +770,10 @@ pub const CodeGen = struct {
 
         // If right is in x0, we MUST save it before loading left into x0
         if (right_mcv == .register and right_mcv.register == .x0) {
-            // Choose scratch reg that doesn't conflict with left operand
-            const scratch: aarch64.Reg = if (left_mcv == .register and left_mcv.register == .x9) .x10 else .x9;
-            try aarch64.movRegReg(self.buf, scratch, .x0);
+            // Use scratch0 (x16) - avoids clobbering x9-x15 which may hold live values
+            try aarch64.movRegReg(self.buf, scratch0, .x0);
             try self.loadToReg(.x0, left_mcv);
-            try aarch64.subRegReg(self.buf, .x0, .x0, scratch);
+            try aarch64.subRegReg(self.buf, .x0, .x0, scratch0);
         } else {
             try self.loadToReg(.x0, left_mcv);
 
@@ -787,13 +785,13 @@ pub const CodeGen = struct {
                     if (imm >= 0 and imm <= 4095) {
                         try aarch64.subRegImm12(self.buf, .x0, .x0, @intCast(imm));
                     } else {
-                        try aarch64.movRegImm64(self.buf, .x9, imm);
-                        try aarch64.subRegReg(self.buf, .x0, .x0, .x9);
+                        try aarch64.movRegImm64(self.buf, scratch0, imm);
+                        try aarch64.subRegReg(self.buf, .x0, .x0, scratch0);
                     }
                 },
                 .stack => |offset| {
-                    try self.ldrSpOffset(.x9, offset);
-                    try aarch64.subRegReg(self.buf, .x0, .x0, .x9);
+                    try self.ldrSpOffset(scratch0, offset);
+                    try aarch64.subRegReg(self.buf, .x0, .x0, scratch0);
                 },
                 else => {},
             }
@@ -818,11 +816,10 @@ pub const CodeGen = struct {
 
         // If right is in x0, we MUST save it before loading left into x0
         if (right_mcv == .register and right_mcv.register == .x0) {
-            // Choose scratch reg that doesn't conflict with left operand
-            const scratch: aarch64.Reg = if (left_mcv == .register and left_mcv.register == .x9) .x10 else .x9;
-            try aarch64.movRegReg(self.buf, scratch, .x0);
+            // Use scratch0 (x16) - avoids clobbering x9-x15 which may hold live values
+            try aarch64.movRegReg(self.buf, scratch0, .x0);
             try self.loadToReg(.x0, left_mcv);
-            try aarch64.mulRegReg(self.buf, .x0, .x0, scratch);
+            try aarch64.mulRegReg(self.buf, .x0, .x0, scratch0);
         } else {
             try self.loadToReg(.x0, left_mcv);
 
@@ -831,12 +828,12 @@ pub const CodeGen = struct {
                     try aarch64.mulRegReg(self.buf, .x0, .x0, src);
                 },
                 .stack => |offset| {
-                    try self.ldrSpOffset(.x9, offset);
-                    try aarch64.mulRegReg(self.buf, .x0, .x0, .x9);
+                    try self.ldrSpOffset(scratch0, offset);
+                    try aarch64.mulRegReg(self.buf, .x0, .x0, scratch0);
                 },
                 .immediate => |imm| {
-                    try aarch64.movRegImm64(self.buf, .x9, imm);
-                    try aarch64.mulRegReg(self.buf, .x0, .x0, .x9);
+                    try aarch64.movRegImm64(self.buf, scratch0, imm);
+                    try aarch64.mulRegReg(self.buf, .x0, .x0, scratch0);
                 },
                 else => {},
             }
@@ -859,20 +856,18 @@ pub const CodeGen = struct {
             try self.ensureRegFree(.x0);
         }
 
-        // Choose scratch reg that doesn't conflict with left operand
-        const scratch: aarch64.Reg = if (left_mcv == .register and left_mcv.register == .x9) .x10 else .x9;
-
+        // Use scratch0 (x16) for divisor - avoids clobbering x9-x15 which may hold live values
         // If right is in x0, we MUST save it before loading left into x0
         if (right_mcv == .register and right_mcv.register == .x0) {
-            try aarch64.movRegReg(self.buf, scratch, .x0);
+            try aarch64.movRegReg(self.buf, scratch0, .x0);
             try self.loadToReg(.x0, left_mcv);
         } else {
             try self.loadToReg(.x0, left_mcv);
-            try self.loadToReg(scratch, right_mcv);
+            try self.loadToReg(scratch0, right_mcv);
         }
 
-        // ARM64 SDIV: x0 = x0 / scratch
-        try aarch64.sdivRegReg(self.buf, .x0, .x0, scratch);
+        // ARM64 SDIV: x0 = x0 / scratch0
+        try aarch64.sdivRegReg(self.buf, .x0, .x0, scratch0);
 
         self.freeDeadOperands(value);
         self.reg_manager.markUsed(.x0, value.id);

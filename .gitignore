@@ -100,6 +100,7 @@ backend_boot
 aarch64_boot
 arm64_boot
 arm64_boot_test
+object_boot
 
 # Any test binary in root
 /test_*

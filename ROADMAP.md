@@ -66,12 +66,12 @@ Every Zig source file needs a corresponding bootstrap .cot file that uses only s
 | `src/codegen/amd64_codegen.zig` | `src/bootstrap/codegen/amd64_boot.cot` | TODO | x86_64 code generation |
 | `src/codegen/aarch64.zig` | `src/bootstrap/codegen/aarch64_boot.cot` | **Done** | ARM64 instruction encoding |
 | `src/codegen/x86_64.zig` | `src/bootstrap/codegen/x86_64_boot.cot` | TODO | x86_64 instruction encoding |
-| `src/codegen/object.zig` | `src/bootstrap/codegen/object_boot.cot` | TODO | Mach-O/ELF output |
+| `src/codegen/object.zig` | `src/bootstrap/codegen/object_boot.cot` | **Done** | Mach-O output (ARM64) |
 | `src/codegen/pe_coff.zig` | `src/bootstrap/codegen/pe_coff_boot.cot` | TODO | Windows PE/COFF output |
 | `src/debug.zig` | `src/bootstrap/debug_boot.cot` | **Done** | Debug output utilities |
 | `src/type_context.zig` | `src/bootstrap/type_context_boot.cot` | **Done** | Type context for checker |
 
-**Progress: 17/22 files complete**
+**Progress: 18/22 files complete**
 
 ---
 
@@ -202,6 +202,52 @@ After successful self-hosting:
 2. Each iteration: `cotN` compiles `cotN+1`
 3. Eventually support all features in wireframe .cot files
 4. Deprecate Zig bootstrap compiler
+
+---
+
+## Post-Bootstrap: Register Allocation Improvement
+
+### Current State (Bootstrap)
+
+The ARM64 codegen uses an ad-hoc register allocation strategy:
+- **x0-x7**: Function arguments and return values (ABI-defined)
+- **x9-x15**: Caller-saved temporaries (used for intermediate values)
+- **x16/x17**: IP (intra-procedure call) scratch registers
+- **x19-x28**: Callee-saved (spilled in prologue/restored in epilogue)
+
+**Bootstrap Fix (2026-01-13):** Arithmetic operations (genDiv, genAdd, genSub, genMul) were updated to use x16/x17 as scratch instead of x9. This prevents register clobbering bugs where x9 held a live value needed for later operations.
+
+### Post-Bootstrap: Go's Linear Scan Register Allocation
+
+After bootstrap is complete, implement proper register allocation following Go's approach:
+
+**1. Liveness Analysis** (`src/liveness.zig` / `liveness_boot.cot`)
+- Already implemented for basic live range tracking
+- Extend to track precise use/def points for each SSA value
+
+**2. Register Allocator** (new file: `src/regalloc.zig`)
+- **Linear scan algorithm:**
+  1. Sort SSA values by live range start position
+  2. Maintain "active" list of values currently in registers
+  3. For each value: expire old intervals, allocate register or spill
+- **Spill management:**
+  - When no registers available, spill least-recently-used value to stack
+  - Track spill slots to avoid reloading unnecessarily
+
+**3. Codegen Integration**
+- Replace `getValue()` → `getLocation()` that returns register or stack slot
+- Remove ad-hoc scratch register usage
+- Generate spill/reload code as directed by allocator
+
+**Reference Implementation:**
+- Go: `cmd/compile/internal/ssa/regalloc.go`
+- Zig: `lib/std/Target.zig` register definitions
+- LLVM: `lib/CodeGen/RegAllocLinearScan.cpp` (historical)
+
+**Benefits:**
+- Eliminates register clobbering bugs by design
+- Better code quality (fewer spills, better register utilization)
+- Cleaner codegen (no manual scratch register juggling)
 
 ---
 

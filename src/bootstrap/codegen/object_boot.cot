@@ -1,0 +1,783 @@
+// Object file generation for cot bootstrap.
+// Simplified version - Mach-O 64-bit for ARM64 only.
+//
+// Based on src/codegen/object.zig patterns.
+// For stage 1 bootstrap, we only need ARM64 Mach-O output.
+
+// =============================================================================
+// Mach-O Relocation Types
+// =============================================================================
+
+enum MachORelocARM64: u8 {
+    ARM64_RELOC_UNSIGNED,     // 0: Absolute address
+    ARM64_RELOC_SUBTRACTOR,   // 1: Must be followed by UNSIGNED
+    ARM64_RELOC_BRANCH26,     // 2: B/BL with 26-bit displacement
+    ARM64_RELOC_PAGE21,       // 3: ADRP page address
+    ARM64_RELOC_PAGEOFF12,    // 4: ADD page offset
+    ARM64_RELOC_GOT_LOAD_PAGE21,     // 5: GOT page
+    ARM64_RELOC_GOT_LOAD_PAGEOFF12,  // 6: GOT page offset
+    ARM64_RELOC_POINTER_TO_GOT,      // 7: Pointer to GOT
+    ARM64_RELOC_TLVP_LOAD_PAGE21,    // 8: TLV page
+    ARM64_RELOC_TLVP_LOAD_PAGEOFF12, // 9: TLV page offset
+    ARM64_RELOC_ADDEND,       // 10: Addend for following reloc
+}
+
+// =============================================================================
+// Relocation Kind (internal representation)
+// =============================================================================
+
+enum RelocKind: u8 {
+    pc_rel_32,        // PC-relative 32-bit (BL instruction)
+    aarch64_adrp,     // ADRP instruction
+    aarch64_add_lo12, // ADD with lo12 page offset
+    abs_64,           // Absolute 64-bit address
+    got_rel,          // GOT-relative
+    plt_rel,          // PLT-relative
+}
+
+fn relocKindToMachOARM64(kind: RelocKind) MachORelocARM64 {
+    if kind == RelocKind.pc_rel_32 {
+        return MachORelocARM64.ARM64_RELOC_BRANCH26
+    }
+    if kind == RelocKind.aarch64_adrp {
+        return MachORelocARM64.ARM64_RELOC_PAGE21
+    }
+    if kind == RelocKind.aarch64_add_lo12 {
+        return MachORelocARM64.ARM64_RELOC_PAGEOFF12
+    }
+    if kind == RelocKind.abs_64 {
+        return MachORelocARM64.ARM64_RELOC_UNSIGNED
+    }
+    // Default for got_rel and plt_rel
+    return MachORelocARM64.ARM64_RELOC_BRANCH26
+}
+
+fn isRelocPCRel(kind: RelocKind) bool {
+    if kind == RelocKind.pc_rel_32 { return true }
+    if kind == RelocKind.got_rel { return true }
+    if kind == RelocKind.plt_rel { return true }
+    if kind == RelocKind.aarch64_adrp { return true }
+    return false
+}
+
+fn getRelocLength(kind: RelocKind) int {
+    if kind == RelocKind.abs_64 {
+        return 3  // 8 bytes (2^3)
+    }
+    return 2  // 4 bytes (2^2)
+}
+
+// =============================================================================
+// Relocation
+// =============================================================================
+
+struct Relocation {
+    offset: int,      // Offset in section
+    symbol: string,   // Target symbol name
+    kind: RelocKind,
+    addend: int,
+}
+
+fn relocationNew(offset: int, symbol: string, kind: RelocKind, addend: int) Relocation {
+    return Relocation{
+        .offset = offset,
+        .symbol = symbol,
+        .kind = kind,
+        .addend = addend,
+    }
+}
+
+// =============================================================================
+// Symbol
+// =============================================================================
+
+enum SymbolKind: u8 {
+    func,       // Function symbol
+    data,       // Data symbol
+    external,   // External reference (undefined)
+    section,    // Section symbol
+}
+
+struct Symbol {
+    name: string,
+    kind: SymbolKind,
+    section: int,   // Section index
+    offset: int,    // Offset within section
+    size: int,      // Size of symbol
+    is_global: bool,
+}
+
+fn symbolNew(name: string, kind: SymbolKind, section: int, offset: int, size: int, is_global: bool) Symbol {
+    return Symbol{
+        .name = name,
+        .kind = kind,
+        .section = section,
+        .offset = offset,
+        .size = size,
+        .is_global = is_global,
+    }
+}
+
+fn symbolExternal(name: string) Symbol {
+    return Symbol{
+        .name = name,
+        .kind = SymbolKind.external,
+        .section = 0,
+        .offset = 0,
+        .size = 0,
+        .is_global = true,
+    }
+}
+
+// =============================================================================
+// Section
+// =============================================================================
+
+enum SectionKind: u8 {
+    text,    // Executable code
+    rodata,  // Read-only data
+    data,    // Initialized read-write data
+    bss,     // Uninitialized data
+}
+
+struct Section {
+    name: string,
+    kind: SectionKind,
+    data: List<int>,        // Bytes stored as ints
+    relocations: List<Relocation>,
+    alignment: int,
+    vaddr: int,
+}
+
+fn sectionNew(name: string, kind: SectionKind) Section {
+    return Section{
+        .name = name,
+        .kind = kind,
+        .data = new List<int>(),
+        .relocations = new List<Relocation>(),
+        .alignment = 16,
+        .vaddr = 0,
+    }
+}
+
+fn sectionAppendByte(sec: Section, b: int) void {
+    sec.data.push(b)
+}
+
+fn sectionAppendBytes(sec: Section, bytes: List<int>) void {
+    var i: int = 0
+    while i < len(bytes) {
+        sec.data.push(bytes.get(i))
+        i = i + 1
+    }
+}
+
+fn sectionSize(sec: Section) int {
+    return len(sec.data)
+}
+
+fn sectionAddRelocation(sec: Section, reloc: Relocation) void {
+    sec.relocations.push(reloc)
+}
+
+// =============================================================================
+// Object File
+// =============================================================================
+
+struct ObjectFile {
+    sections: List<Section>,
+    symbols: List<Symbol>,
+    strtab: List<int>,  // String table (bytes as ints)
+}
+
+fn objectFileNew() ObjectFile {
+    var obj: ObjectFile = ObjectFile{
+        .sections = new List<Section>(),
+        .symbols = new List<Symbol>(),
+        .strtab = new List<int>(),
+    }
+    // Add null byte at start of string table
+    obj.strtab.push(0)
+    return obj
+}
+
+fn objectAddSection(obj: ObjectFile, name: string, kind: SectionKind) int {
+    var idx: int = len(obj.sections)
+    var sec: Section = sectionNew(name, kind)
+    obj.sections.push(sec)
+    return idx
+}
+
+fn objectGetSection(obj: ObjectFile, idx: int) Section {
+    return obj.sections.get(idx)
+}
+
+fn objectAddSymbol(obj: ObjectFile, sym: Symbol) int {
+    var idx: int = len(obj.symbols)
+    obj.symbols.push(sym)
+    return idx
+}
+
+fn objectAddExternalSymbol(obj: ObjectFile, name: string) int {
+    // Check if already exists
+    var i: int = 0
+    while i < len(obj.symbols) {
+        var sym: Symbol = obj.symbols.get(i)
+        if sym.name == name {
+            return i
+        }
+        i = i + 1
+    }
+    // Add new external symbol
+    return objectAddSymbol(obj, symbolExternal(name))
+}
+
+fn objectGetSymbolIndex(obj: ObjectFile, name: string) int {
+    // Look up existing symbol
+    var i: int = 0
+    while i < len(obj.symbols) {
+        var sym: Symbol = obj.symbols.get(i)
+        if sym.name == name {
+            return i
+        }
+        i = i + 1
+    }
+    // Not found - add as external
+    return objectAddExternalSymbol(obj, name)
+}
+
+fn objectFindSymbol(obj: ObjectFile, name: string) int {
+    var i: int = 0
+    while i < len(obj.symbols) {
+        var sym: Symbol = obj.symbols.get(i)
+        if sym.name == name {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1  // Not found
+}
+
+// =============================================================================
+// Output Buffer (simplified - would use file I/O in real compiler)
+// =============================================================================
+
+struct OutputBuffer {
+    bytes: List<int>,
+}
+
+fn outputBufferNew() OutputBuffer {
+    return OutputBuffer{
+        .bytes = new List<int>(),
+    }
+}
+
+fn outputWriteByte(buf: OutputBuffer, b: int) void {
+    buf.bytes.push(b % 256)
+}
+
+fn outputWriteU16LE(buf: OutputBuffer, val: int) void {
+    outputWriteByte(buf, val % 256)
+    outputWriteByte(buf, (val / 256) % 256)
+}
+
+fn outputWriteU32LE(buf: OutputBuffer, val: int) void {
+    outputWriteByte(buf, val % 256)
+    outputWriteByte(buf, (val / 256) % 256)
+    outputWriteByte(buf, (val / 65536) % 256)
+    outputWriteByte(buf, (val / 16777216) % 256)
+}
+
+fn outputWriteU64LE(buf: OutputBuffer, val: int) void {
+    outputWriteU32LE(buf, val % 4294967296)
+    outputWriteU32LE(buf, val / 4294967296)
+}
+
+fn outputWriteBytes(buf: OutputBuffer, bytes: List<int>) void {
+    var i: int = 0
+    while i < len(bytes) {
+        buf.bytes.push(bytes.get(i))
+        i = i + 1
+    }
+}
+
+fn outputWriteZeros(buf: OutputBuffer, count: int) void {
+    var i: int = 0
+    while i < count {
+        buf.bytes.push(0)
+        i = i + 1
+    }
+}
+
+fn outputWriteString(buf: OutputBuffer, s: string) void {
+    var i: int = 0
+    while i < len(s) {
+        buf.bytes.push(s[i])
+        i = i + 1
+    }
+}
+
+fn outputWriteStringPadded(buf: OutputBuffer, s: string, pad_len: int) void {
+    var i: int = 0
+    while i < len(s) and i < pad_len {
+        buf.bytes.push(s[i])
+        i = i + 1
+    }
+    while i < pad_len {
+        buf.bytes.push(0)
+        i = i + 1
+    }
+}
+
+fn outputSize(buf: OutputBuffer) int {
+    return len(buf.bytes)
+}
+
+// =============================================================================
+// Mach-O Constants
+// =============================================================================
+
+const MH_MAGIC_64: int = 0xFEEDFACF
+const CPU_TYPE_ARM64: int = 0x0100000C
+const CPU_SUBTYPE_ARM64_ALL: int = 0
+const MH_OBJECT: int = 1
+const MH_SUBSECTIONS_VIA_SYMBOLS: int = 0x2000
+
+const LC_SEGMENT_64: int = 0x19
+const LC_SYMTAB: int = 0x02
+
+const N_EXT: int = 0x01
+const N_UNDF: int = 0x00
+const N_SECT: int = 0x0e
+
+const S_REGULAR: int = 0x0
+const S_ZEROFILL: int = 0x1
+const S_ATTR_PURE_INSTRUCTIONS: int = 0x80000000
+const S_ATTR_SOME_INSTRUCTIONS: int = 0x00000400
+
+// =============================================================================
+// Mach-O Writer
+// =============================================================================
+
+fn writeMachORelocationInfo(buf: OutputBuffer, r_address: int, r_symbolnum: int, r_pcrel: int, r_length: int, r_extern: int, r_type: int) void {
+    // Write r_address (4 bytes)
+    outputWriteU32LE(buf, r_address)
+
+    // Pack remaining fields into u32
+    var word: int = r_symbolnum
+    word = word + (r_pcrel * 16777216)   // bit 24
+    word = word + (r_length * 33554432)  // bits 25-26
+    word = word + (r_extern * 134217728) // bit 27
+    word = word + (r_type * 268435456)   // bits 28-31
+    outputWriteU32LE(buf, word)
+}
+
+fn writeMachOSection(buf: OutputBuffer, sec: Section, file_offset: int, reloff: int, nreloc: int) void {
+    // Section name (16 bytes, null-padded)
+    outputWriteStringPadded(buf, sec.name, 16)
+
+    // Segment name (16 bytes)
+    var segname: string = "__TEXT"
+    if sec.kind == SectionKind.data {
+        segname = "__DATA"
+    }
+    if sec.kind == SectionKind.bss {
+        segname = "__DATA"
+    }
+    outputWriteStringPadded(buf, segname, 16)
+
+    // addr, size
+    outputWriteU64LE(buf, 0)  // addr (filled at link time)
+    outputWriteU64LE(buf, sectionSize(sec))  // size
+
+    // offset, align
+    outputWriteU32LE(buf, file_offset)  // offset
+    outputWriteU32LE(buf, 4)  // align (2^4 = 16)
+
+    // reloff, nreloc
+    outputWriteU32LE(buf, reloff)
+    outputWriteU32LE(buf, nreloc)
+
+    // flags
+    var sec_type: int = S_REGULAR
+    var sec_attrs: int = 0
+    if sec.kind == SectionKind.text {
+        sec_attrs = S_ATTR_PURE_INSTRUCTIONS + S_ATTR_SOME_INSTRUCTIONS
+    }
+    if sec.kind == SectionKind.bss {
+        sec_type = S_ZEROFILL
+    }
+    outputWriteU32LE(buf, sec_type + sec_attrs)
+
+    // reserved1, reserved2, reserved3
+    outputWriteU32LE(buf, 0)
+    outputWriteU32LE(buf, 0)
+    outputWriteU32LE(buf, 0)
+}
+
+fn countSectionRelocations(obj: ObjectFile, sec_idx: int) int {
+    var sec: Section = obj.sections.get(sec_idx)
+    var count: int = 0
+
+    var i: int = 0
+    while i < len(sec.relocations) {
+        var reloc: Relocation = sec.relocations.get(i)
+
+        // Skip pc_rel_32 for local function symbols (already patched)
+        if reloc.kind == RelocKind.pc_rel_32 {
+            var sym_idx: int = objectFindSymbol(obj, reloc.symbol)
+            if sym_idx >= 0 {
+                var sym: Symbol = obj.symbols.get(sym_idx)
+                if sym.kind == SymbolKind.func {
+                    // Skip local function call
+                    i = i + 1
+                    continue
+                }
+            }
+        }
+        count = count + 1
+        i = i + 1
+    }
+    return count
+}
+
+fn writeMachO64(obj: ObjectFile, buf: OutputBuffer) void {
+    // Sizes
+    var header_size: int = 32
+    var segment_cmd_size: int = 72
+    var section_hdr_size: int = 80
+    var symtab_cmd_size: int = 24
+    var reloc_entry_size: int = 8
+    var nlist_size: int = 16
+
+    var num_sections: int = len(obj.sections)
+    var load_cmds_size: int = segment_cmd_size + (num_sections * section_hdr_size) + symtab_cmd_size
+
+    // Calculate section data size
+    var section_data_size: int = 0
+    var sec_idx: int = 0
+    while sec_idx < num_sections {
+        section_data_size = section_data_size + sectionSize(obj.sections.get(sec_idx))
+        sec_idx = sec_idx + 1
+    }
+
+    // Count relocations per section
+    var total_reloc_count: int = 0
+    sec_idx = 0
+    while sec_idx < num_sections {
+        total_reloc_count = total_reloc_count + countSectionRelocations(obj, sec_idx)
+        sec_idx = sec_idx + 1
+    }
+    var total_reloc_size: int = total_reloc_count * reloc_entry_size
+
+    // File layout
+    var section_data_start: int = header_size + load_cmds_size
+    var reloc_start: int = section_data_start + section_data_size
+    var symtab_start: int = reloc_start + total_reloc_size
+
+    // Symbol and string table sizes
+    var nsyms: int = len(obj.symbols)
+    var strtab_start: int = symtab_start + (nsyms * nlist_size)
+
+    var strtab_size: int = 1  // Start with null byte
+    var sym_idx: int = 0
+    while sym_idx < nsyms {
+        var sym: Symbol = obj.symbols.get(sym_idx)
+        strtab_size = strtab_size + len(sym.name) + 1
+        sym_idx = sym_idx + 1
+    }
+
+    // === Write Mach-O header (32 bytes) ===
+    outputWriteU32LE(buf, MH_MAGIC_64)
+    outputWriteU32LE(buf, CPU_TYPE_ARM64)
+    outputWriteU32LE(buf, CPU_SUBTYPE_ARM64_ALL)
+    outputWriteU32LE(buf, MH_OBJECT)
+    outputWriteU32LE(buf, 2)  // ncmds (segment + symtab)
+    outputWriteU32LE(buf, load_cmds_size)
+    outputWriteU32LE(buf, MH_SUBSECTIONS_VIA_SYMBOLS)
+    outputWriteU32LE(buf, 0)  // reserved
+
+    // === LC_SEGMENT_64 command ===
+    outputWriteU32LE(buf, LC_SEGMENT_64)
+    outputWriteU32LE(buf, segment_cmd_size + (num_sections * section_hdr_size))
+    outputWriteZeros(buf, 16)  // segname (empty for object files)
+    outputWriteU64LE(buf, 0)   // vmaddr
+    outputWriteU64LE(buf, section_data_size)  // vmsize
+    outputWriteU64LE(buf, section_data_start) // fileoff
+    outputWriteU64LE(buf, section_data_size)  // filesize
+    outputWriteU32LE(buf, 7)   // maxprot (rwx)
+    outputWriteU32LE(buf, 7)   // initprot
+    outputWriteU32LE(buf, num_sections)
+    outputWriteU32LE(buf, 0)   // flags
+
+    // === Section headers ===
+    var section_file_offset: int = section_data_start
+    var section_reloc_offset: int = reloc_start
+    sec_idx = 0
+    while sec_idx < num_sections {
+        var sec: Section = obj.sections.get(sec_idx)
+        var nreloc: int = countSectionRelocations(obj, sec_idx)
+        var reloff: int = 0
+        if nreloc > 0 {
+            reloff = section_reloc_offset
+        }
+        writeMachOSection(buf, sec, section_file_offset, reloff, nreloc)
+        section_file_offset = section_file_offset + sectionSize(sec)
+        section_reloc_offset = section_reloc_offset + (nreloc * reloc_entry_size)
+        sec_idx = sec_idx + 1
+    }
+
+    // === LC_SYMTAB command ===
+    outputWriteU32LE(buf, LC_SYMTAB)
+    outputWriteU32LE(buf, symtab_cmd_size)
+    outputWriteU32LE(buf, symtab_start)
+    outputWriteU32LE(buf, nsyms)
+    outputWriteU32LE(buf, strtab_start)
+    outputWriteU32LE(buf, strtab_size)
+
+    // === Section data ===
+    sec_idx = 0
+    while sec_idx < num_sections {
+        var sec: Section = obj.sections.get(sec_idx)
+        outputWriteBytes(buf, sec.data)
+        sec_idx = sec_idx + 1
+    }
+
+    // === Relocations ===
+    sec_idx = 0
+    while sec_idx < num_sections {
+        var sec: Section = obj.sections.get(sec_idx)
+        var reloc_idx: int = 0
+        while reloc_idx < len(sec.relocations) {
+            var reloc: Relocation = sec.relocations.get(reloc_idx)
+
+            // Skip pc_rel_32 for local function symbols
+            if reloc.kind == RelocKind.pc_rel_32 {
+                var found_idx: int = objectFindSymbol(obj, reloc.symbol)
+                if found_idx >= 0 {
+                    var sym: Symbol = obj.symbols.get(found_idx)
+                    if sym.kind == SymbolKind.func {
+                        reloc_idx = reloc_idx + 1
+                        continue
+                    }
+                }
+            }
+
+            var target_sym_idx: int = objectGetSymbolIndex(obj, reloc.symbol)
+            var r_type: int = @intFromEnum(relocKindToMachOARM64(reloc.kind))
+            var r_pcrel: int = 0
+            if isRelocPCRel(reloc.kind) {
+                r_pcrel = 1
+            }
+            var r_length: int = getRelocLength(reloc.kind)
+
+            writeMachORelocationInfo(buf, reloc.offset, target_sym_idx, r_pcrel, r_length, 1, r_type)
+            reloc_idx = reloc_idx + 1
+        }
+        sec_idx = sec_idx + 1
+    }
+
+    // === Symbol table ===
+    var str_offset: int = 1  // Skip initial null
+    sym_idx = 0
+    while sym_idx < nsyms {
+        var sym: Symbol = obj.symbols.get(sym_idx)
+
+        // n_strx
+        outputWriteU32LE(buf, str_offset)
+
+        // n_type
+        var n_type: int = N_SECT + N_EXT
+        if sym.kind == SymbolKind.external {
+            n_type = N_UNDF + N_EXT
+        }
+        outputWriteByte(buf, n_type)
+
+        // n_sect
+        var n_sect: int = sym.section + 1
+        if sym.kind == SymbolKind.external {
+            n_sect = 0
+        }
+        outputWriteByte(buf, n_sect)
+
+        // n_desc
+        outputWriteU16LE(buf, 0)
+
+        // n_value
+        outputWriteU64LE(buf, sym.offset)
+
+        str_offset = str_offset + len(sym.name) + 1
+        sym_idx = sym_idx + 1
+    }
+
+    // === String table ===
+    outputWriteByte(buf, 0)  // Initial null byte
+    sym_idx = 0
+    while sym_idx < nsyms {
+        var sym: Symbol = obj.symbols.get(sym_idx)
+        outputWriteString(buf, sym.name)
+        outputWriteByte(buf, 0)  // Null terminator
+        sym_idx = sym_idx + 1
+    }
+}
+
+// =============================================================================
+// Apply Local Relocations (patch BL instructions)
+// =============================================================================
+
+fn applyLocalRelocations(obj: ObjectFile) void {
+    var sec_idx: int = 0
+    while sec_idx < len(obj.sections) {
+        var sec: Section = obj.sections.get(sec_idx)
+
+        var reloc_idx: int = 0
+        while reloc_idx < len(sec.relocations) {
+            var reloc: Relocation = sec.relocations.get(reloc_idx)
+
+            // Only patch pc_rel_32 (BL instructions) for local functions
+            if reloc.kind == RelocKind.pc_rel_32 {
+                var target_idx: int = objectFindSymbol(obj, reloc.symbol)
+                if target_idx >= 0 {
+                    var target_sym: Symbol = obj.symbols.get(target_idx)
+
+                    // Compute relative offset for BL instruction
+                    var reloc_offset: int = reloc.offset
+                    var target_offset: int = target_sym.offset
+                    var signed_offset: int = target_offset - reloc_offset
+                    var inst_offset: int = signed_offset / 4
+
+                    // Read existing instruction
+                    var inst: int = sec.data.get(reloc_offset)
+                    inst = inst + (sec.data.get(reloc_offset + 1) * 256)
+                    inst = inst + (sec.data.get(reloc_offset + 2) * 65536)
+                    inst = inst + (sec.data.get(reloc_offset + 3) * 16777216)
+
+                    // Mask out old offset, insert new offset
+                    inst = inst / 67108864 * 67108864  // Keep opcode (top 6 bits)
+                    var masked_offset: int = inst_offset
+                    if masked_offset < 0 {
+                        masked_offset = masked_offset + 67108864  // Handle negative
+                    }
+                    masked_offset = masked_offset % 67108864  // 26 bits
+                    inst = inst + masked_offset
+
+                    // Write back
+                    sec.data[reloc_offset] = inst % 256
+                    sec.data[reloc_offset + 1] = (inst / 256) % 256
+                    sec.data[reloc_offset + 2] = (inst / 65536) % 256
+                    sec.data[reloc_offset + 3] = (inst / 16777216) % 256
+                }
+            }
+
+            reloc_idx = reloc_idx + 1
+        }
+        sec_idx = sec_idx + 1
+    }
+}
+
+// =============================================================================
+// Test
+// =============================================================================
+
+fn main() int {
+    // Test relocation kind conversion
+    var rk: RelocKind = RelocKind.pc_rel_32
+    var macho_rk: MachORelocARM64 = relocKindToMachOARM64(rk)
+    if macho_rk != MachORelocARM64.ARM64_RELOC_BRANCH26 {
+        return 1
+    }
+
+    if not isRelocPCRel(RelocKind.pc_rel_32) {
+        return 2
+    }
+    if isRelocPCRel(RelocKind.abs_64) {
+        return 3
+    }
+
+    if getRelocLength(RelocKind.pc_rel_32) != 2 {
+        return 4
+    }
+    if getRelocLength(RelocKind.abs_64) != 3 {
+        return 5
+    }
+
+    // Test symbol creation
+    var sym: Symbol = symbolNew("_main", SymbolKind.func, 0, 0, 100, true)
+    if sym.name != "_main" {
+        return 6
+    }
+    if sym.kind != SymbolKind.func {
+        return 7
+    }
+
+    var ext_sym: Symbol = symbolExternal("_printf")
+    if ext_sym.kind != SymbolKind.external {
+        return 8
+    }
+
+    // Test section creation
+    var sec: Section = sectionNew("__text", SectionKind.text)
+    if sec.name != "__text" {
+        return 9
+    }
+    if sec.kind != SectionKind.text {
+        return 10
+    }
+
+    sectionAppendByte(sec, 0xAA)
+    sectionAppendByte(sec, 0xBB)
+    if sectionSize(sec) != 2 {
+        return 11
+    }
+
+    // Test object file
+    var obj: ObjectFile = objectFileNew()
+    var text_idx: int = objectAddSection(obj, "__text", SectionKind.text)
+    if text_idx != 0 {
+        return 12
+    }
+
+    var sym_idx: int = objectAddSymbol(obj, sym)
+    if sym_idx != 0 {
+        return 13
+    }
+
+    var found_idx: int = objectGetSymbolIndex(obj, "_main")
+    if found_idx != 0 {
+        return 14
+    }
+
+    var ext_idx: int = objectAddExternalSymbol(obj, "_printf")
+    if ext_idx != 1 {
+        return 15
+    }
+
+    // Test output buffer
+    var buf: OutputBuffer = outputBufferNew()
+    outputWriteByte(buf, 0x42)
+    if outputSize(buf) != 1 {
+        return 16
+    }
+    if buf.bytes.get(0) != 0x42 {
+        return 17
+    }
+
+    outputWriteU32LE(buf, 0x12345678)
+    if outputSize(buf) != 5 {
+        return 18
+    }
+    // Little-endian: 0x78, 0x56, 0x34, 0x12
+    if buf.bytes.get(1) != 0x78 {
+        return 19
+    }
+    if buf.bytes.get(4) != 0x12 {
+        return 20
+    }
+
+    // Test Mach-O constants
+    if MH_MAGIC_64 != 0xFEEDFACF {
+        return 21
+    }
+
+    return 42
+}

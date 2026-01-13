@@ -33,10 +33,10 @@ zig build test                    # 135+ embedded tests
 
 | Progress | Count | Status |
 |----------|-------|--------|
-| Bootstrap .cot files done | 17/22 | 77% |
+| Bootstrap .cot files done | 18/22 | 82% |
 | Zig source files | 22 | Reference implementation |
 
-**Completed:** `token_boot.cot`, `source_boot.cot`, `scanner_boot.cot`, `ast_boot.cot`, `types_boot.cot`, `errors_boot.cot`, `parser_boot.cot`, `check_boot.cot`, `ir_boot.cot`, `lower_boot.cot`, `ssa_boot.cot`, `liveness_boot.cot`, `type_context_boot.cot`, `debug_boot.cot`, `backend_boot.cot`, `aarch64_boot.cot`, `arm64_boot.cot`
+**Completed:** `token_boot.cot`, `source_boot.cot`, `scanner_boot.cot`, `ast_boot.cot`, `types_boot.cot`, `errors_boot.cot`, `parser_boot.cot`, `check_boot.cot`, `ir_boot.cot`, `lower_boot.cot`, `ssa_boot.cot`, `liveness_boot.cot`, `type_context_boot.cot`, `debug_boot.cot`, `backend_boot.cot`, `aarch64_boot.cot`, `arm64_boot.cot`, `object_boot.cot`
 
 ---
 
