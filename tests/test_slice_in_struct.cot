@@ -1,0 +1,42 @@
+// Test: Slice expression directly in struct init field
+// BUG-007: Slice expressions in struct init fields return wrong values
+
+struct Result {
+    text: string,
+    value: int,
+}
+
+fn getResultDirect(content: string, start: int, end_pos: int) Result {
+    // BROKEN pattern - slice directly in struct init
+    return Result{ .text = content[start:end_pos], .value = 42 }
+}
+
+fn getResultExtract(content: string, start: int, end_pos: int) Result {
+    // WORKING pattern - extract to local first
+    var slice_text: string = content[start:end_pos]
+    return Result{ .text = slice_text, .value = 42 }
+}
+
+fn main() int {
+    var content: string = "hello world"
+
+    // Test extract pattern first (should work)
+    var r1: Result = getResultExtract(content, 0, 5)
+    if len(r1.text) != 5 {
+        return 1  // Extract pattern failed
+    }
+    if r1.value != 42 {
+        return 2
+    }
+
+    // Test direct pattern (may fail due to bug)
+    var r2: Result = getResultDirect(content, 0, 5)
+    if len(r2.text) != 5 {
+        return 3  // Direct pattern failed - BUG-007
+    }
+    if r2.value != 42 {
+        return 4
+    }
+
+    return 42
+}

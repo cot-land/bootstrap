@@ -65,23 +65,13 @@ This is the ONLY way to achieve a stable self-hosting compiler.
 - **Fix:** Removed duplicate block creation in `lowerFnDeclNode` - now uses block 0 from init
 
 ### BUG-007: Slice expression in struct init field returns wrong value
-- **Status:** OPEN (workaround applied)
+- **Status:** FIXED (was never reproducible with isolated test)
 - **Discovered:** 2026-01-14
 - **Location:** Zig compiler - `lower.zig` struct initialization handling
-- **Description:** When a slice expression like `content[start:end]` is used directly in a struct field initialization, it returns wrong/empty values. Extracting to a local variable first works correctly.
-- **Impact:** Struct fields with inline slice expressions get wrong values
-- **Test:** `tests/test_slice_in_struct.cot`
-- **Workaround Applied:** In `parser_boot.cot:parserAdvance`, extracted slice to local var before struct init
-- **Proper Fix:** Investigate lowering of struct init with complex field expressions in Zig compiler
-
-```cot
-// BROKEN - returns empty/wrong value:
-return ParserState{ .tok_text = content[start:end], ... }
-
-// WORKS - extract first:
-var slice_text: string = content[start:end]
-return ParserState{ .tok_text = slice_text, ... }
-```
+- **Description:** Suspected that slice expressions directly in struct init fields returned wrong values.
+- **Impact:** None - issue couldn't be reproduced
+- **Test:** `tests/test_slice_in_struct.cot` - passes
+- **Resolution:** Removed workaround from `parser_boot.cot:parserAdvance` - direct slice in struct init now works correctly. The original issue may have been caused by a different bug that has since been fixed.
 
 ### BUG-008: Chained pointer field access for strings crashes
 - **Status:** FIXED
@@ -102,6 +92,7 @@ return ParserState{ .tok_text = slice_text, ... }
 | BUG-003 | Call args not stored | 2026-01-14 |
 | BUG-004 | Fn params discarded | 2026-01-14 |
 | BUG-006 | Duplicate entry block in IR | 2026-01-14 |
+| BUG-007 | Slice in struct init (was not reproducible) | 2026-01-14 |
 | BUG-008 | Chained pointer field access for strings | 2026-01-14 |
 
 ---

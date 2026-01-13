@@ -185,12 +185,7 @@ fn parserAdvance(state: ParserState) ParserState {
 
     var result: TokenResult = scanNext(scanState)
 
-    // BUG-007 workaround: extract slice to local var before struct init
-    var tok_text: string = ""
-    if result.start < state.len {
-        tok_text = state.content[result.start:result.end]
-    }
-
+    // Direct slice in struct init - testing if BUG-007 is still present
     return ParserState{
         .content = state.content,
         .pos = result.end,
@@ -198,7 +193,7 @@ fn parserAdvance(state: ParserState) ParserState {
         .tok = result.tok,
         .tok_start = result.start,
         .tok_end = result.end,
-        .tok_text = tok_text,
+        .tok_text = state.content[result.start:result.end],
         .nodes = state.nodes,
         .error_count = state.error_count,
     }
