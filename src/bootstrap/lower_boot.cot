@@ -646,6 +646,13 @@ fn lowerExprNode(l: *Lowerer, fb: *IRFuncBuilder, node_idx: NodeIndex) NodeIndex
     if tag == NodeTag.paren_expr {
         return lowerExprNode(l, fb, node.left)
     }
+    if tag == NodeTag.struct_init {
+        // TODO: Implement struct init lowering
+        // For now, struct init requires type info (field offsets)
+        // Parser now captures field inits in node.args (BUG-005 fix)
+        println("DEBUG: struct_init lowering not yet implemented")
+        return null_node
+    }
     return null_node
 }
 

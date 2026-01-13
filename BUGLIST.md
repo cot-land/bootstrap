@@ -45,13 +45,14 @@ This is the ONLY way to achieve a stable self-hosting compiler.
 - **Fix:** Added `param` NodeTag, store params in list, assign to `node.args`
 
 ### BUG-005: Struct init fields not stored
-- **Status:** OPEN
+- **Status:** PARTIAL FIX
 - **Discovered:** 2026-01-14
-- **Location:** `parser_boot.cot:865-898`
-- **Description:** Struct field initializers are parsed but not stored in node
+- **Location:** `parser_boot.cot:624-672`
+- **Description:** Struct field initializers were parsed but not stored in node
 - **Impact:** Struct initialization won't work
 - **Test:** `tests/test_struct_init.cot`
-- **Fix:** TBD - need field storage mechanism
+- **Fix (Parser):** Added `struct_init_field` NodeTag, parse each `.field = value` into field nodes, store in `struct_init.args`
+- **Remaining:** Lowering still needs type info (field offsets) to emit proper IR
 
 ### BUG-006: Duplicate entry block in IR
 - **Status:** OPEN

@@ -99,6 +99,9 @@ enum NodeTag: u8 {
     switch_expr,
     switch_case,
 
+    // Struct initialization
+    struct_init_field,
+
     // Special
     bad_node,
 }
@@ -623,11 +626,13 @@ fn parseFieldAccess(state: ParserState, base: NodeIndex) ParseResult {
 
 fn parseStructInit(state: ParserState, type_name: string, start: Pos) ParseResult {
     var current: ParserState = parserAdvance(state)  // consume '{'
+    var fields: List<NodeIndex> = new List<NodeIndex>()
 
     // Parse field initializers
     while current.tok != Token.rbrace and current.tok != Token.eof {
         // Expect .field = value
         if current.tok == Token.dot {
+            var field_start: Pos = parserPos(current)
             current = parserAdvance(current)
             if current.tok == Token.identifier {
                 var field_name: string = current.tok_text
@@ -637,6 +642,15 @@ fn parseStructInit(state: ParserState, type_name: string, start: Pos) ParseResul
                 var val_result: ParseResult = parseExpr(current)
                 if val_result.node_idx != null_node {
                     current = val_result.state
+
+                    // Create field init node (BUG-005 fix)
+                    var field_span: Span = spanInit(field_start, parserPos(current))
+                    var field_node: Node = makeNode(NodeTag.struct_init_field, field_span)
+                    field_node.name = field_name
+                    field_node.left = val_result.node_idx
+                    var field_result: ParseResult = addNode(current, field_node)
+                    current = field_result.state
+                    fields.push(field_result.node_idx)
                 }
             }
         }
@@ -653,6 +667,7 @@ fn parseStructInit(state: ParserState, type_name: string, start: Pos) ParseResul
     var span: Span = spanInit(start, parserPos(current))
     var node: Node = makeNode(NodeTag.struct_init, span)
     node.name = type_name
+    node.args = fields
     return addNode(current, node)
 }
 
