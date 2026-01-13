@@ -121,6 +121,7 @@ t2
 t3
 cot0
 cot1
+a.out
 
 # Bootstrap test artifacts
 tests/bootstrap/

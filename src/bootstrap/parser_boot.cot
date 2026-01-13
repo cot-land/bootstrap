@@ -154,10 +154,21 @@ struct ParserState {
 }
 
 fn parserInit(content: string) ParserState {
+    var content_length: int = len(content)
+    println("DEBUG: parserInit content len")
+    if content_length < 10 {
+        println("DEBUG: initial content_length < 10")
+    } else if content_length < 30 {
+        println("DEBUG: initial content_length 10-29")
+    } else if content_length < 50 {
+        println("DEBUG: initial content_length 30-49 - expected")
+    } else {
+        println("DEBUG: initial content_length >= 50")
+    }
     var state: ParserState = ParserState{
         .content = content,
         .pos = 0,
-        .len = len(content),
+        .len = content_length,
         .tok = Token.eof,
         .tok_start = 0,
         .tok_end = 0,
@@ -226,8 +237,19 @@ fn parserAdvance(state: ParserState) ParserState {
 
     // Number
     if isDigit(c) {
-        while end < state.len and (isDigit(state.content[end]) or state.content[end] == 95) {
-            end = end + 1
+        // Use a simpler loop structure to avoid potential and/or issues
+        var scanning: bool = true
+        while scanning {
+            if end >= state.len {
+                scanning = false
+            } else {
+                var nc: u8 = state.content[end]
+                if isDigit(nc) or nc == 95 {
+                    end = end + 1
+                } else {
+                    scanning = false
+                }
+            }
         }
         // Check for float
         if end < state.len and state.content[end] == 46 {
@@ -391,6 +413,19 @@ fn parserAdvance(state: ParserState) ParserState {
         if next == 63 { tok = Token.question_question; end = end + 1 }
         else if next == 46 { tok = Token.question_dot; end = end + 1 }
         else { tok = Token.question }
+    }
+
+    // Debug: check state.len before return
+    if c == 123 {
+        println("DEBUG: parserAdvance returning lbrace")
+        var return_len: int = state.len
+        if return_len < 10 {
+            println("DEBUG: INSIDE parserAdvance state.len < 10 - CORRUPT BEFORE RETURN")
+        } else if return_len < 50 {
+            println("DEBUG: INSIDE parserAdvance state.len 10-49 - OK")
+        } else {
+            println("DEBUG: INSIDE parserAdvance state.len >= 50")
+        }
     }
 
     return ParserState{
@@ -1291,23 +1326,76 @@ fn parseForStmt(state: ParserState) ParseResult {
 }
 
 fn parseBlockStmt(state: ParserState) ParseResult {
+    println("DEBUG: parseBlockStmt enter - NEW CODE")
+    println("DEBUG: state.pos before expect:")
+    var before_pos: int = state.pos
+    if before_pos == 0 {
+        println("DEBUG: before_pos is 0")
+    } else if before_pos < 20 {
+        println("DEBUG: before_pos < 20")
+    } else {
+        println("DEBUG: before_pos >= 20")
+    }
     var start: Pos = parserPos(state)
     var current: ParserState = parserExpect(state, Token.lbrace)
+    println("DEBUG: after expect lbrace")
+    var after_pos: int = current.pos
+    var content_len: int = current.len
+    if content_len < 10 {
+        println("DEBUG: content_len < 10 - WRONG!")
+    } else if content_len < 30 {
+        println("DEBUG: content_len 10-29")
+    } else if content_len < 50 {
+        println("DEBUG: content_len 30-49 - expected range")
+    } else {
+        println("DEBUG: content_len >= 50")
+    }
+    if after_pos >= content_len {
+        println("DEBUG: after_pos >= content_len - THIS IS THE ISSUE")
+    } else {
+        println("DEBUG: after_pos < content_len - OK")
+    }
+
+    // Collect statement node indices
+    var stmts: List<NodeIndex> = new List<NodeIndex>()
+    println("DEBUG: created stmts list")
+
+    if current.tok == Token.rbrace {
+        println("DEBUG: tok is RBRACE already!")
+    } else if current.tok == Token.eof {
+        println("DEBUG: tok is EOF!")
+    } else {
+        println("DEBUG: tok is something else, entering loop")
+    }
 
     while current.tok != Token.rbrace and current.tok != Token.eof {
+        println("DEBUG: parsing stmt in block")
         var stmt_result: ParseResult = parseStmt(current)
         if stmt_result.node_idx != null_node {
+            println("DEBUG: got valid stmt, pushing to stmts")
+            stmts.push(stmt_result.node_idx)
             current = stmt_result.state
         } else {
+            println("DEBUG: null stmt, skipping")
             // Error recovery: skip token
             current = parserAdvance(current)
         }
     }
+    println("DEBUG: done parsing stmts")
 
     current = parserExpect(current, Token.rbrace)
 
+    var stmts_count: int = len(stmts)
+    if stmts_count == 0 {
+        println("DEBUG: stmts list is empty before assign!")
+    } else {
+        println("DEBUG: stmts has items")
+    }
+
     var span: Span = spanInit(start, parserPos(current))
     var node: Node = makeNode(NodeTag.block_stmt, span)
+    node.args = stmts
+    println("DEBUG: assigned stmts to node.args")
     return addNode(current, node)
 }
 
@@ -1466,6 +1554,17 @@ fn parseDecl(state: ParserState) ParseResult {
 }
 
 fn parseFnDecl(state: ParserState) ParseResult {
+    println("DEBUG: parseFnDecl enter")
+    var fn_len: int = state.len
+    if fn_len < 10 {
+        println("DEBUG: parseFnDecl state.len < 10 - BAD")
+    } else if fn_len < 30 {
+        println("DEBUG: parseFnDecl state.len 10-29")
+    } else if fn_len < 50 {
+        println("DEBUG: parseFnDecl state.len 30-49 - expected")
+    } else {
+        println("DEBUG: parseFnDecl state.len >= 50")
+    }
     var start: Pos = parserPos(state)
     var current: ParserState = parserAdvance(state)  // consume 'fn'
 

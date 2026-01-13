@@ -161,17 +161,14 @@ fn sectionNew(name: string, kind: SectionKind) Section {
 }
 
 fn sectionAppendByte(sec: *Section, b: int) void {
-    // Workaround: dereference pointer and extract list to avoid corruption
-    // when large structs are passed by value
-    var s: Section = sec.*
-    s.data.push(b)
+    // Access data field directly through pointer
+    sec.*.data.push(b)
 }
 
 fn sectionAppendBytes(sec: *Section, bytes: List<int>) void {
     var i: int = 0
     while i < len(bytes) {
-        var s: Section = sec.*
-        s.data.push(bytes.get(i))
+        sec.*.data.push(bytes.get(i))
         i = i + 1
     }
 }
@@ -215,6 +212,10 @@ fn objectAddSection(obj: ObjectFile, name: string, kind: SectionKind) int {
 
 fn objectGetSection(obj: ObjectFile, idx: int) Section {
     return obj.sections.get(idx)
+}
+
+fn objectSetSection(obj: ObjectFile, idx: int, sec: Section) void {
+    obj.sections[idx] = sec
 }
 
 fn objectAddSymbol(obj: ObjectFile, sym: Symbol) int {

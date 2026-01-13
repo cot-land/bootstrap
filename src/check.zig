@@ -191,6 +191,16 @@ pub const Checker = struct {
     }
 
     // ========================================================================
+    // Expression type lookup
+    // ========================================================================
+
+    /// Get the cached type of an expression node.
+    /// Returns invalid_type if the expression hasn't been type-checked.
+    pub fn getExprType(self: *const Checker, node: NodeIndex) TypeIndex {
+        return self.expr_types.get(node) orelse invalid_type;
+    }
+
+    // ========================================================================
     // File checking
     // ========================================================================
 
@@ -667,7 +677,20 @@ pub const Checker = struct {
 
         // Arithmetic operators: +, -, *, /, %
         switch (bin.op) {
-            .plus, .minus, .star, .slash, .percent => {
+            .plus => {
+                // Allow string + string (concatenation)
+                if (left_type == TypeRegistry.STRING and right_type == TypeRegistry.STRING) {
+                    return TypeRegistry.STRING;
+                }
+                // Both operands must be numeric
+                if (!isNumeric(left) or !isNumeric(right)) {
+                    self.errInvalidOp(bin.span.start, "arithmetic", left_type, right_type);
+                    return invalid_type;
+                }
+                // Result is the common type (simplified: use left type)
+                return left_type;
+            },
+            .minus, .star, .slash, .percent => {
                 // Both operands must be numeric
                 if (!isNumeric(left) or !isNumeric(right)) {
                     self.errInvalidOp(bin.span.start, "arithmetic", left_type, right_type);
@@ -783,6 +806,9 @@ pub const Checker = struct {
                 }
                 if (std.mem.eql(u8, name, "@listByteSize")) {
                     return self.checkBuiltinListByteSize(c);
+                }
+                if (std.mem.eql(u8, name, "@fileWriteListBytes")) {
+                    return self.checkBuiltinFileWriteListBytes(c);
                 }
                 // Command-line argument builtins (for bootstrap)
                 if (std.mem.eql(u8, name, "@argsCount")) {
@@ -1122,6 +1148,21 @@ pub const Checker = struct {
             return invalid_type;
         }
         _ = try self.checkExpr(c.args[0]);
+        return TypeRegistry.I64;
+    }
+
+    /// Check builtin @fileWriteListBytes(path, list) - write list elements as bytes to file
+    fn checkBuiltinFileWriteListBytes(self: *Checker, c: ast.Call) CheckError!TypeIndex {
+        if (c.args.len != 2) {
+            self.err.errorWithCode(c.span.start, .E300, "@fileWriteListBytes() expects two arguments: path, list");
+            return invalid_type;
+        }
+        const path_type = try self.checkExpr(c.args[0]);
+        if (path_type != TypeRegistry.STRING) {
+            self.err.errorWithCode(c.span.start, .E300, "@fileWriteListBytes() path must be a string");
+            return invalid_type;
+        }
+        _ = try self.checkExpr(c.args[1]);
         return TypeRegistry.I64;
     }
 

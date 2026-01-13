@@ -1275,7 +1275,7 @@ fn convertIRNode(func: *ssa.Func, node: *const ir.Node, ir_to_ssa: *std.AutoHash
 
         // Address arithmetic
         .addr_offset => |ao| {
-            ssa_op = .field_value;
+            ssa_op = .addr_const;
             aux_int = ao.offset;
         },
         .addr_index => |ai| {
@@ -1394,6 +1394,9 @@ fn convertIRNode(func: *ssa.Func, node: *const ir.Node, ir_to_ssa: *std.AutoHash
         },
         .file_free => {
             ssa_op = .file_free;
+        },
+        .file_write_list_bytes => {
+            ssa_op = .file_write_list_bytes;
         },
 
         // Command line args
@@ -1754,6 +1757,14 @@ fn convertIRNode(func: *ssa.Func, node: *const ir.Node, ir_to_ssa: *std.AutoHash
         .file_free => |ff| {
             if (ir_to_ssa.get(ff.ptr)) |p_ssa| {
                 try value.addArg(p_ssa, func.allocator);
+            }
+        },
+        .file_write_list_bytes => |fwlb| {
+            if (ir_to_ssa.get(fwlb.path)) |p_ssa| {
+                try value.addArg(p_ssa, func.allocator);
+            }
+            if (ir_to_ssa.get(fwlb.handle)) |h_ssa| {
+                try value.addArg(h_ssa, func.allocator);
             }
         },
 

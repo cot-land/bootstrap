@@ -221,6 +221,41 @@ export fn cot_list_byte_size(handle: ?*ListHandle) i64 {
     return @intCast(data.length * data.elem_size);
 }
 
+/// Write list elements as bytes to a file.
+/// Each list element is written as a single byte (low 8 bits only).
+/// Used for writing byte buffers stored in List<int>.
+/// Returns bytes written on success, -1 on failure.
+export fn cot_file_write_list_bytes(path_ptr: i64, path_len: i64, list_handle: ?*ListHandle) i64 {
+    const h = list_handle orelse return -1;
+    const data = h.data;
+
+    // Build path slice
+    const path_slice = blk: {
+        const ptr: [*]const u8 = @ptrFromInt(@as(usize, @intCast(path_ptr)));
+        break :blk ptr[0..@intCast(path_len)];
+    };
+
+    // Create file
+    const file = std.fs.cwd().createFile(path_slice, .{}) catch return -1;
+    defer file.close();
+
+    if (data.length == 0) return 0;
+
+    const elements = data.elements_ptr orelse return -1;
+    const elem_size = data.elem_size;
+
+    // Write each element's low byte
+    var i: u64 = 0;
+    while (i < data.length) : (i += 1) {
+        const offset = i * elem_size;
+        const byte_val = elements[offset];
+        const single_byte = [_]u8{byte_val};
+        file.writeAll(&single_byte) catch return -1;
+    }
+
+    return @intCast(data.length);
+}
+
 /// Set an element in the list at a specific index
 /// For elements <= 8 bytes, value is passed directly
 /// For larger elements, value is a pointer to the source data

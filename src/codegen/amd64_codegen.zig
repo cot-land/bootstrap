@@ -1611,6 +1611,29 @@ pub const CodeGen = struct {
         try self.setResult(value.id, .{ .register = dest });
     }
 
+    /// Generate code for addr_const: compute address with constant offset
+    /// args[0] = base address (SSA), aux_int = offset
+    /// Returns computed address (base + aux_int)
+    pub fn genAddrConst(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+        if (args.len == 0) return;
+
+        const offset: i32 = @intCast(value.aux_int);
+        const base_mcv = self.getValue(args[0]);
+        const dest = try self.allocReg(value.id);
+
+        // Load base address into dest
+        try self.loadToReg(dest, base_mcv);
+
+        // If offset is non-zero, add it using LEA
+        if (offset != 0) {
+            // LEA dest, [dest + offset]
+            try x86.leaRegMem(self.buf, dest, dest, offset);
+        }
+
+        try self.setResult(value.id, .{ .register = dest });
+    }
+
     /// Generate code for addr_add: compute address without loading
     /// args[0] = base address (SSA), args[1] = index (SSA), aux_int = elem_size
     pub fn genAddrAdd(self: *CodeGen, value: *ssa.Value) !void {
@@ -2444,6 +2467,35 @@ pub const CodeGen = struct {
         // No result
     }
 
+    /// Generate code for file_write_list_bytes: args[0]=path (string), args[1]=list_handle
+    /// Calls cot_file_write_list_bytes(path_ptr, path_len, list_handle) -> returns i64 in rax
+    pub fn genFileWriteListBytes(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+        if (args.len < 2) return;
+
+        try self.spillCallerSaved();
+
+        // Load handle first to a safe scratch register (r9) to avoid clobbering
+        // by loadSliceToRegs which modifies rdi/rsi
+        const handle_mcv = self.getValue(args[1]);
+        try self.loadToReg(.r9, handle_mcv);
+
+        // Load path string (ptr, len) to rdi, rsi
+        const path_val = &self.func.values.items[args[0]];
+        try self.loadSliceToRegs(path_val, .rdi, .rsi);
+
+        // Move handle from scratch register to rdx
+        try x86.movRegReg(self.buf, .rdx, .r9);
+
+        // Call cot_file_write_list_bytes(path_ptr, path_len, list_handle)
+        const func_name = if (self.os == .macos) "_cot_file_write_list_bytes" else "cot_file_write_list_bytes";
+        try x86.callSymbol(self.buf, func_name);
+
+        // Result in rax
+        self.reg_manager.markUsed(.rax, value.id);
+        try self.setResult(value.id, .{ .register = .rax });
+    }
+
     /// Generate code for list_data_ptr: args[0]=handle
     /// Calls cot_list_data_ptr(handle) -> returns i64 in rax
     pub fn genListDataPtr(self: *CodeGen, value: *ssa.Value) !void {
@@ -2841,6 +2893,7 @@ pub const CodeGen = struct {
             .index_local, .index => try self.genIndex(value),
             .index_value => try self.genIndexValue(value),
             .addr => try self.genAddr(value),
+            .addr_const => try self.genAddrConst(value),
             .ptr_load => try self.genPtrLoad(value),
             .ptr_store => try self.genPtrStore(value),
             .slice_local, .slice_make => try self.genSliceMake(value),
@@ -2875,6 +2928,7 @@ pub const CodeGen = struct {
             .file_write => try self.genFileWrite(value),
             .file_exists => try self.genFileExists(value),
             .file_free => try self.genFileFree(value),
+            .file_write_list_bytes => try self.genFileWriteListBytes(value),
             .list_data_ptr => try self.genListDataPtr(value),
             .list_byte_size => try self.genListByteSize(value),
             .args_count => try self.genArgsCount(value),

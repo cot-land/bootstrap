@@ -389,7 +389,9 @@ fn lowerCallExprNode(state: *CompilerState, fb: *IRFuncBuilder, node: Node, span
 // =============================================================================
 
 fn lowerStmt(state: *CompilerState, fb: *IRFuncBuilder, node_idx: NodeIndex) void {
+    println("DEBUG: lowerStmt enter")
     if node_idx == null_node {
+        println("DEBUG: lowerStmt null_node, returning")
         return
     }
 
@@ -398,7 +400,9 @@ fn lowerStmt(state: *CompilerState, fb: *IRFuncBuilder, node_idx: NodeIndex) voi
     var span_end: int = node.span.end.offset
     var tag: NodeTag = node.tag
 
+    println("DEBUG: lowerStmt got tag")
     if tag == NodeTag.return_stmt {
+        println("DEBUG: lowering return_stmt")
         lowerReturnStmtNode(state, fb, node, span_start, span_end)
     } else if tag == NodeTag.var_stmt {
         lowerVarStmtNode(state, fb, node, span_start, span_end)
@@ -409,9 +413,13 @@ fn lowerStmt(state: *CompilerState, fb: *IRFuncBuilder, node_idx: NodeIndex) voi
     } else if tag == NodeTag.while_stmt {
         lowerWhileStmtNode(state, fb, node, span_start, span_end)
     } else if tag == NodeTag.block_stmt {
+        println("DEBUG: lowering block_stmt")
         lowerBlockStmtNode(state, fb, node)
     } else if tag == NodeTag.expr_stmt {
+        println("DEBUG: lowering expr_stmt")
         lowerExprStmtNode(state, fb, node)
+    } else {
+        println("DEBUG: unknown stmt tag")
     }
 }
 
@@ -500,11 +508,20 @@ fn lowerWhileStmtNode(state: *CompilerState, fb: *IRFuncBuilder, node: Node, spa
 }
 
 fn lowerBlockStmtNode(state: *CompilerState, fb: *IRFuncBuilder, node: Node) void {
+    println("DEBUG: lowerBlockStmtNode enter")
+    var arg_count: int = len(node.args)
+    if arg_count == 0 {
+        println("DEBUG: block has 0 args")
+    } else {
+        println("DEBUG: block has args")
+    }
     var i: int = 0
-    while i < len(node.args) {
+    while i < arg_count {
+        println("DEBUG: processing block arg")
         lowerStmt(state, fb, node.args.get(i))
         i = i + 1
     }
+    println("DEBUG: lowerBlockStmtNode exit")
 }
 
 fn lowerExprStmtNode(state: *CompilerState, fb: *IRFuncBuilder, node: Node) void {
@@ -523,6 +540,15 @@ fn lowerFnDecl(state: *CompilerState, node_idx: NodeIndex) void {
 
     // Create function builder
     var fb: IRFuncBuilder = irFuncBuilderInit(node.name, 0, TYPE_INT, span_start, span_end)
+
+    // Create entry block
+    var entry_block: IRBlockIndex = irFuncBuilderNewBlock(&fb, "entry")
+    irFuncBuilderSetBlock(&fb, entry_block)
+
+    // Process the function body
+    if node.body != null_node {
+        lowerStmt(state, &fb, node.body)
+    }
 
     // Build and add function to IR
     var func: IRFunc = irFuncBuilderBuild(fb)
@@ -576,13 +602,36 @@ fn generateCode(state: *CompilerState, output_path: string) bool {
     var text_sec: Section = objectGetSection(obj, text_idx)
 
     // Generate code for each function
+    println("DEBUG: num funcs in IR")
+    var n_funcs: int = len(ir.funcs)
+    if n_funcs == 0 {
+        println("DEBUG: 0 funcs")
+    } else if n_funcs == 1 {
+        println("DEBUG: 1 func")
+    } else {
+        println("DEBUG: multiple funcs")
+    }
     var func_idx: int = 0
-    while func_idx < len(ir.funcs) {
+    while func_idx < n_funcs {
         var func: IRFunc = ir.funcs.get(func_idx)
+        println("DEBUG: processing func")
+        var n_blocks: int = len(func.blocks)
+        if n_blocks == 0 {
+            println("DEBUG: func has 0 blocks")
+        } else {
+            println("DEBUG: func has blocks")
+        }
+        var n_nodes: int = len(func.nodes)
+        if n_nodes == 0 {
+            println("DEBUG: func has 0 nodes")
+        } else {
+            println("DEBUG: func has nodes")
+        }
 
-        // Add function symbol
+        // Add function symbol (prefix with underscore on macOS)
         var sym_start: int = sectionSize(text_sec)
-        objectAddSymbol(obj, symbolNew(func.name, SymbolKind.func, text_idx, sym_start, 0, true))
+        var sym_name: string = "_" + func.name
+        objectAddSymbol(obj, symbolNew(sym_name, SymbolKind.func, text_idx, sym_start, 0, true))
 
         // Generate function code
         generateFunction(state, &text_sec, func)
@@ -590,14 +639,18 @@ fn generateCode(state: *CompilerState, output_path: string) bool {
         func_idx = func_idx + 1
     }
 
-    // Write object file
+    // Note: text_sec is a shallow copy - its .data List handle points to the
+    // same underlying data as obj.sections[text_idx].data. So modifications
+    // via sectionAppendByte already affected the shared data.
+
+    // Write object file to buffer
     var output: OutputBuffer = outputBufferNew()
     writeMachO64(obj, output)
 
-    // TODO: Write to disk once @fileWrite supports List<int>
-    // For now, the object file is built but not written
+    // Write buffer to disk - @fileWriteListBytes writes each list element's low byte
+    var result: int = @fileWriteListBytes(output_path, output.bytes)
 
-    return true
+    return result > 0
 }
 
 fn generateFunction(state: *CompilerState, text_sec: *Section, func: IRFunc) void {
@@ -605,16 +658,24 @@ fn generateFunction(state: *CompilerState, text_sec: *Section, func: IRFunc) voi
     var cg: FullCodeGen = fullCodeGenInit(func.frame_size)
 
     // Emit prologue
-    cgGenPrologue(cg, func.frame_size)
+    cgGenPrologue(&cg, func.frame_size)
 
     // Generate code for each block
+    println("DEBUG: generating blocks")
     var block_idx: int = 0
     while block_idx < len(func.blocks) {
+        println("DEBUG: processing block")
         var block: IRBlock = func.blocks.get(block_idx)
 
         // Generate code for each node in block
         var node_idx: int = 0
-        while node_idx < len(block.nodes) {
+        var node_count: int = len(block.nodes)
+        if node_count == 0 {
+            println("DEBUG: block has 0 nodes")
+        } else {
+            println("DEBUG: block has nodes")
+        }
+        while node_idx < node_count {
             var ir_node_idx: IRNodeIndex = block.nodes.get(node_idx)
             var ir_node: IRNode = func.nodes.get(ir_node_idx)
             generateNode(state, &cg, ir_node, ir_node_idx)
@@ -626,46 +687,62 @@ fn generateFunction(state: *CompilerState, text_sec: *Section, func: IRFunc) voi
 
     // Copy code buffer to section
     var byte_count: int = len(cg.buf.bytes)
+    println("DEBUG: generateFunction copying bytes")
+    if byte_count == 0 {
+        println("DEBUG: byte_count is ZERO!")
+    } else {
+        println("DEBUG: byte_count is non-zero")
+    }
+    println("DEBUG: starting loop")
     var i: int = 0
     while i < byte_count {
+        println("DEBUG: loop iter")
         var byte_val: int = cg.buf.bytes.get(i)
+        println("DEBUG: got byte_val")
         sectionAppendByte(text_sec, byte_val)
+        println("DEBUG: appended byte")
         i = i + 1
     }
+    println("DEBUG: done copying")
 }
 
 fn generateNode(state: *CompilerState, cg: *FullCodeGen, node: IRNode, node_idx: IRNodeIndex) void {
+    println("DEBUG: generateNode called")
     var op: Op = node.op
     if op == Op.const_int {
-        cgGenConstInt(cg.*, node_idx, node.aux)
+        println("DEBUG: generating const_int")
+        cgGenConstInt(cg, node_idx, node.aux)
     } else if op == Op.add {
-        cgGenAdd(cg.*, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
+        cgGenAdd(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
     } else if op == Op.sub {
-        cgGenSub(cg.*, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
+        cgGenSub(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
     } else if op == Op.mul {
-        cgGenMul(cg.*, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
+        cgGenMul(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
     } else if op == Op.div {
-        cgGenDiv(cg.*, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
+        cgGenDiv(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
     } else if op == Op.eq {
-        cgGenCmpEq(cg.*, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
+        cgGenCmpEq(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
     } else if op == Op.ne {
-        cgGenCmpNe(cg.*, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
+        cgGenCmpNe(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
     } else if op == Op.lt {
-        cgGenCmpLt(cg.*, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
+        cgGenCmpLt(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
     } else if op == Op.le {
-        cgGenCmpLe(cg.*, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
+        cgGenCmpLe(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
     } else if op == Op.gt {
-        cgGenCmpGt(cg.*, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
+        cgGenCmpGt(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
     } else if op == Op.ge {
-        cgGenCmpGe(cg.*, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
+        cgGenCmpGe(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
     } else if op == Op.neg {
-        cgGenNeg(cg.*, node_idx, irNodeGetArg(node, 0))
+        cgGenNeg(cg, node_idx, irNodeGetArg(node, 0))
     } else if op == Op.local {
-        cgGenLoadStack(cg.*, node_idx, 0 - (node.aux + 1) * 8, 8)
+        cgGenLoadStack(cg, node_idx, 0 - (node.aux + 1) * 8, 8)
     } else if op == Op.store {
-        cgGenStoreStack(cg.*, irNodeGetArg(node, 0), 0 - (node.aux + 1) * 8, 8)
+        cgGenStoreStack(cg, irNodeGetArg(node, 0), 0 - (node.aux + 1) * 8, 8)
     } else if op == Op.ret {
-        cgGenReturn(cg.*, irNodeGetArg(node, 0))
+        println("DEBUG: generating ret")
+        cgGenReturn(cg, irNodeGetArg(node, 0))
+    } else {
+        println("DEBUG: unknown op")
     }
 }
 
@@ -675,10 +752,16 @@ fn generateNode(state: *CompilerState, cg: *FullCodeGen, node: IRNode, node_idx:
 
 fn compile(input_path: string, output_path: string, verbose: bool) int {
     // Read source file
+    println("DEBUG: reading file")
     var content: string = @fileRead(input_path)
+    println("DEBUG: file read done")
 
-    if len(content) == 0 {
+    var content_len: int = len(content)
+    if content_len == 0 {
+        println("DEBUG: content is empty!")
         return 1  // Error: Cannot read input file
+    } else {
+        println("DEBUG: content has data")
     }
 
     // Initialize compiler state

@@ -173,6 +173,9 @@ pub const Op = enum(u8) {
     /// Compute address: args[0] = base address (SSA), args[1] = index (SSA), aux_int = elem_size
     /// Returns computed address (base + index * elem_size)
     addr_add,
+    /// Compute address with constant offset: args[0] = base address (SSA), aux_int = offset
+    /// Returns computed address (base + aux_int)
+    addr_const,
     // Legacy ops (to be removed)
     field,
     index,
@@ -239,6 +242,8 @@ pub const Op = enum(u8) {
     file_exists,
     // Free memory from file_read. args[0] = ptr.
     file_free,
+    // Write list elements as bytes to file. args[0] = path (string), args[1] = handle (list). Returns i64.
+    file_write_list_bytes,
     // Get list's raw data pointer. args[0] = handle. Returns i64.
     list_data_ptr,
     // Get list's total byte size. args[0] = handle. Returns i64.

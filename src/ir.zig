@@ -373,6 +373,12 @@ pub const FileExists = struct {
     path: NodeIndex,
 };
 
+/// File write list bytes operation.
+pub const FileWriteListBytes = struct {
+    path: NodeIndex,
+    handle: NodeIndex,
+};
+
 /// Get command line argument.
 pub const ArgsGet = struct {
     index: NodeIndex,
@@ -527,6 +533,7 @@ pub const Node = struct {
         file_write: FileWrite,
         file_exists: FileExists,
         file_free: PtrLoadValue, // Free ptr from file_read
+        file_write_list_bytes: FileWriteListBytes,
 
         // ========== Command Line Args ==========
         args_count: void,
@@ -585,6 +592,7 @@ pub const Node = struct {
             .map_free,
             .file_write,
             .file_free,
+            .file_write_list_bytes,
             => true,
             else => false,
         };
@@ -710,6 +718,10 @@ pub const Node = struct {
             },
             .file_exists => |f| try refs.append(allocator, f.path),
             .file_free => |f| try refs.append(allocator, f.ptr),
+            .file_write_list_bytes => |f| {
+                try refs.append(allocator, f.path);
+                try refs.append(allocator, f.handle);
+            },
             .args_get => |a| try refs.append(allocator, a.index),
             .convert => |c| try refs.append(allocator, c.operand),
             .ptr_cast => |p| try refs.append(allocator, p.operand),
@@ -1219,6 +1231,11 @@ pub const FuncBuilder = struct {
     /// Emit file free.
     pub fn emitFileFree(self: *FuncBuilder, ptr: NodeIndex, span: Span) !NodeIndex {
         return self.emit(Node.init(.{ .file_free = .{ .ptr = ptr } }, TypeRegistry.VOID, span));
+    }
+
+    /// Emit file write list bytes.
+    pub fn emitFileWriteListBytes(self: *FuncBuilder, path: NodeIndex, handle: NodeIndex, span: Span) !NodeIndex {
+        return self.emit(Node.init(.{ .file_write_list_bytes = .{ .path = path, .handle = handle } }, TypeRegistry.INT, span));
     }
 
     /// Emit list data pointer.

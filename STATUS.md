@@ -1,6 +1,6 @@
 # Cot Implementation Status
 
-**Last Updated:** 2026-01-13
+**Last Updated:** 2026-01-14
 
 > **Claude: Update this file whenever you complete a feature or fix a test.**
 
@@ -71,12 +71,31 @@ zig build test                    # 135+ embedded tests
 
 ### Self-Hosting Status
 
-The bootstrap compiler (`main_boot.cot`) compiles successfully with the Zig compiler and can compile simple `.cot` files (e.g., `test_return.cot`). Output file writing is not yet implemented (TODO: `@fileWrite` for `List<int>`).
+**✅ MILESTONE ACHIEVED (2026-01-14):** The bootstrap compiler (`cot0`) can compile, link, and run cot programs!
+
+```bash
+# Build the bootstrap compiler
+./zig-out/bin/cot src/bootstrap/main_boot.cot -o cot0
+
+# Compile a cot source file
+./cot0 tests/test_return.cot     # produces a.out (Mach-O object)
+
+# Link and run
+zig cc -o test_exe a.out && ./test_exe
+# Exit code: 42 ✅
+```
+
+**Key fixes in this session:**
+1. Fixed ARM64 STP/LDP instruction encoding (wrong bit positions)
+2. Fixed MOV fp, sp encoding (SP requires ADD not ORR)
+3. Fixed number parsing loop (cot `and` in while conditions)
+4. Added proper function epilogue emission
 
 ### Known Language Bugs (Workarounds Applied)
 
 1. **Large struct by value**: Passing structs > 16 bytes by value corrupts nested List handles. Workaround: pass pointers instead.
 2. **Address-of chained field access**: `&state.*.field.subfield` doesn't work correctly. Workaround: copy to local first.
+3. **`and` in while loop conditions**: Complex conditions like `while a < b and isDigit(c[i])` may not evaluate correctly. Workaround: use nested if statements inside a `while true` loop.
 
 ---
 

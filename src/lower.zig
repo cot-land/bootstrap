@@ -1338,6 +1338,12 @@ pub const Lowerer = struct {
         };
     }
 
+    /// Check if an expression has string type using the checker's cached type information.
+    fn isStringExpr(self: *const Lowerer, node: ast.NodeIndex) bool {
+        const expr_type = self.checker.getExprType(node);
+        return expr_type == TypeRegistry.STRING;
+    }
+
     fn lowerBinary(self: *Lowerer, bin: ast.Binary) Allocator.Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
 
@@ -1347,6 +1353,17 @@ pub const Lowerer = struct {
         // TODO: Proper null check implementation
         if (bin.op == .question_question) {
             return self.lowerExpr(bin.left);
+        }
+
+        // Handle string concatenation: string + string -> str_concat
+        if (bin.op == .plus) {
+            const left_is_string = self.isStringExpr(bin.left);
+            const right_is_string = self.isStringExpr(bin.right);
+            if (left_is_string and right_is_string) {
+                const left = try self.lowerExpr(bin.left);
+                const right = try self.lowerExpr(bin.right);
+                return try fb.emitStrConcat(left, right, Span.fromPos(Pos.zero));
+            }
         }
 
         const left = try self.lowerExpr(bin.left);
@@ -1578,6 +1595,9 @@ pub const Lowerer = struct {
         }
         if (std.mem.eql(u8, func_name, "@listByteSize")) {
             return self.lowerBuiltinListByteSize(call);
+        }
+        if (std.mem.eql(u8, func_name, "@fileWriteListBytes")) {
+            return self.lowerBuiltinFileWriteListBytes(call);
         }
 
         // Handle command-line argument builtins (for bootstrap)
@@ -1980,6 +2000,18 @@ pub const Lowerer = struct {
         return try fb.emitListByteSize(handle_node, Span.fromPos(Pos.zero));
     }
 
+    /// Lower builtin @fileWriteListBytes(path, list) - write list bytes to file
+    fn lowerBuiltinFileWriteListBytes(self: *Lowerer, call: ast.Call) Allocator.Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+
+        if (call.args.len != 2) return ir.null_node;
+
+        const path_node = try self.lowerExpr(call.args[0]);
+        const list_node = try self.lowerExpr(call.args[1]);
+
+        return try fb.emitFileWriteListBytes(path_node, list_node, Span.fromPos(Pos.zero));
+    }
+
     /// Lower builtin @argsCount() - get number of command-line arguments
     fn lowerBuiltinArgsCount(self: *Lowerer, call: ast.Call) Allocator.Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
@@ -2157,6 +2189,17 @@ pub const Lowerer = struct {
             const index_node = try self.lowerExpr(call.args[0]);
             log.debug("  list.get() -> list_get IR op, elem_type={d}", .{elem_type});
             return try fb.emitListGet(list_handle, index_node, elem_type, Span.fromPos(Pos.zero));
+        } else if (std.mem.eql(u8, method_name, "set")) {
+            // list.set(index, value) -> list_set(handle, index, value)
+            if (call.args.len != 2) {
+                log.debug("  list.set() expects 2 arguments, got {d}", .{call.args.len});
+                return ir.null_node;
+            }
+
+            const index_node = try self.lowerExpr(call.args[0]);
+            const value_node = try self.lowerExpr(call.args[1]);
+            log.debug("  list.set() -> list_set IR op", .{});
+            return try fb.emitListSet(list_handle, index_node, value_node, Span.fromPos(Pos.zero));
         } else if (std.mem.eql(u8, method_name, "len")) {
             // list.len() -> list_len(handle)
             if (call.args.len != 0) {
@@ -2205,6 +2248,17 @@ pub const Lowerer = struct {
             const index_node = try self.lowerExpr(call.args[0]);
             log.debug("  list.get() -> list_get IR op (via handle), elem_type={d}", .{elem_type});
             return try fb.emitListGet(list_handle, index_node, elem_type, Span.fromPos(Pos.zero));
+        } else if (std.mem.eql(u8, method_name, "set")) {
+            // list.set(index, value) -> list_set(handle, index, value)
+            if (call.args.len != 2) {
+                log.debug("  list.set() expects 2 arguments, got {d}", .{call.args.len});
+                return ir.null_node;
+            }
+
+            const index_node = try self.lowerExpr(call.args[0]);
+            const value_node = try self.lowerExpr(call.args[1]);
+            log.debug("  list.set() -> list_set IR op (via handle)", .{});
+            return try fb.emitListSet(list_handle, index_node, value_node, Span.fromPos(Pos.zero));
         } else if (std.mem.eql(u8, method_name, "len")) {
             // list.len() -> list_len(handle)
             if (call.args.len != 0) {

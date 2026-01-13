@@ -1,6 +1,6 @@
 # Cot Self-Hosting Roadmap
 
-**Last Updated:** 2026-01-13
+**Last Updated:** 2026-01-14
 
 > **Claude: Update this file when you start or complete a roadmap item.**
 
@@ -94,9 +94,10 @@ Every Zig source file needs a corresponding bootstrap .cot file that uses only s
 
 ### Remaining Work
 
-1. **File output** - `@fileWrite` doesn't support `List<int>`, so object files aren't written to disk yet
+1. ✅ **File output** - `@fileWriteListBytes` now works, cot0 writes Mach-O object files
 2. **x86_64 bootstrap** - `amd64_boot.cot` and `x86_64_boot.cot` not created
 3. **Windows bootstrap** - `pe_coff_boot.cot` not created
+4. **Full self-hosting** - cot0 currently only compiles simple programs (return literals)
 
 ### Testing Command
 
