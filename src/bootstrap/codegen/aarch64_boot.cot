@@ -521,7 +521,7 @@ fn emitEpilogue(buf: CodeBuffer) void {
 // Simple test
 // =============================================================================
 
-fn main() int {
+fn test_aarch64() int {
     var buf: CodeBuffer = codeBufferInit()
 
     // Test NOP first (simple known value)

@@ -273,7 +273,7 @@ fn x86_64ReturnReg(index: int) int {
 // Simple test
 // =============================================================================
 
-fn main() int {
+fn test_backend() int {
     // Test storage creation
     var s1: Storage = storageReg(5)
     if s1.kind != StorageKind.general_reg {

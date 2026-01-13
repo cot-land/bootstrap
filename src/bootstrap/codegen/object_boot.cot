@@ -679,7 +679,7 @@ fn applyLocalRelocations(obj: ObjectFile) void {
 // Test
 // =============================================================================
 
-fn main() int {
+fn test_object() int {
     // Test relocation kind conversion
     var rk: RelocKind = RelocKind.pc_rel_32
     var macho_rk: MachORelocARM64 = relocKindToMachOARM64(rk)

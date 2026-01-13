@@ -1,11 +1,5 @@
 // Error handling for cot bootstrap.
-// Simplified version using only currently-supported features.
-//
-// Changes from original errors.zig:
-// - No ErrorHandler callback (function pointers not supported)
-// - Standalone functions instead of methods
-// - Uses boolean flag instead of optional capture for first error
-// - Simplified error printing (no source context)
+import "source_boot.cot"
 
 // =============================================================================
 // Error Codes
@@ -65,30 +59,6 @@ fn errorCodeDescription(code: ErrorCode) string {
 
 fn errorCodeValue(code: ErrorCode) int {
     return @intFromEnum(code)
-}
-
-// =============================================================================
-// Span (from source_boot.cot)
-// =============================================================================
-
-// Position in source code
-struct Pos {
-    offset: int,
-}
-
-// Span in source code
-struct Span {
-    start: Pos,
-    end: Pos,
-}
-
-fn spanFromPos(pos: Pos) Span {
-    return Span{ .start = pos, .end = pos }
-}
-
-fn spanFromOffset(offset: int) Span {
-    var pos: Pos = Pos{ .offset = offset }
-    return Span{ .start = pos, .end = pos }
 }
 
 // =============================================================================
@@ -225,7 +195,7 @@ fn traceMsg(msg: string) void {
 // Tests
 // =============================================================================
 
-fn main() int {
+fn test_errors() int {
     // Test calling errorCodeValue
     var val: int = errorCodeValue(ErrorCode.E100)
     if val != 100 {

@@ -432,7 +432,7 @@ fn typeRegistryInit() TypeRegistry {
 // Simple test
 // =============================================================================
 
-fn main() int {
+fn test_type_context() int {
     // Test type registry initialization
     var reg: TypeRegistry = typeRegistryInit()
 

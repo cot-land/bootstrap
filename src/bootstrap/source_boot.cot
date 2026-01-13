@@ -102,7 +102,7 @@ fn locationFromOffset(offset: int) Location {
 }
 
 // Simple test: verify position operations
-fn main() i64 {
+fn test_source() i64 {
     // Simple test - just return constant first
     return 42
 }

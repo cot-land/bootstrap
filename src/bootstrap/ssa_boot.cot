@@ -780,7 +780,7 @@ fn copyelim(f: *Func) void {
 // Test
 // ============================================================================
 
-fn main() int {
+fn test_ssa() int {
     // Test Func creation
     var f: Func = newFunc("test", 0, 0)
 

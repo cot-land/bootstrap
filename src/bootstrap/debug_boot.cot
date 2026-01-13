@@ -163,7 +163,7 @@ fn categoryName(cat: Category) string {
 // Simple test
 // =============================================================================
 
-fn main() int {
+fn test_debug() int {
     // Test category enum
     var cat: Category = Category.ir
     if not isEnabled(cat) {

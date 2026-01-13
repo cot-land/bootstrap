@@ -22,12 +22,12 @@ const MAX_INLINE_ARGS: int = 8
 // Index Types
 // =============================================================================
 
-type NodeIndex = int
-type BlockIndex = int
+type IRNodeIndex = int
+type IRBlockIndex = int
 type TypeIndex = int
 
-const null_node: NodeIndex = @maxInt(i64)
-const null_block: BlockIndex = @maxInt(i64)
+const ir_null_node: IRNodeIndex = @maxInt(i64)
+const ir_null_block: IRBlockIndex = @maxInt(i64)
 
 // =============================================================================
 // Operations
@@ -167,27 +167,27 @@ fn opHasSideEffects(op: Op) bool {
 // IR Node
 // =============================================================================
 
-struct Node {
+struct IRNode {
     op: Op,
     type_idx: TypeIndex,
-    args0: NodeIndex,
-    args1: NodeIndex,
-    args2: NodeIndex,
-    args3: NodeIndex,
-    args4: NodeIndex,
-    args5: NodeIndex,
-    args6: NodeIndex,
-    args7: NodeIndex,
+    args0: IRNodeIndex,
+    args1: IRNodeIndex,
+    args2: IRNodeIndex,
+    args3: IRNodeIndex,
+    args4: IRNodeIndex,
+    args5: IRNodeIndex,
+    args6: IRNodeIndex,
+    args7: IRNodeIndex,
     args_len: int,
     aux: int,
     aux_str: string,
     span_start: int,
     span_end: int,
-    block: BlockIndex,
+    block: IRBlockIndex,
 }
 
-fn nodeInit(op: Op, type_idx: TypeIndex, span_start: int, span_end: int) Node {
-    return Node{
+fn irNodeInit(op: Op, type_idx: TypeIndex, span_start: int, span_end: int) IRNode {
+    return IRNode{
         .op = op,
         .type_idx = type_idx,
         .args0 = 0,
@@ -203,11 +203,11 @@ fn nodeInit(op: Op, type_idx: TypeIndex, span_start: int, span_end: int) Node {
         .aux_str = "",
         .span_start = span_start,
         .span_end = span_end,
-        .block = null_block,
+        .block = ir_null_block,
     }
 }
 
-fn nodeGetArg(n: Node, idx: int) NodeIndex {
+fn irNodeGetArg(n: IRNode, idx: int) IRNodeIndex {
     if idx == 0 { return n.args0 }
     if idx == 1 { return n.args1 }
     if idx == 2 { return n.args2 }
@@ -216,10 +216,10 @@ fn nodeGetArg(n: Node, idx: int) NodeIndex {
     if idx == 5 { return n.args5 }
     if idx == 6 { return n.args6 }
     if idx == 7 { return n.args7 }
-    return null_node
+    return ir_null_node
 }
 
-fn nodeSetArg(n: *Node, idx: int, val: NodeIndex) void {
+fn irNodeSetArg(n: *IRNode, idx: int, val: IRNodeIndex) void {
     if idx == 0 { n.*.args0 = val }
     if idx == 1 { n.*.args1 = val }
     if idx == 2 { n.*.args2 = val }
@@ -230,23 +230,23 @@ fn nodeSetArg(n: *Node, idx: int, val: NodeIndex) void {
     if idx == 7 { n.*.args7 = val }
 }
 
-fn nodeWithArg0(n: Node, arg: NodeIndex) Node {
-    var result: Node = n
+fn irNodeWithArg0(n: IRNode, arg: IRNodeIndex) IRNode {
+    var result: IRNode = n
     result.args0 = arg
     result.args_len = 1
     return result
 }
 
-fn nodeWithArg01(n: Node, arg0: NodeIndex, arg1: NodeIndex) Node {
-    var result: Node = n
+fn irNodeWithArg01(n: IRNode, arg0: IRNodeIndex, arg1: IRNodeIndex) IRNode {
+    var result: IRNode = n
     result.args0 = arg0
     result.args1 = arg1
     result.args_len = 2
     return result
 }
 
-fn nodeWithArg012(n: Node, arg0: NodeIndex, arg1: NodeIndex, arg2: NodeIndex) Node {
-    var result: Node = n
+fn irNodeWithArg012(n: IRNode, arg0: IRNodeIndex, arg1: IRNodeIndex, arg2: IRNodeIndex) IRNode {
+    var result: IRNode = n
     result.args0 = arg0
     result.args1 = arg1
     result.args2 = arg2
@@ -254,20 +254,20 @@ fn nodeWithArg012(n: Node, arg0: NodeIndex, arg1: NodeIndex, arg2: NodeIndex) No
     return result
 }
 
-fn nodeWithAux(n: Node, aux: int) Node {
-    var result: Node = n
+fn irNodeWithAux(n: IRNode, aux: int) IRNode {
+    var result: IRNode = n
     result.aux = aux
     return result
 }
 
-fn nodeWithAuxStr(n: Node, aux_str: string) Node {
-    var result: Node = n
+fn irNodeWithAuxStr(n: IRNode, aux_str: string) IRNode {
+    var result: IRNode = n
     result.aux_str = aux_str
     return result
 }
 
-fn nodeWithBlock(n: Node, block: BlockIndex) Node {
-    var result: Node = n
+fn irNodeWithBlock(n: IRNode, block: IRBlockIndex) IRNode {
+    var result: IRNode = n
     result.block = block
     return result
 }
@@ -275,23 +275,23 @@ fn nodeWithBlock(n: Node, block: BlockIndex) Node {
 // Branch accessors - single source of truth for branch format
 // Format: args[0]=condition, args[1]=then_block, args[2]=else_block
 
-fn nodeGetBranchCondition(n: Node) NodeIndex {
+fn irNodeGetBranchCondition(n: IRNode) IRNodeIndex {
     if n.op != Op.branch or n.args_len < 1 {
-        return null_node
+        return ir_null_node
     }
     return n.args0
 }
 
-fn nodeGetBranchThenBlock(n: Node) BlockIndex {
+fn irNodeGetBranchThenBlock(n: IRNode) IRBlockIndex {
     if n.op != Op.branch or n.args_len < 2 {
-        return null_block
+        return ir_null_block
     }
     return n.args1
 }
 
-fn nodeGetBranchElseBlock(n: Node) BlockIndex {
+fn irNodeGetBranchElseBlock(n: IRNode) IRBlockIndex {
     if n.op != Op.branch or n.args_len < 3 {
-        return null_block
+        return ir_null_block
     }
     return n.args2
 }
@@ -300,26 +300,26 @@ fn nodeGetBranchElseBlock(n: Node) BlockIndex {
 // Basic Block
 // =============================================================================
 
-struct Block {
-    index: BlockIndex,
-    preds: List<BlockIndex>,
-    succs: List<BlockIndex>,
-    nodes: List<NodeIndex>,
+struct IRBlock {
+    index: IRBlockIndex,
+    preds: List<IRBlockIndex>,
+    succs: List<IRBlockIndex>,
+    nodes: List<IRNodeIndex>,
     label: string,
 }
 
-fn blockInit(index: BlockIndex) Block {
-    return Block{
+fn irBlockInit(index: IRBlockIndex) IRBlock {
+    return IRBlock{
         .index = index,
-        .preds = new List<BlockIndex>(),
-        .succs = new List<BlockIndex>(),
-        .nodes = new List<NodeIndex>(),
+        .preds = new List<IRBlockIndex>(),
+        .succs = new List<IRBlockIndex>(),
+        .nodes = new List<IRNodeIndex>(),
         .label = "",
     }
 }
 
-fn blockWithLabel(b: Block, label: string) Block {
-    var result: Block = b
+fn irBlockWithLabel(b: IRBlock, label: string) IRBlock {
+    var result: IRBlock = b
     result.label = label
     return result
 }
@@ -328,7 +328,7 @@ fn blockWithLabel(b: Block, label: string) Block {
 // Local Variable
 // =============================================================================
 
-struct Local {
+struct IRLocal {
     name: string,
     type_idx: TypeIndex,
     slot: int,
@@ -339,8 +339,8 @@ struct Local {
     offset: int,
 }
 
-fn localInit(name: string, type_idx: TypeIndex, slot: int, mutable: bool) Local {
-    return Local{
+fn irLocalInit(name: string, type_idx: TypeIndex, slot: int, mutable: bool) IRLocal {
+    return IRLocal{
         .name = name,
         .type_idx = type_idx,
         .slot = slot,
@@ -352,8 +352,8 @@ fn localInit(name: string, type_idx: TypeIndex, slot: int, mutable: bool) Local 
     }
 }
 
-fn localInitParam(name: string, type_idx: TypeIndex, param_idx: int, size: int) Local {
-    return Local{
+fn irLocalInitParam(name: string, type_idx: TypeIndex, param_idx: int, size: int) IRLocal {
+    return IRLocal{
         .name = name,
         .type_idx = type_idx,
         .slot = param_idx,
@@ -365,8 +365,8 @@ fn localInitParam(name: string, type_idx: TypeIndex, param_idx: int, size: int) 
     }
 }
 
-fn localInitWithSize(name: string, type_idx: TypeIndex, slot: int, mutable: bool, size: int) Local {
-    return Local{
+fn irLocalInitWithSize(name: string, type_idx: TypeIndex, slot: int, mutable: bool, size: int) IRLocal {
+    return IRLocal{
         .name = name,
         .type_idx = type_idx,
         .slot = slot,
@@ -382,30 +382,30 @@ fn localInitWithSize(name: string, type_idx: TypeIndex, slot: int, mutable: bool
 // Function
 // =============================================================================
 
-struct Func {
+struct IRFunc {
     name: string,
     type_idx: TypeIndex,
     return_type: TypeIndex,
-    params: List<Local>,
-    locals: List<Local>,
-    blocks: List<Block>,
-    entry: BlockIndex,
-    nodes: List<Node>,
+    params: List<IRLocal>,
+    locals: List<IRLocal>,
+    blocks: List<IRBlock>,
+    entry: IRBlockIndex,
+    nodes: List<IRNode>,
     span_start: int,
     span_end: int,
     frame_size: int,
 }
 
-fn funcInit(name: string, type_idx: TypeIndex, return_type: TypeIndex, span_start: int, span_end: int) Func {
-    return Func{
+fn irFuncInit(name: string, type_idx: TypeIndex, return_type: TypeIndex, span_start: int, span_end: int) IRFunc {
+    return IRFunc{
         .name = name,
         .type_idx = type_idx,
         .return_type = return_type,
-        .params = new List<Local>(),
-        .locals = new List<Local>(),
-        .blocks = new List<Block>(),
+        .params = new List<IRLocal>(),
+        .locals = new List<IRLocal>(),
+        .blocks = new List<IRBlock>(),
         .entry = 0,
-        .nodes = new List<Node>(),
+        .nodes = new List<IRNode>(),
         .span_start = span_start,
         .span_end = span_end,
         .frame_size = 0,
@@ -416,20 +416,20 @@ fn funcInit(name: string, type_idx: TypeIndex, return_type: TypeIndex, span_star
 // Global
 // =============================================================================
 
-struct Global {
+struct IRGlobal {
     name: string,
     type_idx: TypeIndex,
-    init_value: NodeIndex,
+    init_value: IRNodeIndex,
     is_const: bool,
     span_start: int,
     span_end: int,
 }
 
-fn globalInit(name: string, type_idx: TypeIndex, is_const: bool, span_start: int, span_end: int) Global {
-    return Global{
+fn irGlobalInit(name: string, type_idx: TypeIndex, is_const: bool, span_start: int, span_end: int) IRGlobal {
+    return IRGlobal{
         .name = name,
         .type_idx = type_idx,
-        .init_value = null_node,
+        .init_value = ir_null_node,
         .is_const = is_const,
         .span_start = span_start,
         .span_end = span_end,
@@ -440,15 +440,15 @@ fn globalInit(name: string, type_idx: TypeIndex, is_const: bool, span_start: int
 // Struct Definition
 // =============================================================================
 
-struct StructDef {
+struct IRStructDef {
     name: string,
     type_idx: TypeIndex,
     span_start: int,
     span_end: int,
 }
 
-fn structDefInit(name: string, type_idx: TypeIndex, span_start: int, span_end: int) StructDef {
-    return StructDef{
+fn irStructDefInit(name: string, type_idx: TypeIndex, span_start: int, span_end: int) IRStructDef {
+    return IRStructDef{
         .name = name,
         .type_idx = type_idx,
         .span_start = span_start,
@@ -460,24 +460,24 @@ fn structDefInit(name: string, type_idx: TypeIndex, span_start: int, span_end: i
 // IR Program
 // =============================================================================
 
-struct IR {
-    funcs: List<Func>,
-    globals: List<Global>,
-    structs: List<StructDef>,
+struct IRProgram {
+    funcs: List<IRFunc>,
+    globals: List<IRGlobal>,
+    structs: List<IRStructDef>,
 }
 
-fn irInit() IR {
-    return IR{
-        .funcs = new List<Func>(),
-        .globals = new List<Global>(),
-        .structs = new List<StructDef>(),
+fn irProgramInit() IRProgram {
+    return IRProgram{
+        .funcs = new List<IRFunc>(),
+        .globals = new List<IRGlobal>(),
+        .structs = new List<IRStructDef>(),
     }
 }
 
-fn irGetFunc(ir: IR, name: string) int {
+fn irProgramGetFunc(ir: IRProgram, name: string) int {
     var i: int = 0
     while i < len(ir.funcs) {
-        var f: Func = ir.funcs.get(i)
+        var f: IRFunc = ir.funcs.get(i)
         if f.name == name {
             return i
         }
@@ -486,10 +486,10 @@ fn irGetFunc(ir: IR, name: string) int {
     return -1
 }
 
-fn irGetGlobal(ir: IR, name: string) int {
+fn irProgramGetGlobal(ir: IRProgram, name: string) int {
     var i: int = 0
     while i < len(ir.globals) {
-        var g: Global = ir.globals.get(i)
+        var g: IRGlobal = ir.globals.get(i)
         if g.name == name {
             return i
         }
@@ -502,172 +502,172 @@ fn irGetGlobal(ir: IR, name: string) int {
 // Function Builder
 // =============================================================================
 
-struct FuncBuilder {
+struct IRFuncBuilder {
     name: string,
     type_idx: TypeIndex,
     return_type: TypeIndex,
     span_start: int,
     span_end: int,
-    locals: List<Local>,
-    blocks: List<Block>,
-    nodes: List<Node>,
-    current_block: BlockIndex,
+    locals: List<IRLocal>,
+    blocks: List<IRBlock>,
+    nodes: List<IRNode>,
+    current_block: IRBlockIndex,
     local_map: Map<string, int>,
     max_call_ret_size: int,
 }
 
-fn funcBuilderInit(name: string, type_idx: TypeIndex, return_type: TypeIndex, span_start: int, span_end: int) FuncBuilder {
-    var fb: FuncBuilder = FuncBuilder{
+fn irFuncBuilderInit(name: string, type_idx: TypeIndex, return_type: TypeIndex, span_start: int, span_end: int) IRFuncBuilder {
+    var fb: IRFuncBuilder = IRFuncBuilder{
         .name = name,
         .type_idx = type_idx,
         .return_type = return_type,
         .span_start = span_start,
         .span_end = span_end,
-        .locals = new List<Local>(),
-        .blocks = new List<Block>(),
-        .nodes = new List<Node>(),
+        .locals = new List<IRLocal>(),
+        .blocks = new List<IRBlock>(),
+        .nodes = new List<IRNode>(),
         .current_block = 0,
         .local_map = new Map<string, int>(),
         .max_call_ret_size = 0,
     }
 
     // Create entry block
-    fb.blocks.push(blockInit(0))
+    fb.blocks.push(irBlockInit(0))
 
     return fb
 }
 
-fn funcBuilderAddParam(fb: *FuncBuilder, name: string, type_idx: TypeIndex, size: int) int {
+fn irFuncBuilderAddParam(fb: *IRFuncBuilder, name: string, type_idx: TypeIndex, size: int) int {
     var idx: int = len(fb.*.locals)
-    fb.*.locals.push(localInitParam(name, type_idx, idx, size))
+    fb.*.locals.push(irLocalInitParam(name, type_idx, idx, size))
     fb.*.local_map.set(name, idx)
     return idx
 }
 
-fn funcBuilderAddLocal(fb: *FuncBuilder, name: string, type_idx: TypeIndex, mutable: bool) int {
+fn irFuncBuilderAddLocal(fb: *IRFuncBuilder, name: string, type_idx: TypeIndex, mutable: bool) int {
     var idx: int = len(fb.*.locals)
-    fb.*.locals.push(localInit(name, type_idx, idx, mutable))
+    fb.*.locals.push(irLocalInit(name, type_idx, idx, mutable))
     fb.*.local_map.set(name, idx)
     return idx
 }
 
-fn funcBuilderAddLocalWithSize(fb: *FuncBuilder, name: string, type_idx: TypeIndex, mutable: bool, size: int) int {
+fn irFuncBuilderAddLocalWithSize(fb: *IRFuncBuilder, name: string, type_idx: TypeIndex, mutable: bool, size: int) int {
     var idx: int = len(fb.*.locals)
-    fb.*.locals.push(localInitWithSize(name, type_idx, idx, mutable, size))
+    fb.*.locals.push(irLocalInitWithSize(name, type_idx, idx, mutable, size))
     fb.*.local_map.set(name, idx)
     return idx
 }
 
-fn funcBuilderLookupLocal(fb: FuncBuilder, name: string) int {
+fn irFuncBuilderLookupLocal(fb: IRFuncBuilder, name: string) int {
     if fb.local_map.has(name) {
         return fb.local_map.get(name)
     }
     return -1
 }
 
-fn funcBuilderNewBlock(fb: *FuncBuilder, label: string) BlockIndex {
-    var idx: BlockIndex = len(fb.*.blocks)
-    var block: Block = blockInit(idx)
+fn irFuncBuilderNewBlock(fb: *IRFuncBuilder, label: string) IRBlockIndex {
+    var idx: IRBlockIndex = len(fb.*.blocks)
+    var block: IRBlock = irBlockInit(idx)
     block.label = label
     fb.*.blocks.push(block)
     return idx
 }
 
-fn funcBuilderSetBlock(fb: *FuncBuilder, block: BlockIndex) void {
+fn irFuncBuilderSetBlock(fb: *IRFuncBuilder, block: IRBlockIndex) void {
     fb.*.current_block = block
 }
 
-fn funcBuilderEmit(fb: *FuncBuilder, node: Node) NodeIndex {
-    var idx: NodeIndex = len(fb.*.nodes)
-    var n: Node = node
+fn irFuncBuilderEmit(fb: *IRFuncBuilder, node: IRNode) IRNodeIndex {
+    var idx: IRNodeIndex = len(fb.*.nodes)
+    var n: IRNode = node
     n.block = fb.*.current_block
     fb.*.nodes.push(n)
 
     // Add to current block's node list
-    var block: Block = fb.*.blocks.get(fb.*.current_block)
+    var block: IRBlock = fb.*.blocks.get(fb.*.current_block)
     block.nodes.push(idx)
 
     return idx
 }
 
-fn funcBuilderEmitConstInt(fb: *FuncBuilder, value: int, type_idx: TypeIndex, span_start: int, span_end: int) NodeIndex {
-    var n: Node = nodeInit(Op.const_int, type_idx, span_start, span_end)
+fn irFuncBuilderEmitConstInt(fb: *IRFuncBuilder, value: int, type_idx: TypeIndex, span_start: int, span_end: int) IRNodeIndex {
+    var n: IRNode = irNodeInit(Op.const_int, type_idx, span_start, span_end)
     n.aux = value
-    return funcBuilderEmit(fb, n)
+    return irFuncBuilderEmit(fb, n)
 }
 
-fn funcBuilderEmitConstBool(fb: *FuncBuilder, value: bool, span_start: int, span_end: int) NodeIndex {
-    var n: Node = nodeInit(Op.const_bool, 1, span_start, span_end)
+fn irFuncBuilderEmitConstBool(fb: *IRFuncBuilder, value: bool, span_start: int, span_end: int) IRNodeIndex {
+    var n: IRNode = irNodeInit(Op.const_bool, 1, span_start, span_end)
     if value {
         n.aux = 1
     } else {
         n.aux = 0
     }
-    return funcBuilderEmit(fb, n)
+    return irFuncBuilderEmit(fb, n)
 }
 
-fn funcBuilderEmitConstSlice(fb: *FuncBuilder, string_idx: int, type_idx: TypeIndex, span_start: int, span_end: int) NodeIndex {
-    var n: Node = nodeInit(Op.const_slice, type_idx, span_start, span_end)
+fn irFuncBuilderEmitConstSlice(fb: *IRFuncBuilder, string_idx: int, type_idx: TypeIndex, span_start: int, span_end: int) IRNodeIndex {
+    var n: IRNode = irNodeInit(Op.const_slice, type_idx, span_start, span_end)
     n.aux = string_idx
-    return funcBuilderEmit(fb, n)
+    return irFuncBuilderEmit(fb, n)
 }
 
-fn funcBuilderEmitLocalLoad(fb: *FuncBuilder, local_idx: int, type_idx: TypeIndex, span_start: int, span_end: int) NodeIndex {
-    var n: Node = nodeInit(Op.local, type_idx, span_start, span_end)
+fn irFuncBuilderEmitLocalLoad(fb: *IRFuncBuilder, local_idx: int, type_idx: TypeIndex, span_start: int, span_end: int) IRNodeIndex {
+    var n: IRNode = irNodeInit(Op.local, type_idx, span_start, span_end)
     n.aux = local_idx
-    return funcBuilderEmit(fb, n)
+    return irFuncBuilderEmit(fb, n)
 }
 
-fn funcBuilderEmitLocalStore(fb: *FuncBuilder, local_idx: int, value: NodeIndex, type_idx: TypeIndex, span_start: int, span_end: int) NodeIndex {
-    var n: Node = nodeInit(Op.store, type_idx, span_start, span_end)
-    n = nodeWithArg0(n, value)
+fn irFuncBuilderEmitLocalStore(fb: *IRFuncBuilder, local_idx: int, value: IRNodeIndex, type_idx: TypeIndex, span_start: int, span_end: int) IRNodeIndex {
+    var n: IRNode = irNodeInit(Op.store, type_idx, span_start, span_end)
+    n = irNodeWithArg0(n, value)
     n.aux = local_idx
-    return funcBuilderEmit(fb, n)
+    return irFuncBuilderEmit(fb, n)
 }
 
-fn funcBuilderEmitBinary(fb: *FuncBuilder, op: Op, left: NodeIndex, right: NodeIndex, type_idx: TypeIndex, span_start: int, span_end: int) NodeIndex {
-    var n: Node = nodeInit(op, type_idx, span_start, span_end)
-    n = nodeWithArg01(n, left, right)
-    return funcBuilderEmit(fb, n)
+fn irFuncBuilderEmitBinary(fb: *IRFuncBuilder, op: Op, left: IRNodeIndex, right: IRNodeIndex, type_idx: TypeIndex, span_start: int, span_end: int) IRNodeIndex {
+    var n: IRNode = irNodeInit(op, type_idx, span_start, span_end)
+    n = irNodeWithArg01(n, left, right)
+    return irFuncBuilderEmit(fb, n)
 }
 
-fn funcBuilderEmitUnary(fb: *FuncBuilder, op: Op, operand: NodeIndex, type_idx: TypeIndex, span_start: int, span_end: int) NodeIndex {
-    var n: Node = nodeInit(op, type_idx, span_start, span_end)
-    n = nodeWithArg0(n, operand)
-    return funcBuilderEmit(fb, n)
+fn irFuncBuilderEmitUnary(fb: *IRFuncBuilder, op: Op, operand: IRNodeIndex, type_idx: TypeIndex, span_start: int, span_end: int) IRNodeIndex {
+    var n: IRNode = irNodeInit(op, type_idx, span_start, span_end)
+    n = irNodeWithArg0(n, operand)
+    return irFuncBuilderEmit(fb, n)
 }
 
-fn funcBuilderEmitReturn(fb: *FuncBuilder, value: NodeIndex, span_start: int, span_end: int) NodeIndex {
-    var n: Node = nodeInit(Op.ret, 12, span_start, span_end)
-    if value != null_node {
-        n = nodeWithArg0(n, value)
+fn irFuncBuilderEmitReturn(fb: *IRFuncBuilder, value: IRNodeIndex, span_start: int, span_end: int) IRNodeIndex {
+    var n: IRNode = irNodeInit(Op.ret, 12, span_start, span_end)
+    if value != ir_null_node {
+        n = irNodeWithArg0(n, value)
     }
-    return funcBuilderEmit(fb, n)
+    return irFuncBuilderEmit(fb, n)
 }
 
-fn funcBuilderEmitJump(fb: *FuncBuilder, target: BlockIndex, span_start: int, span_end: int) NodeIndex {
-    var n: Node = nodeInit(Op.jump, 12, span_start, span_end)
+fn irFuncBuilderEmitJump(fb: *IRFuncBuilder, target: IRBlockIndex, span_start: int, span_end: int) IRNodeIndex {
+    var n: IRNode = irNodeInit(Op.jump, 12, span_start, span_end)
     n.aux = target
-    return funcBuilderEmit(fb, n)
+    return irFuncBuilderEmit(fb, n)
 }
 
-fn funcBuilderEmitBranch(fb: *FuncBuilder, cond: NodeIndex, true_block: BlockIndex, false_block: BlockIndex, span_start: int, span_end: int) NodeIndex {
-    var n: Node = nodeInit(Op.branch, 12, span_start, span_end)
-    n = nodeWithArg012(n, cond, true_block, false_block)
-    return funcBuilderEmit(fb, n)
+fn irFuncBuilderEmitBranch(fb: *IRFuncBuilder, cond: IRNodeIndex, true_block: IRBlockIndex, false_block: IRBlockIndex, span_start: int, span_end: int) IRNodeIndex {
+    var n: IRNode = irNodeInit(Op.branch, 12, span_start, span_end)
+    n = irNodeWithArg012(n, cond, true_block, false_block)
+    return irFuncBuilderEmit(fb, n)
 }
 
-fn funcBuilderEmitField(fb: *FuncBuilder, base: NodeIndex, field_offset: int, type_idx: TypeIndex, span_start: int, span_end: int) NodeIndex {
-    var n: Node = nodeInit(Op.field, type_idx, span_start, span_end)
-    n = nodeWithArg0(n, base)
+fn irFuncBuilderEmitField(fb: *IRFuncBuilder, base: IRNodeIndex, field_offset: int, type_idx: TypeIndex, span_start: int, span_end: int) IRNodeIndex {
+    var n: IRNode = irNodeInit(Op.field, type_idx, span_start, span_end)
+    n = irNodeWithArg0(n, base)
     n.aux = field_offset
-    return funcBuilderEmit(fb, n)
+    return irFuncBuilderEmit(fb, n)
 }
 
-fn funcBuilderEmitIndex(fb: *FuncBuilder, base: NodeIndex, index: NodeIndex, type_idx: TypeIndex, span_start: int, span_end: int) NodeIndex {
-    var n: Node = nodeInit(Op.index, type_idx, span_start, span_end)
-    n = nodeWithArg01(n, base, index)
-    return funcBuilderEmit(fb, n)
+fn irFuncBuilderEmitIndex(fb: *IRFuncBuilder, base: IRNodeIndex, index: IRNodeIndex, type_idx: TypeIndex, span_start: int, span_end: int) IRNodeIndex {
+    var n: IRNode = irNodeInit(Op.index, type_idx, span_start, span_end)
+    n = irNodeWithArg01(n, base, index)
+    return irFuncBuilderEmit(fb, n)
 }
 
 // Round up to alignment (must be power of 2)
@@ -675,12 +675,12 @@ fn roundUp(offset: int, alignment: int) int {
     return ((offset + alignment - 1) / alignment) * alignment
 }
 
-fn funcBuilderBuild(fb: FuncBuilder) Func {
+fn irFuncBuilderBuild(fb: IRFuncBuilder) IRFunc {
     // Collect params from locals
-    var params: List<Local> = new List<Local>()
+    var params: List<IRLocal> = new List<IRLocal>()
     var i: int = 0
     while i < len(fb.locals) {
-        var local: Local = fb.locals.get(i)
+        var local: IRLocal = fb.locals.get(i)
         if local.is_param {
             params.push(local)
         }
@@ -691,7 +691,7 @@ fn funcBuilderBuild(fb: FuncBuilder) Func {
     var frame_offset: int = 0
     i = 0
     while i < len(fb.locals) {
-        var local: Local = fb.locals.get(i)
+        var local: IRLocal = fb.locals.get(i)
         // Round up to 8-byte alignment
         frame_offset = roundUp(frame_offset, 8)
         // Assign offset (negative for rbp-relative)
@@ -707,7 +707,7 @@ fn funcBuilderBuild(fb: FuncBuilder) Func {
     // Round total frame size to 16-byte alignment
     var frame_size: int = roundUp(frame_offset, 16)
 
-    return Func{
+    return IRFunc{
         .name = fb.name,
         .type_idx = fb.type_idx,
         .return_type = fb.return_type,
@@ -723,45 +723,45 @@ fn funcBuilderBuild(fb: FuncBuilder) Func {
 }
 
 // =============================================================================
-// IR Builder
+// IR Program Builder
 // =============================================================================
 
-struct IRBuilder {
-    ir: IR,
-    current_func: FuncBuilder,
+struct IRProgramBuilder {
+    ir: IRProgram,
+    current_func: IRFuncBuilder,
     has_func: bool,
 }
 
-fn irBuilderInit() IRBuilder {
-    return IRBuilder{
-        .ir = irInit(),
-        .current_func = funcBuilderInit("", 0, 0, 0, 0),
+fn irProgramBuilderInit() IRProgramBuilder {
+    return IRProgramBuilder{
+        .ir = irProgramInit(),
+        .current_func = irFuncBuilderInit("", 0, 0, 0, 0),
         .has_func = false,
     }
 }
 
-fn irBuilderStartFunc(b: *IRBuilder, name: string, type_idx: TypeIndex, return_type: TypeIndex, span_start: int, span_end: int) void {
-    b.*.current_func = funcBuilderInit(name, type_idx, return_type, span_start, span_end)
+fn irProgramBuilderStartFunc(b: *IRProgramBuilder, name: string, type_idx: TypeIndex, return_type: TypeIndex, span_start: int, span_end: int) void {
+    b.*.current_func = irFuncBuilderInit(name, type_idx, return_type, span_start, span_end)
     b.*.has_func = true
 }
 
-fn irBuilderEndFunc(b: *IRBuilder) void {
+fn irProgramBuilderEndFunc(b: *IRProgramBuilder) void {
     if b.*.has_func {
-        var func: Func = funcBuilderBuild(b.*.current_func)
+        var func: IRFunc = irFuncBuilderBuild(b.*.current_func)
         b.*.ir.funcs.push(func)
         b.*.has_func = false
     }
 }
 
-fn irBuilderAddGlobal(b: *IRBuilder, g: Global) void {
+fn irProgramBuilderAddGlobal(b: *IRProgramBuilder, g: IRGlobal) void {
     b.*.ir.globals.push(g)
 }
 
-fn irBuilderAddStruct(b: *IRBuilder, s: StructDef) void {
+fn irProgramBuilderAddStruct(b: *IRProgramBuilder, s: IRStructDef) void {
     b.*.ir.structs.push(s)
 }
 
-fn irBuilderGetIR(b: IRBuilder) IR {
+fn irProgramBuilderGetIR(b: IRProgramBuilder) IRProgram {
     return b.ir
 }
 
@@ -769,10 +769,10 @@ fn irBuilderGetIR(b: IRBuilder) IR {
 // Simple test
 // =============================================================================
 
-fn main() int {
+fn test_ir() int {
     // Test node creation
-    var n: Node = nodeInit(Op.const_int, 5, 0, 10)
-    n = nodeWithAux(n, 42)
+    var n: IRNode = irNodeInit(Op.const_int, 5, 0, 10)
+    n = irNodeWithAux(n, 42)
     if n.op != Op.const_int {
         return 1
     }
@@ -798,13 +798,13 @@ fn main() int {
     }
 
     // Test block creation
-    var block: Block = blockInit(0)
+    var block: IRBlock = irBlockInit(0)
     if block.index != 0 {
         return 8
     }
 
     // Test local creation
-    var local: Local = localInit("x", 5, 0, true)
+    var local: IRLocal = irLocalInit("x", 5, 0, true)
     if local.name != "x" {
         return 9
     }
@@ -813,7 +813,7 @@ fn main() int {
     }
 
     // Test local with param
-    var param: Local = localInitParam("a", 5, 0, 8)
+    var param: IRLocal = irLocalInitParam("a", 5, 0, 8)
     if not param.is_param {
         return 11
     }
@@ -822,44 +822,44 @@ fn main() int {
     }
 
     // Test func builder
-    var fb: FuncBuilder = funcBuilderInit("test_fn", 0, 5, 0, 100)
-    var param_idx: int = funcBuilderAddParam(&fb, "x", 5, 8)
+    var fb: IRFuncBuilder = irFuncBuilderInit("test_fn", 0, 5, 0, 100)
+    var param_idx: int = irFuncBuilderAddParam(&fb, "x", 5, 8)
     if param_idx != 0 {
         return 13
     }
 
-    var local_idx: int = funcBuilderAddLocal(&fb, "y", 5, true)
+    var local_idx: int = irFuncBuilderAddLocal(&fb, "y", 5, true)
     if local_idx != 1 {
         return 14
     }
 
     // Test lookup
-    var found_idx: int = funcBuilderLookupLocal(fb, "x")
+    var found_idx: int = irFuncBuilderLookupLocal(fb, "x")
     if found_idx != 0 {
         return 15
     }
 
-    var not_found: int = funcBuilderLookupLocal(fb, "z")
+    var not_found: int = irFuncBuilderLookupLocal(fb, "z")
     if not_found != -1 {
         return 16
     }
 
     // Test emitting nodes
-    var load_x: NodeIndex = funcBuilderEmitLocalLoad(&fb, 0, 5, 0, 10)
+    var load_x: IRNodeIndex = irFuncBuilderEmitLocalLoad(&fb, 0, 5, 0, 10)
     if load_x != 0 {
         return 17
     }
 
-    var const_1: NodeIndex = funcBuilderEmitConstInt(&fb, 1, 5, 0, 10)
-    var add_node: NodeIndex = funcBuilderEmitBinary(&fb, Op.add, load_x, const_1, 5, 0, 10)
-    var ret_node: NodeIndex = funcBuilderEmitReturn(&fb, add_node, 0, 10)
+    var const_1: IRNodeIndex = irFuncBuilderEmitConstInt(&fb, 1, 5, 0, 10)
+    var add_node: IRNodeIndex = irFuncBuilderEmitBinary(&fb, Op.add, load_x, const_1, 5, 0, 10)
+    var ret_node: IRNodeIndex = irFuncBuilderEmitReturn(&fb, add_node, 0, 10)
 
     if ret_node != 3 {
         return 18
     }
 
     // Test building func - skip for now due to large struct return issues
-    // var func: Func = funcBuilderBuild(fb)
+    // var func: IRFunc = irFuncBuilderBuild(fb)
     // if func.name != "test_fn" {
     //     return 19
     // }
@@ -887,11 +887,11 @@ fn main() int {
         return 26
     }
 
-    // Skip IRBuilder tests that use funcBuilderBuild (large struct return issue)
+    // Skip IRProgramBuilder tests that use irFuncBuilderBuild (large struct return issue)
     // TODO: Fix large struct returns in codegen
 
     // Test global
-    var g: Global = globalInit("MAX_SIZE", 5, true, 0, 20)
+    var g: IRGlobal = irGlobalInit("MAX_SIZE", 5, true, 0, 20)
     if g.name != "MAX_SIZE" {
         return 30
     }
@@ -900,42 +900,42 @@ fn main() int {
     }
 
     // Test struct def
-    var sd: StructDef = structDefInit("Point", 100, 0, 30)
+    var sd: IRStructDef = irStructDefInit("Point", 100, 0, 30)
     if sd.name != "Point" {
         return 32
     }
 
     // Test branch accessors
-    var branch_node: Node = nodeInit(Op.branch, 12, 0, 10)
-    branch_node = nodeWithArg012(branch_node, 99, 1, 2)
-    if nodeGetBranchCondition(branch_node) != 99 {
+    var branch_node: IRNode = irNodeInit(Op.branch, 12, 0, 10)
+    branch_node = irNodeWithArg012(branch_node, 99, 1, 2)
+    if irNodeGetBranchCondition(branch_node) != 99 {
         return 33
     }
-    if nodeGetBranchThenBlock(branch_node) != 1 {
+    if irNodeGetBranchThenBlock(branch_node) != 1 {
         return 34
     }
-    if nodeGetBranchElseBlock(branch_node) != 2 {
+    if irNodeGetBranchElseBlock(branch_node) != 2 {
         return 35
     }
 
     // Test node arg getters
-    var test_node: Node = nodeInit(Op.add, 5, 0, 10)
-    test_node = nodeWithArg01(test_node, 10, 20)
-    if nodeGetArg(test_node, 0) != 10 {
+    var test_node: IRNode = irNodeInit(Op.add, 5, 0, 10)
+    test_node = irNodeWithArg01(test_node, 10, 20)
+    if irNodeGetArg(test_node, 0) != 10 {
         return 36
     }
-    if nodeGetArg(test_node, 1) != 20 {
+    if irNodeGetArg(test_node, 1) != 20 {
         return 37
     }
 
-    // Test nodeSetArg
-    var mut_node: Node = nodeInit(Op.call, 5, 0, 10)
-    nodeSetArg(&mut_node, 0, 100)
-    nodeSetArg(&mut_node, 1, 200)
-    if nodeGetArg(mut_node, 0) != 100 {
+    // Test irNodeSetArg
+    var mut_node: IRNode = irNodeInit(Op.call, 5, 0, 10)
+    irNodeSetArg(&mut_node, 0, 100)
+    irNodeSetArg(&mut_node, 1, 200)
+    if irNodeGetArg(mut_node, 0) != 100 {
         return 38
     }
-    if nodeGetArg(mut_node, 1) != 200 {
+    if irNodeGetArg(mut_node, 1) != 200 {
         return 39
     }
 

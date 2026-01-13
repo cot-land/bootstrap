@@ -417,7 +417,7 @@ fn computeLiveness(func: *Func) LivenessInfo {
 // Tests
 // ============================================================================
 
-fn main() int {
+fn test_liveness() int {
     // Test 1: newLivenessInfo creates properly sized lists
     var info1: LivenessInfo = newLivenessInfo(5)
     if info1.last_use.len() != 5 {

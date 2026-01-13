@@ -1,78 +1,6 @@
 // Abstract Syntax Tree node definitions for cot bootstrap.
-// Simplified version using only currently-supported features.
-//
-// Changes from original ast.cot:
-// - No imports (Pos, Span, Token inlined)
-// - No optional types (?NodeIndex) - use null_node sentinel instead
-// - Standalone functions instead of methods on unions
-// - Module-level const uses literal instead of @maxInt
-
-// =============================================================================
-// Inlined from source_boot.cot
-// =============================================================================
-
-struct Pos {
-    offset: int,
-}
-
-const zero_pos: Pos = Pos{ .offset = 0 }
-
-fn posFromOffset(offset: int) Pos {
-    return Pos{ .offset = offset }
-}
-
-struct Span {
-    start: Pos,
-    end: Pos,
-}
-
-fn spanInit(s: Pos, e: Pos) Span {
-    return Span{ .start = s, .end = e }
-}
-
-fn spanFromPos(pos: Pos) Span {
-    return Span{ .start = pos, .end = pos }
-}
-
-// =============================================================================
-// Inlined Token enum (minimal subset needed for AST)
-// =============================================================================
-
-enum Token: u8 {
-    eof,
-    invalid,
-    identifier,
-    int_literal,
-    float_literal,
-    string_literal,
-    char_literal,
-    plus,
-    minus,
-    star,
-    slash,
-    percent,
-    ampersand,
-    pipe,
-    caret,
-    bang,
-    equal,
-    less,
-    greater,
-    dot,
-    question,
-    plus_equal,
-    minus_equal,
-    star_equal,
-    slash_equal,
-    equal_equal,
-    bang_equal,
-    less_equal,
-    greater_equal,
-    question_question,
-    kw_and,
-    kw_or,
-    kw_not,
-}
+import "source_boot.cot"
+import "token_boot.cot"
 
 // =============================================================================
 // Core Types
@@ -593,7 +521,7 @@ fn nodeSpan(n: Node) Span {
 // Simple test
 // =============================================================================
 
-fn main() int {
+fn test_ast() int {
     // Test basic struct creation
     var pos: Pos = Pos{ .offset = 100 }
 

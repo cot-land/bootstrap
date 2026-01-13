@@ -382,7 +382,7 @@ fn typeSize(type_idx: TypeIndex) int {
 // Tests
 // =============================================================================
 
-fn main() int {
+fn test_check() int {
     // Test 1: Checker initialization
     var checker: Checker = checkerInit()
     if checker.current_scope_idx != 0 {

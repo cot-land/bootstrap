@@ -176,7 +176,7 @@ fn compile(input_path: string, output_path: string) CompileResult {
 // Test
 // =============================================================================
 
-fn main() int {
+fn test_driver() int {
     // Test driver can read a file
     var opts: CompileOptions = compileOptionsNew("build.zig", "test_out")
     var driver: Driver = driverNew(opts)

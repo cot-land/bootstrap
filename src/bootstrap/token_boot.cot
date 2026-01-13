@@ -123,6 +123,7 @@ enum Token: u8 {
     kw_u64,
     kw_f32,
     kw_f64,
+    kw_void,
 }
 
 // Operator precedence levels (higher = binds tighter).
@@ -200,11 +201,12 @@ fn lookupKeyword(name: string) Token {
     if name == "u64" { return Token.kw_u64 }
     if name == "f32" { return Token.kw_f32 }
     if name == "f64" { return Token.kw_f64 }
+    if name == "void" { return Token.kw_void }
     return Token.invalid
 }
 
 // Simple test: return 42 if keyword lookup works
-fn main() i64 {
+fn test_token() i64 {
     const t: Token = lookupKeyword("fn")
     if t == Token.kw_fn {
         return 42

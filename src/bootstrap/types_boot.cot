@@ -510,7 +510,7 @@ fn isAssignableBasicToBasic(kf: BasicKind, kt: BasicKind) bool {
 // Simple test
 // =============================================================================
 
-fn main() int {
+fn test_types() int {
     // Test type registry initialization
     var reg: TypeRegistry = typeRegistryInit()
 

@@ -1319,7 +1319,7 @@ fn cgGenGep(cg: FullCodeGen, value_id: int, base_id: int, index_id: int, elem_si
 // Simple test
 // =============================================================================
 
-fn main() int {
+fn test_arm64() int {
     // Test MCValue creation
     var mcv1: MCValue = mcvNone()
     if mcv1.kind != MCValueKind.none {
