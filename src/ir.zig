@@ -1111,7 +1111,9 @@ pub const FuncBuilder = struct {
 
     /// Emit function call.
     pub fn emitCall(self: *FuncBuilder, func_name: []const u8, args: []const NodeIndex, is_builtin: bool, type_idx: TypeIndex, span: Span) !NodeIndex {
-        return self.emit(Node.init(.{ .call = .{ .func_name = func_name, .args = args, .is_builtin = is_builtin } }, type_idx, span));
+        // Must dupe args slice - caller may pass temporary stack memory (e.g., &.{arg_node})
+        const duped_args = try self.allocator.dupe(NodeIndex, args);
+        return self.emit(Node.init(.{ .call = .{ .func_name = func_name, .args = duped_args, .is_builtin = is_builtin } }, type_idx, span));
     }
 
     /// Emit return.
@@ -1486,7 +1488,14 @@ pub fn debugPrintNode(node: *const Node, writer: anytype) !void {
 
         .addr_offset => |a| try writer.print("addr_offset base={d} offset={d}", .{ a.base, a.offset }),
 
-        .call => |c| try writer.print("call {s} args={d}", .{ c.func_name, c.args.len }),
+        .call => |c| {
+            try writer.print("call {s} args=[", .{c.func_name});
+            for (c.args, 0..) |arg, i| {
+                if (i > 0) try writer.print(",", .{});
+                try writer.print("{d}", .{arg});
+            }
+            try writer.print("]", .{});
+        },
         .ret => |r| {
             if (r.value) |v| {
                 try writer.print("ret value={d}", .{v});

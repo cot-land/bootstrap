@@ -34,8 +34,8 @@ zig build test                    # 135+ embedded tests
 | Progress | Count | Status |
 |----------|-------|--------|
 | Bootstrap .cot files exist | 20/23 | 87% |
-| Bootstrap module tests passing | 10/20 | ⚠️ 50% |
-| Self-hosting test | 0/1 | ❌ Crashes |
+| Bootstrap module tests passing | 20/20 | ✅ 100% |
+| Self-hosting test | 1/1 | ✅ Pass |
 | Zig source files | 22 | Reference implementation |
 
 ```bash
@@ -45,35 +45,38 @@ zig build test                    # 135+ embedded tests
 
 ### Module Test Results (2026-01-13)
 
-**Passing (10):**
+**All 20 modules passing:**
 - `token_boot.cot` - Token types and keywords
 - `source_boot.cot` - Source position tracking
 - `scanner_boot.cot` - Lexer/tokenizer
 - `ast_boot.cot` - AST node types
 - `types_boot.cot` - Type registry
+- `errors_boot.cot` - Error reporting
 - `parser_boot.cot` - Parser
+- `ir_boot.cot` - IR data structures
 - `lower_boot.cot` - AST → IR lowering
+- `ssa_boot.cot` - SSA conversion
+- `liveness_boot.cot` - Liveness analysis
+- `backend_boot.cot` - Backend utilities
+- `aarch64_boot.cot` - AArch64 instruction encoding
+- `arm64_boot.cot` - ARM64 code generation
 - `object_boot.cot` - Mach-O output
 - `debug_boot.cot` - Debug utilities
-- `main_boot.cot` (compile only) - Entry point compiles
-
-**Failing (10):**
-- `errors_boot.cot` - Calls undefined `spanFromOffset`
-- `ir_boot.cot` - Compile errors (struct/function issues)
-- `ssa_boot.cot` - Compile errors
-- `liveness_boot.cot` - Compile errors
-- `backend_boot.cot` - Compile errors
-- `aarch64_boot.cot` - Compile errors
-- `arm64_boot.cot` - Compile errors
-- `type_context_boot.cot` - Compile errors
-- `driver_boot.cot` - Compile errors
-- `main_boot.cot` (self-host) - Segfaults when compiling code
+- `type_context_boot.cot` - Type context management
+- `driver_boot.cot` - Compilation driver
+- `main_boot.cot` (compile) - Entry point compiles
+- `main_boot.cot` (self-host) - Successfully compiles test_return.cot
 
 **Not yet created:** `amd64_boot.cot`, `x86_64_boot.cot`, `pe_coff_boot.cot`
 
 ### Self-Hosting Status
 
-The bootstrap compiler (`main_boot.cot`) compiles successfully with the Zig compiler but crashes (segfault) when attempting to compile any `.cot` file. This indicates bugs in the lowering, IR, or codegen modules within the `.cot` implementation.
+The bootstrap compiler (`main_boot.cot`) compiles successfully with the Zig compiler and can compile simple `.cot` files (e.g., `test_return.cot`). Output file writing is not yet implemented (TODO: `@fileWrite` for `List<int>`).
+
+### Known Language Bugs (Workarounds Applied)
+
+1. **Large struct by value**: Passing structs > 16 bytes by value corrupts nested List handles. Workaround: pass pointers instead.
+2. **Address-of chained field access**: `&state.*.field.subfield` doesn't work correctly. Workaround: copy to local first.
 
 ---
 

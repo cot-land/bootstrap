@@ -160,14 +160,18 @@ fn sectionNew(name: string, kind: SectionKind) Section {
     }
 }
 
-fn sectionAppendByte(sec: Section, b: int) void {
-    sec.data.push(b)
+fn sectionAppendByte(sec: *Section, b: int) void {
+    // Workaround: dereference pointer and extract list to avoid corruption
+    // when large structs are passed by value
+    var s: Section = sec.*
+    s.data.push(b)
 }
 
-fn sectionAppendBytes(sec: Section, bytes: List<int>) void {
+fn sectionAppendBytes(sec: *Section, bytes: List<int>) void {
     var i: int = 0
     while i < len(bytes) {
-        sec.data.push(bytes.get(i))
+        var s: Section = sec.*
+        s.data.push(bytes.get(i))
         i = i + 1
     }
 }
@@ -176,8 +180,9 @@ fn sectionSize(sec: Section) int {
     return len(sec.data)
 }
 
-fn sectionAddRelocation(sec: Section, reloc: Relocation) void {
-    sec.relocations.push(reloc)
+fn sectionAddRelocation(sec: *Section, reloc: Relocation) void {
+    var s: Section = sec.*
+    s.relocations.push(reloc)
 }
 
 // =============================================================================
@@ -724,8 +729,8 @@ fn test_object() int {
         return 10
     }
 
-    sectionAppendByte(sec, 0xAA)
-    sectionAppendByte(sec, 0xBB)
+    sectionAppendByte(&sec, 0xAA)
+    sectionAppendByte(&sec, 0xBB)
     if sectionSize(sec) != 2 {
         return 11
     }

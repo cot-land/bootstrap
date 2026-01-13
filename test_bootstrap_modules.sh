@@ -173,7 +173,8 @@ cat > "$TESTS_DIR/test_ir.cot" << 'EOF'
 import "../../src/bootstrap/ir_boot.cot"
 
 fn main() int {
-    var fb: IRFuncBuilder = irFuncBuilderInit("test_func", 0, TYPE_INT, 0, 100)
+    // Use 5 for return type (equivalent to TYPE_INT in types_boot)
+    var fb: IRFuncBuilder = irFuncBuilderInit("test_func", 0, 5, 0, 100)
     if fb.name == "test_func" {
         return 42
     }
@@ -202,8 +203,8 @@ cat > "$TESTS_DIR/test_ssa.cot" << 'EOF'
 import "../../src/bootstrap/ssa_boot.cot"
 
 fn main() int {
-    // Test SSAOp enum exists
-    var op: SSAOp = SSAOp.const_int
+    // Test Op enum exists (ssa_boot uses Op not SSAOp)
+    var op: Op = Op.const_int
     if @intFromEnum(op) >= 0 {
         return 42
     }
@@ -219,12 +220,11 @@ import "../../src/bootstrap/liveness_boot.cot"
 fn main() int {
     // Test LivenessInfo struct
     var info: LivenessInfo = LivenessInfo{
-        .live_in = new List<int>(),
-        .live_out = new List<int>(),
-        .uses = new List<int>(),
-        .defs = new List<int>(),
+        .last_use = new List<int>(),
+        .deaths = new List<int>(),
+        .inst_index = new List<int>(),
     }
-    if len(info.live_in) == 0 {
+    if len(info.last_use) == 0 {
         return 42
     }
     return 1
@@ -238,9 +238,9 @@ import "../../src/bootstrap/codegen/backend_boot.cot"
 
 fn main() int {
     // Test CodeBuffer creation
-    var buf: CodeBuffer = codeBufferNew()
-    codeBufferAppendByte(&buf, 144)
-    if len(buf.bytes) == 1 {
+    var buf: CodeBuffer = codeBufferInit()
+    codeBufferEmit8(buf, 144)
+    if codeBufferPos(buf) == 1 {
         return 42
     }
     return 1
@@ -253,9 +253,8 @@ cat > "$TESTS_DIR/test_aarch64.cot" << 'EOF'
 import "../../src/bootstrap/codegen/aarch64_boot.cot"
 
 fn main() int {
-    // Test ARM64 register enum
-    var r: Arm64Reg = Arm64Reg.x0
-    if @intFromEnum(r) == 0 {
+    // Test ARM64 register constants
+    if REG_X0 == 0 and REG_FP == 29 and REG_LR == 30 {
         return 42
     }
     return 1
@@ -270,7 +269,7 @@ import "../../src/bootstrap/codegen/arm64_boot.cot"
 fn main() int {
     // Test FullCodeGen creation
     var cg: FullCodeGen = fullCodeGenInit(64)
-    if cg.frame_size == 64 {
+    if cg.stack_size == 64 {
         return 42
     }
     return 1
@@ -310,8 +309,8 @@ cat > "$TESTS_DIR/test_type_context.cot" << 'EOF'
 import "../../src/bootstrap/type_context_boot.cot"
 
 fn main() int {
-    // Test TypeContext creation
-    var tc: TypeContext = typeContextInit()
+    // Test TypeRegistry creation
+    var reg: TypeRegistry = typeRegistryInit()
     // Just verify it compiles and runs
     return 42
 }
@@ -323,16 +322,8 @@ cat > "$TESTS_DIR/test_driver.cot" << 'EOF'
 import "../../src/bootstrap/driver_boot.cot"
 
 fn main() int {
-    // Test driver options creation
-    var opts: DriverOptions = DriverOptions{
-        .input_path = "test.cot",
-        .output_path = "test",
-        .verbose = false,
-        .debug_ir = false,
-        .debug_ssa = false,
-        .debug_codegen = false,
-        .disasm = false,
-    }
+    // Test CompileOptions creation
+    var opts: CompileOptions = compileOptionsNew("test.cot", "test")
     if opts.input_path == "test.cot" {
         return 42
     }

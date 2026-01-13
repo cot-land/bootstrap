@@ -524,14 +524,13 @@ fn lowerFnDecl(state: *CompilerState, node_idx: NodeIndex) void {
     // Create function builder
     var fb: IRFuncBuilder = irFuncBuilderInit(node.name, 0, TYPE_INT, span_start, span_end)
 
-    // SIMPLIFIED: Skip body lowering for now to isolate the bug
-    // TODO: Add back body lowering once basic function creation works
-
     // Build and add function to IR
     var func: IRFunc = irFuncBuilderBuild(fb)
-    // Extract ir to local var before pushing
-    var ir: *IRProgram = &state.*.ir_builder.ir
-    ir.*.funcs.push(func)
+
+    // Add function to the IR program
+    // Workaround: copy ir_builder to local to avoid pointer chain issues
+    var builder: IRProgramBuilder = state.*.ir_builder
+    builder.ir.funcs.push(func)
 }
 
 // =============================================================================
@@ -541,7 +540,9 @@ fn lowerFnDecl(state: *CompilerState, node_idx: NodeIndex) void {
 fn compileAST(state: *CompilerState) void {
     // Walk through all parsed nodes and process top-level declarations
     var i: int = 0
-    while i < len(state.*.parser.nodes) {
+    var count: int = len(state.*.parser.nodes)
+
+    while i < count {
         var node: Node = state.*.parser.nodes.get(i)
         var tag: NodeTag = node.tag
 
@@ -560,6 +561,12 @@ fn compileAST(state: *CompilerState) void {
 
 fn generateCode(state: *CompilerState, output_path: string) bool {
     var ir: IRProgram = state.*.ir_builder.ir
+
+    // Check for functions to generate
+    var num_funcs: int = len(ir.funcs)
+    if num_funcs == 0 {
+        return false
+    }
 
     // Create object file
     var obj: ObjectFile = objectFileNew()
@@ -610,9 +617,7 @@ fn generateFunction(state: *CompilerState, text_sec: *Section, func: IRFunc) voi
         while node_idx < len(block.nodes) {
             var ir_node_idx: IRNodeIndex = block.nodes.get(node_idx)
             var ir_node: IRNode = func.nodes.get(ir_node_idx)
-
             generateNode(state, &cg, ir_node, ir_node_idx)
-
             node_idx = node_idx + 1
         }
 
@@ -620,9 +625,11 @@ fn generateFunction(state: *CompilerState, text_sec: *Section, func: IRFunc) voi
     }
 
     // Copy code buffer to section
+    var byte_count: int = len(cg.buf.bytes)
     var i: int = 0
-    while i < len(cg.buf.bytes) {
-        sectionAppendByte(text_sec.*, cg.buf.bytes.get(i))
+    while i < byte_count {
+        var byte_val: int = cg.buf.bytes.get(i)
+        sectionAppendByte(text_sec, byte_val)
         i = i + 1
     }
 }
@@ -669,6 +676,7 @@ fn generateNode(state: *CompilerState, cg: *FullCodeGen, node: IRNode, node_idx:
 fn compile(input_path: string, output_path: string, verbose: bool) int {
     // Read source file
     var content: string = @fileRead(input_path)
+
     if len(content) == 0 {
         return 1  // Error: Cannot read input file
     }

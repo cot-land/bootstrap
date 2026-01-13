@@ -56,6 +56,13 @@ fn spanFromPos(pos: Pos) Span {
     return result
 }
 
+// Create a span from an offset (zero-length span at that offset).
+fn spanFromOffset(offset: int) Span {
+    const pos: Pos = Pos{ .offset = offset }
+    const result: Span = Span{ .start = pos, .end = pos }
+    return result
+}
+
 // Check if a span is empty (zero-length).
 fn spanIsEmpty(span: Span) bool {
     return span.start.offset == span.end.offset

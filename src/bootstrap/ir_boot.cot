@@ -753,6 +753,18 @@ fn irProgramBuilderEndFunc(b: *IRProgramBuilder) void {
     }
 }
 
+fn irProgramBuilderAddFunc(b: *IRProgramBuilder, f: IRFunc) void {
+    print("AF1")
+    var builder: IRProgramBuilder = b.*
+    print("AF2")
+    var ir_prog: IRProgram = builder.ir
+    print("AF3")
+    var funcs: List<IRFunc> = ir_prog.funcs
+    print("AF4")
+    funcs.push(f)
+    print("AF5")
+}
+
 fn irProgramBuilderAddGlobal(b: *IRProgramBuilder, g: IRGlobal) void {
     b.*.ir.globals.push(g)
 }

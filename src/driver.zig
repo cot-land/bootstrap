@@ -1109,7 +1109,18 @@ pub const Driver = struct {
                 // Dump nodes (IR ops)
                 std.debug.print("  ops:\n", .{});
                 for (func.nodes, 0..) |node, i| {
-                    std.debug.print("    [{d}] {s} type={d}\n", .{ i, @tagName(node.data), node.type_idx });
+                    std.debug.print("    [{d}] {s} type={d}", .{ i, @tagName(node.data), node.type_idx });
+                    // Show call args
+                    if (node.data == .call) {
+                        const c = node.data.call;
+                        std.debug.print(" args=[", .{});
+                        for (c.args, 0..) |arg, j| {
+                            if (j > 0) std.debug.print(",", .{});
+                            std.debug.print("{d}", .{arg});
+                        }
+                        std.debug.print("]", .{});
+                    }
+                    std.debug.print("\n", .{});
                 }
             }
         }
