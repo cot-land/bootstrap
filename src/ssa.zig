@@ -17,7 +17,6 @@
 
 const std = @import("std");
 const types = @import("types.zig");
-const ir = @import("ir.zig");
 const debug = @import("debug.zig");
 
 const TypeIndex = types.TypeIndex;
@@ -132,6 +131,14 @@ pub const Op = enum(u8) {
     @"or",
     not,
 
+    // Bitwise
+    bit_and,
+    bit_or,
+    bit_xor,
+    bit_not,
+    shl,
+    shr,
+
     // Conditional select (ternary)
     // args[0] = condition, args[1] = then_value, args[2] = else_value
     select,
@@ -161,6 +168,11 @@ pub const Op = enum(u8) {
     index_local,
     /// Index into SSA value (chained access). args[0] = SSA value ref, args[1] = index (SSA ref)
     index_value,
+
+    // Address arithmetic (compute address without loading)
+    /// Compute address: args[0] = base address (SSA), args[1] = index (SSA), aux_int = elem_size
+    /// Returns computed address (base + index * elem_size)
+    addr_add,
     // Legacy ops (to be removed)
     field,
     index,

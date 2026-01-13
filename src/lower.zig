@@ -163,10 +163,9 @@ pub const Lowerer = struct {
                 if (return_type == TypeRegistry.VOID) {
                     // Check if last instruction was already a ret
                     const nodes = fb.nodes.items;
-                    const needs_ret = nodes.len == 0 or nodes[nodes.len - 1].op != .ret;
+                    const needs_ret = nodes.len == 0 or nodes[nodes.len - 1].data != .ret;
                     if (needs_ret) {
-                        const ret_node = ir.Node.init(.ret, TypeRegistry.VOID, Span.fromPos(Pos.zero));
-                        _ = try fb.emit(ret_node);
+                        _ = try fb.emitRet(null, TypeRegistry.VOID, Span.fromPos(Pos.zero));
                         log.debug("  added implicit ret for void function", .{});
                     }
                 }
@@ -211,9 +210,7 @@ pub const Lowerer = struct {
             // If there's an initializer, emit store
             if (var_decl.value) |value_idx| {
                 const value_node = try self.lowerExpr(value_idx);
-                const store = ir.Node.init(.store, type_idx, Span.fromPos(Pos.zero))
-                    .withArgs(&.{ @intCast(local_idx), value_node });
-                _ = try fb.emit(store);
+                _ = try fb.emitStoreLocal(local_idx, value_node, Span.fromPos(Pos.zero));
             }
 
             log.debug("  local var: {s} size={d}", .{ var_decl.name, size });
@@ -256,9 +253,7 @@ pub const Lowerer = struct {
             } else {
                 // Regular expression - lower and store
                 const value_ir_node = try self.lowerExpr(value_idx);
-                const store = ir.Node.init(.store, type_idx, Span.fromPos(Pos.zero))
-                    .withArgs(&.{ @intCast(local_idx), value_ir_node });
-                _ = try fb.emit(store);
+                _ = try fb.emitStoreLocal(@intCast(local_idx), value_ir_node, Span.fromPos(Pos.zero));
             }
         }
 
@@ -294,10 +289,7 @@ pub const Lowerer = struct {
             const value_node = try self.lowerExpr(field_init.value);
 
             // Emit store_field: store value at local[offset]
-            const store = ir.Node.init(.store, field_type_idx, Span.fromPos(Pos.zero))
-                .withArgs(&.{ @intCast(local_idx), value_node })
-                .withAux(@intCast(field_offset));
-            _ = try fb.emit(store);
+            _ = try fb.emitStoreLocalField(@intCast(local_idx), @intCast(field_offset), value_node, Span.fromPos(Pos.zero));
 
             log.debug("  struct field store: .{s} at offset {d}", .{ field_init.name, field_offset });
         }
@@ -319,10 +311,7 @@ pub const Lowerer = struct {
             const offset: u32 = @intCast(i * elem_size);
 
             // Emit store: store value at local[offset]
-            const store = ir.Node.init(.store, elem_type, Span.fromPos(Pos.zero))
-                .withArgs(&.{ @intCast(local_idx), value_node })
-                .withAux(@intCast(offset));
-            _ = try fb.emit(store);
+            _ = try fb.emitStoreLocalField(@intCast(local_idx), @intCast(offset), value_node, Span.fromPos(Pos.zero));
 
             log.debug("  array element store: [{d}] at offset {d}, elem_type={d}", .{ i, offset, elem_type });
         }
@@ -595,9 +584,7 @@ pub const Lowerer = struct {
                 const struct_type_idx = self.type_reg.lookupByName(si.type_name) orelse {
                     // Fallback to regular lowering
                     const value_node = try self.lowerExpr(value_idx);
-                    const ret_node = ir.Node.init(.ret, fb.return_type, Span.fromPos(Pos.zero))
-                        .withArgs(&.{value_node});
-                    _ = try fb.emit(ret_node);
+                    _ = try fb.emitRet(value_node, fb.return_type, Span.fromPos(Pos.zero));
                     return;
                 };
 
@@ -614,24 +601,17 @@ pub const Lowerer = struct {
 
                 // Load first 8 bytes of struct into return value
                 // (For larger structs, this is simplified - full impl would handle hidden ptr)
-                const load = ir.Node.init(.load, struct_type_idx, Span.fromPos(Pos.zero))
-                    .withArgs(&.{@intCast(temp_local_idx)});
-                const load_node = try fb.emit(load);
+                const load_node = try fb.emitLoadLocal(@intCast(temp_local_idx), struct_type_idx, Span.fromPos(Pos.zero));
 
-                const ret_node = ir.Node.init(.ret, struct_type_idx, Span.fromPos(Pos.zero))
-                    .withArgs(&.{load_node});
-                _ = try fb.emit(ret_node);
+                _ = try fb.emitRet(load_node, struct_type_idx, Span.fromPos(Pos.zero));
                 log.debug("  return struct: emitted load and ret", .{});
             } else {
                 const value_node = try self.lowerExpr(value_idx);
-                const ret_node = ir.Node.init(.ret, fb.return_type, Span.fromPos(Pos.zero))
-                    .withArgs(&.{value_node});
-                _ = try fb.emit(ret_node);
+                _ = try fb.emitRet(value_node, fb.return_type, Span.fromPos(Pos.zero));
                 log.debug("  return <expr>", .{});
             }
         } else {
-            const ret_node = ir.Node.init(.ret, TypeRegistry.VOID, Span.fromPos(Pos.zero));
-            _ = try fb.emit(ret_node);
+            _ = try fb.emitRet(null, TypeRegistry.VOID, Span.fromPos(Pos.zero));
             log.debug("  return void", .{});
         }
     }
@@ -652,15 +632,13 @@ pub const Lowerer = struct {
                             // Handle compound assignment: x += 1 becomes x = x + 1
                             const value_node = if (assign.op) |compound_op| blk: {
                                 // Load current value of target
-                                const load = ir.Node.init(.load, local_type, Span.fromPos(Pos.zero))
-                                    .withArgs(&.{@intCast(local_idx)});
-                                const current_value = try fb.emit(load);
+                                const current_value = try fb.emitLoadLocal(local_idx, local_type, Span.fromPos(Pos.zero));
 
                                 // Lower the right-hand side
                                 const rhs = try self.lowerExpr(assign.value);
 
                                 // Determine the binary op from compound op
-                                const bin_op: ir.Op = switch (compound_op) {
+                                const bin_op: ir.BinaryOp = switch (compound_op) {
                                     .plus_equal => .add,
                                     .minus_equal => .sub,
                                     .star_equal => .mul,
@@ -673,17 +651,13 @@ pub const Lowerer = struct {
                                 };
 
                                 // Emit binary operation
-                                const op_node = ir.Node.init(bin_op, local_type, Span.fromPos(Pos.zero))
-                                    .withArgs(&.{ current_value, rhs });
-                                break :blk try fb.emit(op_node);
+                                break :blk try fb.emitBinary(bin_op, current_value, rhs, local_type, Span.fromPos(Pos.zero));
                             } else blk: {
                                 // Simple assignment
                                 break :blk try self.lowerExpr(assign.value);
                             };
 
-                            const store = ir.Node.init(.store, local_type, Span.fromPos(Pos.zero))
-                                .withArgs(&.{ @intCast(local_idx), value_node });
-                            _ = try fb.emit(store);
+                            _ = try fb.emitStoreLocal(local_idx, value_node, Span.fromPos(Pos.zero));
                             if (assign.op) |op| {
                                 log.debug("  compound assign {s}: {s}", .{ op.toString(), name });
                             } else {
@@ -700,17 +674,11 @@ pub const Lowerer = struct {
 
                             if (chain_info.is_ptr_deref) {
                                 // Store through pointer field: c.*.value = x
-                                const store = ir.Node.init(.ptr_field_store, chain_info.field_type_idx, Span.fromPos(Pos.zero))
-                                    .withArgs(&.{ @intCast(local_idx), value_node })
-                                    .withAux(@intCast(chain_info.cumulative_offset));
-                                _ = try fb.emit(store);
+                                _ = try fb.emitPtrFieldStore(local_idx, @intCast(chain_info.cumulative_offset), value_node, Span.fromPos(Pos.zero));
                                 log.debug("  ptr field assign: .{s} at offset {d}", .{ fa.field, chain_info.cumulative_offset });
                             } else {
                                 // Emit store at local + field offset
-                                const store = ir.Node.init(.store, chain_info.field_type_idx, Span.fromPos(Pos.zero))
-                                    .withArgs(&.{ @intCast(local_idx), value_node })
-                                    .withAux(@intCast(chain_info.cumulative_offset));
-                                _ = try fb.emit(store);
+                                _ = try fb.emitStoreLocalField(local_idx, @intCast(chain_info.cumulative_offset), value_node, Span.fromPos(Pos.zero));
                                 log.debug("  field assign: .{s} at offset {d}", .{ fa.field, chain_info.cumulative_offset });
                             }
                         }
@@ -723,14 +691,11 @@ pub const Lowerer = struct {
                         // Lower the value expression
                         const value_node = try self.lowerExpr(assign.value);
 
-                        // Get the pointed-to type
-                        const ptr_type = self.checker.expr_types.get(d.operand) orelse TypeRegistry.INVALID;
-                        const elem_type = self.type_reg.pointerElem(ptr_type);
+                        // Get the pointed-to type (not needed for store, but kept for documentation)
+                        _ = self.checker.expr_types.get(d.operand) orelse TypeRegistry.INVALID;
 
-                        // Emit ptr_store
-                        const store = ir.Node.init(.ptr_store, elem_type, Span.fromPos(Pos.zero))
-                            .withArgs(&.{ ptr_node, value_node });
-                        _ = try fb.emit(store);
+                        // Emit ptr_store through computed pointer
+                        _ = try fb.emitPtrStoreValue(ptr_node, value_node, Span.fromPos(Pos.zero));
                         log.debug("  deref assign: store through pointer", .{});
                     },
                     .index => |idx| {
@@ -752,13 +717,8 @@ pub const Lowerer = struct {
                             // Lower the value
                             const value_node = try self.lowerExpr(assign.value);
 
-                            // Get element type from list using type context
-                            const elem_type = self.type_ctx.getListElementType(base_type_idx) orelse TypeRegistry.INT;
-
-                            // Emit list_set
-                            const list_set = ir.Node.init(.list_set, elem_type, Span.fromPos(Pos.zero))
-                                .withArgs(&.{ handle_node, index_node, value_node });
-                            _ = try fb.emit(list_set);
+                            // Emit list_set (element type not needed for set operation)
+                            _ = try fb.emitListSet(handle_node, index_node, value_node, Span.fromPos(Pos.zero));
                             log.debug("  list indexed assign", .{});
                         } else {
                             // Array indexed assignment - TODO if needed
@@ -794,9 +754,7 @@ pub const Lowerer = struct {
         const then_terminated = try self.lowerBlock(if_stmt.then_branch);
         // Only emit jump to merge if block didn't terminate (with return/break/continue)
         if (!then_terminated) {
-            const jump_merge = ir.Node.init(.jump, TypeRegistry.VOID, Span.fromPos(Pos.zero))
-                .withAux(@intCast(merge_block));
-            _ = try fb.emit(jump_merge);
+            _ = try fb.emitJump(merge_block, Span.fromPos(Pos.zero));
         }
 
         // Lower else block if present
@@ -805,9 +763,7 @@ pub const Lowerer = struct {
             const else_terminated = try self.lowerBlock(else_branch);
             // Only emit jump to merge if block didn't terminate
             if (!else_terminated) {
-                const jump_merge2 = ir.Node.init(.jump, TypeRegistry.VOID, Span.fromPos(Pos.zero))
-                    .withAux(@intCast(merge_block));
-                _ = try fb.emit(jump_merge2);
+                _ = try fb.emitJump(merge_block, Span.fromPos(Pos.zero));
             }
         }
 
@@ -830,26 +786,20 @@ pub const Lowerer = struct {
             .exit_block = exit_block,
         });
 
-        // Jump to condition block (target stored in aux)
-        const jump_cond = ir.Node.init(.jump, TypeRegistry.VOID, Span.fromPos(Pos.zero))
-            .withAux(@intCast(cond_block));
-        _ = try fb.emit(jump_cond);
+        // Jump to condition block
+        _ = try fb.emitJump(cond_block, Span.fromPos(Pos.zero));
 
         // Condition block
         fb.setBlock(cond_block);
         const cond_node = try self.lowerExpr(while_stmt.condition);
-        const branch = ir.Node.init(.branch, TypeRegistry.VOID, Span.fromPos(Pos.zero))
-            .withArgs(&.{ cond_node, body_block, exit_block });
-        _ = try fb.emit(branch);
+        _ = try fb.emitBranch(cond_node, body_block, exit_block, Span.fromPos(Pos.zero));
 
         // Body block
         fb.setBlock(body_block);
         const body_terminated = try self.lowerBlock(while_stmt.body);
         // Only emit jump back to condition if body didn't terminate
         if (!body_terminated) {
-            const jump_back = ir.Node.init(.jump, TypeRegistry.VOID, Span.fromPos(Pos.zero))
-                .withAux(@intCast(cond_block));
-            _ = try fb.emit(jump_back);
+            _ = try fb.emitJump(cond_block, Span.fromPos(Pos.zero));
         }
 
         // Pop loop context
@@ -904,12 +854,8 @@ pub const Lowerer = struct {
 
         // Create hidden index variable: var __for_idx_N: i64 = 0
         const idx_local = try fb.addLocalWithSize(idx_name, TypeRegistry.INT, true, 8);
-        const zero = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
-            .withAux(0);
-        const zero_idx = try fb.emit(zero);
-        const store_init = ir.Node.init(.store, TypeRegistry.INT, Span.fromPos(Pos.zero))
-            .withArgs(&.{ @as(ir.NodeIndex, @intCast(idx_local)), zero_idx });
-        _ = try fb.emit(store_init);
+        const zero_idx = try fb.emitConstInt(0, Span.fromPos(Pos.zero));
+        _ = try fb.emitStoreLocal(idx_local, zero_idx, Span.fromPos(Pos.zero));
 
         // Create loop variable: var item: elem_type
         const elem_size = self.type_reg.sizeOf(elem_type);
@@ -929,25 +875,19 @@ pub const Lowerer = struct {
         });
 
         // Jump to condition block
-        const jump_cond = ir.Node.init(.jump, TypeRegistry.VOID, Span.fromPos(Pos.zero))
-            .withAux(@intCast(cond_block));
-        _ = try fb.emit(jump_cond);
+        _ = try fb.emitJump(cond_block, Span.fromPos(Pos.zero));
 
         // === Condition block ===
         fb.setBlock(cond_block);
 
         // Load current index
-        const load_idx = ir.Node.init(.load, TypeRegistry.INT, Span.fromPos(Pos.zero))
-            .withArgs(&.{@intCast(idx_local)});
-        const idx_val = try fb.emit(load_idx);
+        const idx_val = try fb.emitLoadLocal(idx_local, TypeRegistry.INT, Span.fromPos(Pos.zero));
 
         // Get length of iterable
         var len_val: ir.NodeIndex = undefined;
         if (arr_len) |len| {
             // Array: constant length
-            const len_node = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                .withAux(@intCast(len));
-            len_val = try fb.emit(len_node);
+            len_val = try fb.emitConstInt(@intCast(len), Span.fromPos(Pos.zero));
         } else if (is_slice) {
             // Slice: load length at runtime
             // Need to get the iterable as a local to access .len field
@@ -956,46 +896,31 @@ pub const Lowerer = struct {
                 const ident = iter_node.expr.identifier;
                 if (fb.lookupLocal(ident.name)) |iter_local| {
                     // Slice len is at offset 8 (ptr at 0, len at 8)
-                    const len_field = ir.Node.init(.field, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                        .withArgs(&.{@as(ir.NodeIndex, @intCast(iter_local))})
-                        .withAux(8);
-                    len_val = try fb.emit(len_field);
+                    len_val = try fb.emitFieldLocal(iter_local, 8, TypeRegistry.INT, Span.fromPos(Pos.zero));
                 } else {
                     // Fallback: zero length
-                    const zero_len = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                        .withAux(0);
-                    len_val = try fb.emit(zero_len);
+                    len_val = try fb.emitConstInt(0, Span.fromPos(Pos.zero));
                 }
             } else {
                 // Fallback: zero length
-                const zero_len = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                    .withAux(0);
-                len_val = try fb.emit(zero_len);
+                len_val = try fb.emitConstInt(0, Span.fromPos(Pos.zero));
             }
         } else {
             // Fallback: zero length
-            const zero_len = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                .withAux(0);
-            len_val = try fb.emit(zero_len);
+            len_val = try fb.emitConstInt(0, Span.fromPos(Pos.zero));
         }
 
         // Compare: idx < len
-        const cmp = ir.Node.init(.lt, TypeRegistry.BOOL, Span.fromPos(Pos.zero))
-            .withArgs(&.{ idx_val, len_val });
-        const cmp_idx = try fb.emit(cmp);
+        const cmp_idx = try fb.emitBinary(.lt, idx_val, len_val, TypeRegistry.BOOL, Span.fromPos(Pos.zero));
 
         // Branch: if idx < len goto body else goto exit
-        const branch = ir.Node.init(.branch, TypeRegistry.VOID, Span.fromPos(Pos.zero))
-            .withArgs(&.{ cmp_idx, body_block, exit_block });
-        _ = try fb.emit(branch);
+        _ = try fb.emitBranch(cmp_idx, body_block, exit_block, Span.fromPos(Pos.zero));
 
         // === Body block ===
         fb.setBlock(body_block);
 
         // Load current index again for array access
-        const load_idx2 = ir.Node.init(.load, TypeRegistry.INT, Span.fromPos(Pos.zero))
-            .withArgs(&.{@intCast(idx_local)});
-        const idx_val2 = try fb.emit(load_idx2);
+        const idx_val2 = try fb.emitLoadLocal(idx_local, TypeRegistry.INT, Span.fromPos(Pos.zero));
 
         // Get element at index: arr[__for_idx_N]
         const iter_node = self.tree.getNode(for_stmt.iterable);
@@ -1004,26 +929,16 @@ pub const Lowerer = struct {
             if (fb.lookupLocal(ident.name)) |iter_local| {
                 if (is_slice) {
                     // Slice indexing
-                    const slice_idx_node = ir.Node.init(.slice_index, elem_type, Span.fromPos(Pos.zero))
-                        .withArgs(&.{ @as(ir.NodeIndex, @intCast(iter_local)), idx_val2 })
-                        .withAux(@intCast(elem_size));
-                    const elem_val = try fb.emit(slice_idx_node);
-
+                    const elem_val = try fb.emitSliceIndex(iter_local, idx_val2, @intCast(elem_size), elem_type, Span.fromPos(Pos.zero));
                     // Store to loop variable
-                    const store_item = ir.Node.init(.store, elem_type, Span.fromPos(Pos.zero))
-                        .withArgs(&.{ @as(ir.NodeIndex, @intCast(item_local)), elem_val });
-                    _ = try fb.emit(store_item);
+                    _ = try fb.emitStoreLocal(item_local, elem_val, Span.fromPos(Pos.zero));
                 } else {
-                    // Array indexing
-                    const addr_idx = ir.Node.init(.addr_index, elem_type, Span.fromPos(Pos.zero))
-                        .withArgs(&.{ @as(ir.NodeIndex, @intCast(iter_local)), idx_val2 })
-                        .withAux(@intCast(elem_size));
-                    const elem_val = try fb.emit(addr_idx);
-
+                    // Array indexing - compute address and load
+                    const base_addr = try fb.emitAddrLocal(iter_local, elem_type, Span.fromPos(Pos.zero));
+                    const elem_addr = try fb.emitAddrIndex(base_addr, idx_val2, @intCast(elem_size), elem_type, Span.fromPos(Pos.zero));
+                    const elem_val = try fb.emitPtrLoadValue(elem_addr, elem_type, Span.fromPos(Pos.zero));
                     // Store to loop variable
-                    const store_item = ir.Node.init(.store, elem_type, Span.fromPos(Pos.zero))
-                        .withArgs(&.{ @as(ir.NodeIndex, @intCast(item_local)), elem_val });
-                    _ = try fb.emit(store_item);
+                    _ = try fb.emitStoreLocal(item_local, elem_val, Span.fromPos(Pos.zero));
                 }
             }
         }
@@ -1033,35 +948,20 @@ pub const Lowerer = struct {
 
         // Jump to increment block if body didn't terminate
         if (!body_terminated) {
-            const jump_incr = ir.Node.init(.jump, TypeRegistry.VOID, Span.fromPos(Pos.zero))
-                .withAux(@intCast(incr_block));
-            _ = try fb.emit(jump_incr);
+            _ = try fb.emitJump(incr_block, Span.fromPos(Pos.zero));
         }
 
         // === Increment block ===
         fb.setBlock(incr_block);
 
         // Increment index: __for_idx_N = __for_idx_N + 1
-        const load_idx3 = ir.Node.init(.load, TypeRegistry.INT, Span.fromPos(Pos.zero))
-            .withArgs(&.{@intCast(idx_local)});
-        const idx_val3 = try fb.emit(load_idx3);
-
-        const one = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
-            .withAux(1);
-        const one_idx = try fb.emit(one);
-
-        const add_node = ir.Node.init(.add, TypeRegistry.INT, Span.fromPos(Pos.zero))
-            .withArgs(&.{ idx_val3, one_idx });
-        const new_idx = try fb.emit(add_node);
-
-        const store_inc = ir.Node.init(.store, TypeRegistry.INT, Span.fromPos(Pos.zero))
-            .withArgs(&.{ @as(ir.NodeIndex, @intCast(idx_local)), new_idx });
-        _ = try fb.emit(store_inc);
+        const idx_val3 = try fb.emitLoadLocal(idx_local, TypeRegistry.INT, Span.fromPos(Pos.zero));
+        const one_idx = try fb.emitConstInt(1, Span.fromPos(Pos.zero));
+        const new_idx = try fb.emitBinary(.add, idx_val3, one_idx, TypeRegistry.INT, Span.fromPos(Pos.zero));
+        _ = try fb.emitStoreLocal(idx_local, new_idx, Span.fromPos(Pos.zero));
 
         // Jump back to condition
-        const jump_back = ir.Node.init(.jump, TypeRegistry.VOID, Span.fromPos(Pos.zero))
-            .withAux(@intCast(cond_block));
-        _ = try fb.emit(jump_back);
+        _ = try fb.emitJump(cond_block, Span.fromPos(Pos.zero));
 
         // Pop loop context
         _ = self.loop_stack.pop();
@@ -1082,9 +982,7 @@ pub const Lowerer = struct {
         const loop_ctx = self.loop_stack.items[self.loop_stack.items.len - 1];
 
         // Emit jump to exit block
-        const jump = ir.Node.init(.jump, TypeRegistry.VOID, Span.fromPos(Pos.zero))
-            .withAux(@intCast(loop_ctx.exit_block));
-        _ = try fb.emit(jump);
+        _ = try fb.emitJump(loop_ctx.exit_block, Span.fromPos(Pos.zero));
         log.debug("  break -> block {d}", .{loop_ctx.exit_block});
     }
 
@@ -1099,9 +997,7 @@ pub const Lowerer = struct {
         const loop_ctx = self.loop_stack.items[self.loop_stack.items.len - 1];
 
         // Emit jump to condition block
-        const jump = ir.Node.init(.jump, TypeRegistry.VOID, Span.fromPos(Pos.zero))
-            .withAux(@intCast(loop_ctx.cond_block));
-        _ = try fb.emit(jump);
+        _ = try fb.emitJump(loop_ctx.cond_block, Span.fromPos(Pos.zero));
         log.debug("  continue -> block {d}", .{loop_ctx.cond_block});
     }
 
@@ -1192,7 +1088,7 @@ pub const Lowerer = struct {
             if (result == ir.null_node) {
                 result = segment_node;
             } else {
-                result = try fb.emitBinary(.str_concat, result, segment_node, slice_type, si.span);
+                result = try fb.emitStrConcat(result, segment_node, si.span);
             }
         }
 
@@ -1242,9 +1138,7 @@ pub const Lowerer = struct {
         }
 
         // Fallback: emit null pointer
-        const node = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
-            .withAux(0);
-        return try fb.emit(node);
+        return try fb.emitConstInt(0, Span.fromPos(Pos.zero));
     }
 
     fn lowerIdentifier(self: *Lowerer, ident: ast.Identifier) Allocator.Error!ir.NodeIndex {
@@ -1252,16 +1146,12 @@ pub const Lowerer = struct {
 
         if (fb.lookupLocal(ident.name)) |local_idx| {
             const local = fb.locals.items[local_idx];
-            const load = ir.Node.init(.load, local.type_idx, Span.fromPos(Pos.zero))
-                .withArgs(&.{@intCast(local_idx)});
-            return try fb.emit(load);
+            return try fb.emitLoadLocal(local_idx, local.type_idx, Span.fromPos(Pos.zero));
         }
 
         // Check compile-time constants
         if (self.const_values.get(ident.name)) |value| {
-            const node = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                .withAux(value);
-            return try fb.emit(node);
+            return try fb.emitConstInt(value, Span.fromPos(Pos.zero));
         }
 
         // Unknown identifier - shouldn't happen after type checking
@@ -1295,16 +1185,14 @@ pub const Lowerer = struct {
             .identifier => |ident| {
                 // Taking address of a local variable
                 if (fb.lookupLocal(ident.name)) |local_idx| {
-                    const node = ir.Node.init(.addr_local, ptr_type, ao.span)
-                        .withAux(@as(i64, @intCast(local_idx)));
-                    return try fb.emit(node);
+                    return try fb.emitAddrLocal(local_idx, ptr_type, ao.span);
                 }
                 // Not a local - shouldn't happen for now
                 return ir.null_node;
             },
             .field_access => |fa| {
                 // Taking address of a struct field: &s.field
-                // First get the address of the base, then add field offset
+                // Get address of base struct, then add field offset using add op
                 const base_type = self.checker.expr_types.get(fa.base) orelse TypeRegistry.INVALID;
                 const t = self.type_reg.get(base_type);
                 if (t == .struct_type) {
@@ -1312,11 +1200,14 @@ pub const Lowerer = struct {
                         if (std.mem.eql(u8, field.name, fa.field)) {
                             // Get address of base struct
                             const base_addr = try self.lowerAddrOfExpr(fa.base);
-                            // Emit addr_field to add offset
-                            const node = ir.Node.init(.addr_field, ptr_type, ao.span)
-                                .withAux(@as(i64, @intCast(field.offset)))
-                                .withArgs(&[_]ir.NodeIndex{base_addr});
-                            return try fb.emit(node);
+
+                            // If offset is 0, just return the base address
+                            if (field.offset == 0) {
+                                return base_addr;
+                            }
+
+                            // Use addr_offset to compute base_addr + offset
+                            return try fb.emitAddrOffset(base_addr, @intCast(field.offset), ptr_type, ao.span);
                         }
                     }
                 }
@@ -1326,9 +1217,7 @@ pub const Lowerer = struct {
                 // Taking address of array element: &arr[i]
                 const base_addr = try self.lowerAddrOfExpr(idx.base);
                 const index_val = try self.lowerExpr(idx.index);
-                const node = ir.Node.init(.addr_index, ptr_type, ao.span)
-                    .withArgs(&[_]ir.NodeIndex{ base_addr, index_val });
-                return try fb.emit(node);
+                return try fb.emitAddrIndex(base_addr, index_val, 1, ptr_type, ao.span);
             },
             else => {
                 // Can't take address of arbitrary expressions
@@ -1348,9 +1237,38 @@ pub const Lowerer = struct {
                 if (fb.lookupLocal(ident.name)) |local_idx| {
                     const operand_type = self.checker.expr_types.get(expr_idx) orelse TypeRegistry.INVALID;
                     const ptr_type = self.type_reg.makePointer(operand_type) catch return ir.null_node;
-                    const node = ir.Node.init(.addr_local, ptr_type, ident.span)
-                        .withAux(@as(i64, @intCast(local_idx)));
-                    return try fb.emit(node);
+                    return try fb.emitAddrLocal(local_idx, ptr_type, ident.span);
+                }
+                return ir.null_node;
+            },
+            .deref => |d| {
+                // Address of a dereference: &(ptr.*) = ptr
+                // The pointer value IS the address of what it points to
+                return self.lowerExpr(d.operand);
+            },
+            .field_access => |fa| {
+                // Address of struct field: &s.field
+                // Get address of base struct, then add field offset using add op
+                const base_type = self.checker.expr_types.get(fa.base) orelse TypeRegistry.INVALID;
+                const t = self.type_reg.get(base_type);
+                if (t == .struct_type) {
+                    for (t.struct_type.fields) |field| {
+                        if (std.mem.eql(u8, field.name, fa.field)) {
+                            // Get address of base struct
+                            const base_addr = try self.lowerAddrOfExpr(fa.base);
+                            // Compute result pointer type
+                            const field_type = self.checker.expr_types.get(expr_idx) orelse TypeRegistry.INVALID;
+                            const ptr_type = self.type_reg.makePointer(field_type) catch return ir.null_node;
+
+                            // If offset is 0, just return the base address
+                            if (field.offset == 0) {
+                                return base_addr;
+                            }
+
+                            // Use addr_offset to compute base_addr + offset
+                            return try fb.emitAddrOffset(base_addr, @intCast(field.offset), ptr_type, fa.span);
+                        }
+                    }
                 }
                 return ir.null_node;
             },
@@ -1373,10 +1291,8 @@ pub const Lowerer = struct {
         const ptr_type = self.checker.expr_types.get(d.operand) orelse TypeRegistry.INVALID;
         const elem_type = self.type_reg.pointerElem(ptr_type);
 
-        // Emit a ptr_load operation (load through pointer)
-        const node = ir.Node.init(.ptr_load, elem_type, d.span)
-            .withArgs(&[_]ir.NodeIndex{ptr_val});
-        return try fb.emit(node);
+        // Emit a ptr_load_value operation (load through computed pointer)
+        return try fb.emitPtrLoadValue(ptr_val, elem_type, d.span);
     }
 
     fn lowerLiteral(self: *Lowerer, lit: ast.Literal) Allocator.Error!ir.NodeIndex {
@@ -1386,14 +1302,12 @@ pub const Lowerer = struct {
             .int => {
                 // Use base 0 to auto-detect: 0x for hex, 0b for binary, 0o for octal
                 const value = std.fmt.parseInt(i64, lit.value, 0) catch 0;
-                const node = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                    .withAux(value);
                 log.debug("  const_int: {d}", .{value});
-                return try fb.emit(node);
+                return try fb.emitConstInt(value, Span.fromPos(Pos.zero));
             },
             .float => {
-                const node = ir.Node.init(.const_float, TypeRegistry.FLOAT, Span.fromPos(Pos.zero));
-                return try fb.emit(node);
+                const value = std.fmt.parseFloat(f64, lit.value) catch 0.0;
+                return try fb.emitConstFloat(value, Span.fromPos(Pos.zero));
             },
             .string => {
                 // Strip quotes from string literal
@@ -1410,23 +1324,16 @@ pub const Lowerer = struct {
             },
             .char => {
                 const value: i64 = if (lit.value.len > 0) @intCast(lit.value[0]) else 0;
-                const node = ir.Node.init(.const_int, TypeRegistry.I32, Span.fromPos(Pos.zero))
-                    .withAux(value);
-                return try fb.emit(node);
+                return try fb.emitConstInt(value, Span.fromPos(Pos.zero));
             },
             .true_lit => {
-                const node = ir.Node.init(.const_bool, TypeRegistry.BOOL, Span.fromPos(Pos.zero))
-                    .withAux(1);
-                return try fb.emit(node);
+                return try fb.emitConstBool(true, Span.fromPos(Pos.zero));
             },
             .false_lit => {
-                const node = ir.Node.init(.const_bool, TypeRegistry.BOOL, Span.fromPos(Pos.zero))
-                    .withAux(0);
-                return try fb.emit(node);
+                return try fb.emitConstBool(false, Span.fromPos(Pos.zero));
             },
             .null_lit => {
-                const node = ir.Node.init(.const_null, TypeRegistry.VOID, Span.fromPos(Pos.zero));
-                return try fb.emit(node);
+                return try fb.emitConstNull(TypeRegistry.VOID, Span.fromPos(Pos.zero));
             },
         };
     }
@@ -1445,7 +1352,7 @@ pub const Lowerer = struct {
         const left = try self.lowerExpr(bin.left);
         const right = try self.lowerExpr(bin.right);
 
-        const op: ir.Op = switch (bin.op) {
+        const op: ir.BinaryOp = switch (bin.op) {
             .plus => .add,
             .minus => .sub,
             .star => .mul,
@@ -1467,10 +1374,8 @@ pub const Lowerer = struct {
             .equal_equal, .bang_equal, .less, .less_equal, .greater, .greater_equal => TypeRegistry.BOOL,
             else => TypeRegistry.INT,
         };
-        const node = ir.Node.init(op, result_type, Span.fromPos(Pos.zero))
-            .withArgs(&.{ left, right });
 
-        return try fb.emit(node);
+        return try fb.emitBinary(op, left, right, result_type, Span.fromPos(Pos.zero));
     }
 
     fn lowerUnary(self: *Lowerer, un: ast.Unary) Allocator.Error!ir.NodeIndex {
@@ -1478,17 +1383,14 @@ pub const Lowerer = struct {
 
         const operand = try self.lowerExpr(un.operand);
 
-        const op: ir.Op = switch (un.op) {
+        const op: ir.UnaryOp = switch (un.op) {
             .minus => .neg,
             .bang, .kw_not => .not,
             else => .neg,
         };
 
         const result_type = TypeRegistry.INT;
-        const node = ir.Node.init(op, result_type, Span.fromPos(Pos.zero))
-            .withArgs(&.{operand});
-
-        return try fb.emit(node);
+        return try fb.emitUnary(op, operand, result_type, Span.fromPos(Pos.zero));
     }
 
     fn lowerCall(self: *Lowerer, call: ast.Call) Allocator.Error!ir.NodeIndex {
@@ -1707,12 +1609,10 @@ pub const Lowerer = struct {
             }
         }
 
-        const node = ir.Node.init(.call, return_type, Span.fromPos(Pos.zero))
-            .withArgs(try self.allocator.dupe(ir.NodeIndex, args.items))
-            .withAuxStr(func_name);
-
         log.debug("  call: {s} return_type={d}", .{ func_name, return_type });
-        return try fb.emit(node);
+        // Dupe the args since the ArrayList will be freed
+        const args_slice = try self.allocator.dupe(ir.NodeIndex, args.items);
+        return try fb.emitCall(func_name, args_slice, false, return_type, Span.fromPos(Pos.zero));
     }
 
     fn lowerBuiltinLen(self: *Lowerer, call: ast.Call) Allocator.Error!ir.NodeIndex {
@@ -1734,10 +1634,8 @@ pub const Lowerer = struct {
                             else
                                 raw;
                             // Return constant with string length
-                            const node = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                                .withAux(@intCast(stripped.len));
                             log.debug("  len() constant folded to {d}", .{stripped.len});
-                            return try fb.emit(node);
+                            return try fb.emitConstInt(@intCast(stripped.len), Span.fromPos(Pos.zero));
                         }
                     },
                     .slice_expr => |se| {
@@ -1746,18 +1644,14 @@ pub const Lowerer = struct {
                         const end_val = self.tryGetConstInt(se.end);
                         if (start_val != null and end_val != null) {
                             const len_val = end_val.? - start_val.?;
-                            const node = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                                .withAux(@intCast(len_val));
                             log.debug("  len(slice) constant folded to {d}", .{len_val});
-                            return try fb.emit(node);
+                            return try fb.emitConstInt(@intCast(len_val), Span.fromPos(Pos.zero));
                         }
                     },
                     .array_literal => |al| {
                         // Array literal length is known at compile time
-                        const node = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                            .withAux(@intCast(al.elements.len));
                         log.debug("  len(array) constant folded to {d}", .{al.elements.len});
-                        return try fb.emit(node);
+                        return try fb.emitConstInt(@intCast(al.elements.len), Span.fromPos(Pos.zero));
                     },
                     .identifier => |ident| {
                         // Check if this is a slice or array variable
@@ -1768,27 +1662,19 @@ pub const Lowerer = struct {
                             switch (local_type) {
                                 .slice => {
                                     // For slices, load len from offset 8 (ptr is at 0, len is at 8)
-                                    // Emit field access: args[0] = local index, aux = 8 (len offset)
-                                    const node = ir.Node.init(.field, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                                        .withArgs(&.{@as(ir.NodeIndex, @intCast(local_idx))})
-                                        .withAux(8); // len is at offset 8
                                     log.debug("  len(slice var) runtime: local={d}, offset=8", .{local_idx});
-                                    return try fb.emit(node);
+                                    return try fb.emitFieldLocal(local_idx, 8, TypeRegistry.INT, Span.fromPos(Pos.zero));
                                 },
                                 .array => |a| {
                                     // Array length is known at compile time
-                                    const node = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                                        .withAux(@intCast(a.length));
                                     log.debug("  len(array var) constant folded to {d}", .{a.length});
-                                    return try fb.emit(node);
+                                    return try fb.emitConstInt(@intCast(a.length), Span.fromPos(Pos.zero));
                                 },
                                 .list_type => {
                                     // List length via runtime call
-                                    const list_node = try fb.emitLocalLoad(@intCast(local_idx), local.type_idx, Span.fromPos(Pos.zero));
-                                    const node = ir.Node.init(.list_len, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                                        .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{list_node}));
+                                    const list_node = try fb.emitLoadLocal(local_idx, local.type_idx, Span.fromPos(Pos.zero));
                                     log.debug("  len(list var) runtime: local={d}", .{local_idx});
-                                    return try fb.emit(node);
+                                    return try fb.emitListLen(list_node, Span.fromPos(Pos.zero));
                                 },
                                 else => {},
                             }
@@ -1805,10 +1691,8 @@ pub const Lowerer = struct {
                             if (field_type == .list_type) {
                                 // Lower the field access to get the list handle, then call list_len
                                 const list_node = try self.lowerFieldAccess(fa);
-                                const node = ir.Node.init(.list_len, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                                    .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{list_node}));
                                 log.debug("  len(chained.list_field) runtime: local={d}, offset={d}", .{ local_idx, chain_info.cumulative_offset });
-                                return try fb.emit(node);
+                                return try fb.emitListLen(list_node, Span.fromPos(Pos.zero));
                             } else if (field_type == .slice) {
                                 // For slice fields, the length is at offset cumulative_offset + 8
                                 const len_offset: u32 = chain_info.cumulative_offset + 8;
@@ -1819,17 +1703,11 @@ pub const Lowerer = struct {
                                     self.type_reg.sizeOf(local.type_idx) > 16;
 
                                 if (chain_info.is_ptr_deref or is_large_struct_param) {
-                                    const node = ir.Node.init(.ptr_field, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                                        .withArgs(&.{@as(ir.NodeIndex, @intCast(local_idx))})
-                                        .withAux(@intCast(len_offset));
                                     log.debug("  len(chained.slice_field) ptr: local={d}, offset={d}", .{ local_idx, len_offset });
-                                    return try fb.emit(node);
+                                    return try fb.emitPtrField(local_idx, @intCast(len_offset), TypeRegistry.INT, Span.fromPos(Pos.zero));
                                 } else {
-                                    const node = ir.Node.init(.field_local, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                                        .withArgs(&.{@as(ir.NodeIndex, @intCast(local_idx))})
-                                        .withAux(@intCast(len_offset));
                                     log.debug("  len(chained.slice_field) local: local={d}, offset={d}", .{ local_idx, len_offset });
-                                    return try fb.emit(node);
+                                    return try fb.emitFieldLocal(local_idx, @intCast(len_offset), TypeRegistry.INT, Span.fromPos(Pos.zero));
                                 }
                             }
                         }
@@ -1843,10 +1721,8 @@ pub const Lowerer = struct {
         // For non-constant expressions, we need runtime len support
         // For now, just lower the argument and emit a nop (TODO: proper runtime len)
         _ = try self.lowerExpr(call.args[0]);
-        const node = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
-            .withAux(0);  // Placeholder - runtime len not yet implemented
         log.debug("  len() runtime (not yet implemented)", .{});
-        return try fb.emit(node);
+        return try fb.emitConstInt(0, Span.fromPos(Pos.zero)); // Placeholder
     }
 
     /// Try to extract a constant integer from an expression.
@@ -1879,12 +1755,8 @@ pub const Lowerer = struct {
         const arg_node = try self.lowerExpr(call.args[0]);
 
         // Emit as a call node - codegen will recognize "print"/"println" and emit syscall
-        const node = ir.Node.init(.call, TypeRegistry.VOID, Span.fromPos(Pos.zero))
-            .withArgs(&.{arg_node})
-            .withAuxStr(func_name);
-
         log.debug("  {s}: builtin", .{func_name});
-        return try fb.emit(node);
+        return try fb.emitCall(func_name, &.{arg_node}, true, TypeRegistry.VOID, Span.fromPos(Pos.zero));
     }
 
     fn lowerBuiltinIntFromEnum(self: *Lowerer, call: ast.Call) Allocator.Error!ir.NodeIndex {
@@ -1912,10 +1784,8 @@ pub const Lowerer = struct {
                             for (enum_type.variants) |variant| {
                                 if (std.mem.eql(u8, variant.name, fa.field)) {
                                     // Return the variant's integer value
-                                    const node = ir.Node.init(.const_int, enum_type.backing_type, Span.fromPos(Pos.zero))
-                                        .withAux(variant.value);
                                     log.debug("  @intFromEnum({s}.{s}) = {d}", .{ type_name, fa.field, variant.value });
-                                    return try fb.emit(node);
+                                    return try fb.emitConstIntTyped(variant.value, enum_type.backing_type, Span.fromPos(Pos.zero));
                                 }
                             }
                         }
@@ -1993,9 +1863,7 @@ pub const Lowerer = struct {
         log.debug("  @maxInt({s}) = {d}", .{ type_name, max_value });
 
         // Use i64 as result type since these are compile-time constants
-        const node = ir.Node.init(.const_int, TypeRegistry.I64, Span.fromPos(Pos.zero))
-            .withAux(max_value);
-        return try fb.emit(node);
+        return try fb.emitConstIntTyped(max_value, TypeRegistry.I64, Span.fromPos(Pos.zero));
     }
 
     /// Lower builtin @minInt() - compile-time evaluation of integer min value
@@ -2029,9 +1897,7 @@ pub const Lowerer = struct {
         log.debug("  @minInt({s}) = {d}", .{ type_name, min_value });
 
         // Use i64 as result type since these are compile-time constants
-        const node = ir.Node.init(.const_int, TypeRegistry.I64, Span.fromPos(Pos.zero))
-            .withAux(min_value);
-        return try fb.emit(node);
+        return try fb.emitConstIntTyped(min_value, TypeRegistry.I64, Span.fromPos(Pos.zero));
     }
 
     /// Lower builtin @fileRead(path) - read file contents to string
@@ -2044,9 +1910,7 @@ pub const Lowerer = struct {
         const path_node = try self.lowerExpr(call.args[0]);
 
         // Emit file_read op - result is a string (slice type)
-        const node = ir.Node.init(.file_read, TypeRegistry.STRING, Span.fromPos(Pos.zero))
-            .withArgs(&.{path_node});
-        return try fb.emit(node);
+        return try fb.emitFileRead(path_node, Span.fromPos(Pos.zero));
     }
 
     /// Lower builtin @fileWrite(path, data_ptr, data_len) - write bytes to file
@@ -2061,9 +1925,7 @@ pub const Lowerer = struct {
         const data_len_node = try self.lowerExpr(call.args[2]);
 
         // Emit file_write op - result is i64 (success/failure)
-        const node = ir.Node.init(.file_write, TypeRegistry.I64, Span.fromPos(Pos.zero))
-            .withArgs(&.{ path_node, data_ptr_node, data_len_node });
-        return try fb.emit(node);
+        return try fb.emitFileWrite(path_node, data_ptr_node, data_len_node, Span.fromPos(Pos.zero));
     }
 
     /// Lower builtin @fileExists(path) - check if file exists
@@ -2076,9 +1938,7 @@ pub const Lowerer = struct {
         const path_node = try self.lowerExpr(call.args[0]);
 
         // Emit file_exists op - result is i64 (1 if exists, 0 if not)
-        const node = ir.Node.init(.file_exists, TypeRegistry.I64, Span.fromPos(Pos.zero))
-            .withArgs(&.{path_node});
-        return try fb.emit(node);
+        return try fb.emitFileExists(path_node, Span.fromPos(Pos.zero));
     }
 
     /// Lower builtin @fileFree(ptr) - free memory from file_read
@@ -2091,9 +1951,7 @@ pub const Lowerer = struct {
         const ptr_node = try self.lowerExpr(call.args[0]);
 
         // Emit file_free op - void result
-        const node = ir.Node.init(.file_free, TypeRegistry.VOID, Span.fromPos(Pos.zero))
-            .withArgs(&.{ptr_node});
-        return try fb.emit(node);
+        return try fb.emitFileFree(ptr_node, Span.fromPos(Pos.zero));
     }
 
     /// Lower builtin @listDataPtr(handle) - get raw data pointer from list
@@ -2106,9 +1964,7 @@ pub const Lowerer = struct {
         const handle_node = try self.lowerExpr(call.args[0]);
 
         // Emit list_data_ptr op - result is i64 (pointer as integer)
-        const node = ir.Node.init(.list_data_ptr, TypeRegistry.I64, Span.fromPos(Pos.zero))
-            .withArgs(&.{handle_node});
-        return try fb.emit(node);
+        return try fb.emitListDataPtr(handle_node, Span.fromPos(Pos.zero));
     }
 
     /// Lower builtin @listByteSize(handle) - get total byte size of list data
@@ -2121,9 +1977,7 @@ pub const Lowerer = struct {
         const handle_node = try self.lowerExpr(call.args[0]);
 
         // Emit list_byte_size op - result is i64
-        const node = ir.Node.init(.list_byte_size, TypeRegistry.I64, Span.fromPos(Pos.zero))
-            .withArgs(&.{handle_node});
-        return try fb.emit(node);
+        return try fb.emitListByteSize(handle_node, Span.fromPos(Pos.zero));
     }
 
     /// Lower builtin @argsCount() - get number of command-line arguments
@@ -2132,8 +1986,7 @@ pub const Lowerer = struct {
         _ = call;
 
         // Emit args_count op - result is i64
-        const node = ir.Node.init(.args_count, TypeRegistry.I64, Span.fromPos(Pos.zero));
-        return try fb.emit(node);
+        return try fb.emitArgsCount(Span.fromPos(Pos.zero));
     }
 
     /// Lower builtin @argsGet(index) - get command-line argument by index
@@ -2146,9 +1999,7 @@ pub const Lowerer = struct {
         const index_node = try self.lowerExpr(call.args[0]);
 
         // Emit args_get op - result is string (ptr, len)
-        const node = ir.Node.init(.args_get, TypeRegistry.STRING, Span.fromPos(Pos.zero))
-            .withArgs(&.{index_node});
-        return try fb.emit(node);
+        return try fb.emitArgsGet(index_node, Span.fromPos(Pos.zero));
     }
 
     /// Lower union construction: UnionType.variant(payload)
@@ -2179,17 +2030,13 @@ pub const Lowerer = struct {
         log.debug("  union_init: {s}.{s} (tag={d})", .{ union_type.name, variant_name, variant_idx });
 
         // Lower the payload argument (if any)
-        var payload_node: ir.NodeIndex = ir.null_node;
+        var payload_node: ?ir.NodeIndex = null;
         if (call.args.len > 0) {
             payload_node = try self.lowerExpr(call.args[0]);
         }
 
         // Create union_init IR node
-        const node = ir.Node.init(.union_init, type_idx, Span.fromPos(Pos.zero))
-            .withAux(variant_idx)
-            .withArgs(if (payload_node != ir.null_node) &.{payload_node} else &.{});
-
-        return try fb.emit(node);
+        return try fb.emitUnionInit(variant_idx, payload_node, type_idx, Span.fromPos(Pos.zero));
     }
 
     /// Lower Map method calls: map.set(k, v), map.get(k), map.has(k), map.size()
@@ -2203,7 +2050,7 @@ pub const Lowerer = struct {
         const fb = self.current_func orelse return ir.null_node;
 
         // Load the map handle (use actual map type)
-        const map_handle = try fb.emitLocalLoad(local_idx, map_type_idx, Span.fromPos(Pos.zero));
+        const map_handle = try fb.emitLoadLocal(@intCast(local_idx), map_type_idx, Span.fromPos(Pos.zero));
 
         // Get the map's key and value types
         const key_type = self.type_ctx.getMapKeyType(map_type_idx) orelse TypeRegistry.STRING;
@@ -2233,13 +2080,9 @@ pub const Lowerer = struct {
             const value_node = try self.lowerExpr(call.args[1]);
 
             // The runtime will receive (handle, key_ptr, key_len, value)
-            // aux contains the key type for codegen to select the right runtime function
-            const node = ir.Node.init(.map_set, TypeRegistry.VOID, Span.fromPos(Pos.zero))
-                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ map_handle, key_ptr_node, key_len_node, value_node }))
-                .withAux(key_type);
-
+            _ = key_type; // Key type can be derived from map type in codegen
             log.debug("  map.set() -> map_set IR op", .{});
-            return try fb.emit(node);
+            return try fb.emitMapSet(map_handle, key_ptr_node, key_len_node, value_node, Span.fromPos(Pos.zero));
         } else if (std.mem.eql(u8, method_name, "get")) {
             // map.get(key) -> map_get(handle, key_ptr, key_len)
             if (call.args.len != 1) {
@@ -2249,13 +2092,9 @@ pub const Lowerer = struct {
 
             const key_node = try self.lowerExpr(call.args[0]);
 
-            // Use the map's value type for the result, aux contains key type
-            const node = ir.Node.init(.map_get, value_type, Span.fromPos(Pos.zero))
-                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ map_handle, key_node }))
-                .withAux(key_type);
-
+            // Use the map's value type for the result
             log.debug("  map.get() -> map_get IR op, value_type={d}", .{value_type});
-            return try fb.emit(node);
+            return try fb.emitMapGet(map_handle, key_node, key_node, value_type, Span.fromPos(Pos.zero));
         } else if (std.mem.eql(u8, method_name, "has")) {
             // map.has(key) -> map_has(handle, key_ptr, key_len)
             if (call.args.len != 1) {
@@ -2265,13 +2104,8 @@ pub const Lowerer = struct {
 
             const key_node = try self.lowerExpr(call.args[0]);
 
-            // aux contains key type for integer key support
-            const node = ir.Node.init(.map_has, TypeRegistry.BOOL, Span.fromPos(Pos.zero))
-                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ map_handle, key_node }))
-                .withAux(key_type);
-
-            log.debug("  map.has() -> map_has IR op", .{});
-            return try fb.emit(node);
+            // Need to add emitMapHas - for now use emit directly
+            return try fb.emit(ir.Node.init(.{ .map_has = .{ .handle = map_handle, .key_ptr = key_node, .key_len = key_node } }, TypeRegistry.BOOL, Span.fromPos(Pos.zero)));
         } else if (std.mem.eql(u8, method_name, "size")) {
             // map.size() -> map_size(handle)
             if (call.args.len != 0) {
@@ -2279,11 +2113,8 @@ pub const Lowerer = struct {
                 return ir.null_node;
             }
 
-            const node = ir.Node.init(.map_size, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{map_handle}));
-
             log.debug("  map.size() -> map_size IR op", .{});
-            return try fb.emit(node);
+            return try fb.emit(ir.Node.init(.{ .map_size = .{ .handle = map_handle } }, TypeRegistry.INT, Span.fromPos(Pos.zero)));
         } else {
             log.debug("  unknown map method: {s}", .{method_name});
             return ir.null_node;
@@ -2301,7 +2132,7 @@ pub const Lowerer = struct {
         const fb = self.current_func orelse return ir.null_node;
 
         // Load the list handle (use actual list type)
-        const list_handle = try fb.emitLocalLoad(local_idx, list_type_idx, Span.fromPos(Pos.zero));
+        const list_handle = try fb.emitLoadLocal(@intCast(local_idx), list_type_idx, Span.fromPos(Pos.zero));
 
         // Get the list's element type for get() operations
         const elem_type = self.type_ctx.getListElementType(list_type_idx) orelse TypeRegistry.INT;
@@ -2314,12 +2145,8 @@ pub const Lowerer = struct {
             }
 
             const value_node = try self.lowerExpr(call.args[0]);
-
-            const node = ir.Node.init(.list_push, TypeRegistry.VOID, Span.fromPos(Pos.zero))
-                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ list_handle, value_node }));
-
             log.debug("  list.push() -> list_push IR op", .{});
-            return try fb.emit(node);
+            return try fb.emitListPush(list_handle, value_node, Span.fromPos(Pos.zero));
         } else if (std.mem.eql(u8, method_name, "get")) {
             // list.get(index) -> list_get(handle, index)
             if (call.args.len != 1) {
@@ -2328,13 +2155,8 @@ pub const Lowerer = struct {
             }
 
             const index_node = try self.lowerExpr(call.args[0]);
-
-            // Use the list's element type for the result
-            const node = ir.Node.init(.list_get, elem_type, Span.fromPos(Pos.zero))
-                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ list_handle, index_node }));
-
             log.debug("  list.get() -> list_get IR op, elem_type={d}", .{elem_type});
-            return try fb.emit(node);
+            return try fb.emitListGet(list_handle, index_node, elem_type, Span.fromPos(Pos.zero));
         } else if (std.mem.eql(u8, method_name, "len")) {
             // list.len() -> list_len(handle)
             if (call.args.len != 0) {
@@ -2342,11 +2164,8 @@ pub const Lowerer = struct {
                 return ir.null_node;
             }
 
-            const node = ir.Node.init(.list_len, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{list_handle}));
-
             log.debug("  list.len() -> list_len IR op", .{});
-            return try fb.emit(node);
+            return try fb.emitListLen(list_handle, Span.fromPos(Pos.zero));
         } else {
             log.debug("  unknown list method: {s}", .{method_name});
             return ir.null_node;
@@ -2374,12 +2193,8 @@ pub const Lowerer = struct {
             }
 
             const value_node = try self.lowerExpr(call.args[0]);
-
-            const node = ir.Node.init(.list_push, TypeRegistry.VOID, Span.fromPos(Pos.zero))
-                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ list_handle, value_node }));
-
             log.debug("  list.push() -> list_push IR op (via handle)", .{});
-            return try fb.emit(node);
+            return try fb.emitListPush(list_handle, value_node, Span.fromPos(Pos.zero));
         } else if (std.mem.eql(u8, method_name, "get")) {
             // list.get(index) -> list_get(handle, index)
             if (call.args.len != 1) {
@@ -2388,13 +2203,8 @@ pub const Lowerer = struct {
             }
 
             const index_node = try self.lowerExpr(call.args[0]);
-
-            // Use the list's element type for the result
-            const node = ir.Node.init(.list_get, elem_type, Span.fromPos(Pos.zero))
-                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ list_handle, index_node }));
-
             log.debug("  list.get() -> list_get IR op (via handle), elem_type={d}", .{elem_type});
-            return try fb.emit(node);
+            return try fb.emitListGet(list_handle, index_node, elem_type, Span.fromPos(Pos.zero));
         } else if (std.mem.eql(u8, method_name, "len")) {
             // list.len() -> list_len(handle)
             if (call.args.len != 0) {
@@ -2402,11 +2212,8 @@ pub const Lowerer = struct {
                 return ir.null_node;
             }
 
-            const node = ir.Node.init(.list_len, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{list_handle}));
-
             log.debug("  list.len() -> list_len IR op (via handle)", .{});
-            return try fb.emit(node);
+            return try fb.emitListLen(list_handle, Span.fromPos(Pos.zero));
         } else {
             log.debug("  unknown list method: {s}", .{method_name});
             return ir.null_node;
@@ -2448,12 +2255,9 @@ pub const Lowerer = struct {
 
             const value_node = try self.lowerExpr(call.args[1]);
 
-            const node = ir.Node.init(.map_set, TypeRegistry.VOID, Span.fromPos(Pos.zero))
-                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ map_handle, key_ptr_node, key_len_node, value_node }))
-                .withAux(key_type);
-
+            _ = key_type; // Key type can be derived from map type in codegen
             log.debug("  map.set() -> map_set IR op (via handle)", .{});
-            return try fb.emit(node);
+            return try fb.emitMapSet(map_handle, key_ptr_node, key_len_node, value_node, Span.fromPos(Pos.zero));
         } else if (std.mem.eql(u8, method_name, "get")) {
             // map.get(key)
             if (call.args.len != 1) {
@@ -2462,13 +2266,8 @@ pub const Lowerer = struct {
             }
 
             const key_node = try self.lowerExpr(call.args[0]);
-
-            const node = ir.Node.init(.map_get, value_type, Span.fromPos(Pos.zero))
-                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ map_handle, key_node }))
-                .withAux(key_type);
-
             log.debug("  map.get() -> map_get IR op (via handle), value_type={d}", .{value_type});
-            return try fb.emit(node);
+            return try fb.emitMapGet(map_handle, key_node, key_node, value_type, Span.fromPos(Pos.zero));
         } else if (std.mem.eql(u8, method_name, "has")) {
             // map.has(key)
             if (call.args.len != 1) {
@@ -2477,13 +2276,8 @@ pub const Lowerer = struct {
             }
 
             const key_node = try self.lowerExpr(call.args[0]);
-
-            const node = ir.Node.init(.map_has, TypeRegistry.BOOL, Span.fromPos(Pos.zero))
-                .withArgs(try self.allocator.dupe(ir.NodeIndex, &.{ map_handle, key_node }))
-                .withAux(key_type);
-
             log.debug("  map.has() -> map_has IR op (via handle)", .{});
-            return try fb.emit(node);
+            return try fb.emit(ir.Node.init(.{ .map_has = .{ .handle = map_handle, .key_ptr = key_node, .key_len = key_node } }, TypeRegistry.BOOL, Span.fromPos(Pos.zero)));
         } else {
             log.debug("  unknown map method: {s}", .{method_name});
             return ir.null_node;
@@ -2504,23 +2298,17 @@ pub const Lowerer = struct {
         // First argument is the receiver (self)
         if (method.receiver_is_ptr and !is_ptr) {
             // Method wants *T but we have T - emit addr_local
-            const addr_node = ir.Node.init(.addr_local, ptr_type, Span.fromPos(Pos.zero))
-                .withArgs(&.{@intCast(local_idx)});
-            const receiver = try fb.emit(addr_node);
+            const receiver = try fb.emitAddrLocal(@intCast(local_idx), ptr_type, Span.fromPos(Pos.zero));
             try args.append(self.allocator, receiver);
             log.debug("  method receiver: &local[{d}], ptr_type={d}", .{ local_idx, ptr_type });
         } else if (!method.receiver_is_ptr and is_ptr) {
             // Method wants T but we have *T - emit load from local (dereference)
-            const load_node = ir.Node.init(.local, local.type_idx, Span.fromPos(Pos.zero))
-                .withArgs(&.{@intCast(local_idx)});
-            const receiver = try fb.emit(load_node);
+            const receiver = try fb.emitLoadLocal(@intCast(local_idx), local.type_idx, Span.fromPos(Pos.zero));
             try args.append(self.allocator, receiver);
             log.debug("  method receiver: *local[{d}]", .{local_idx});
         } else {
             // Types match - pass address for both cases (pointer for ptr method, address for value method)
-            const addr_node = ir.Node.init(.addr_local, ptr_type, Span.fromPos(Pos.zero))
-                .withArgs(&.{@intCast(local_idx)});
-            const receiver = try fb.emit(addr_node);
+            const receiver = try fb.emitAddrLocal(@intCast(local_idx), ptr_type, Span.fromPos(Pos.zero));
             try args.append(self.allocator, receiver);
             log.debug("  method receiver: &local[{d}], ptr_type={d}", .{ local_idx, ptr_type });
         }
@@ -2535,12 +2323,10 @@ pub const Lowerer = struct {
         // Look up the method's return type from the AST
         const return_type = self.type_ctx.getFuncReturnType(method.func_name) orelse TypeRegistry.VOID;
 
-        const node = ir.Node.init(.call, return_type, Span.fromPos(Pos.zero))
-            .withArgs(try self.allocator.dupe(ir.NodeIndex, args.items))
-            .withAuxStr(method.func_name);
-
         log.debug("  method call: {s}({d} args) return_type={d}", .{ method.func_name, args.items.len, return_type });
-        return try fb.emit(node);
+        // Dupe the args since the ArrayList will be freed
+        const args_slice = try self.allocator.dupe(ir.NodeIndex, args.items);
+        return try fb.emitCall(method.func_name, args_slice, false, return_type, Span.fromPos(Pos.zero));
     }
 
     fn lowerIndex(self: *Lowerer, index: ast.Index) Allocator.Error!ir.NodeIndex {
@@ -2569,23 +2355,16 @@ pub const Lowerer = struct {
                             const idx_val = std.fmt.parseInt(u32, lit.value, 0) catch 0;
                             const offset = idx_val * elem_size;
 
-                            // Emit addr_field with computed offset (reusing struct field access pattern)
-                            const addr_node = ir.Node.init(.addr_field, arr.elem, Span.fromPos(Pos.zero))
-                                .withArgs(&.{@intCast(local_idx)})
-                                .withAux(@intCast(offset));
+                            // Emit field_local with computed offset (load value at array base + offset)
                             log.debug("  array index (const): [{d}] at offset {d}", .{ idx_val, offset });
-                            return try fb.emit(addr_node);
+                            return try fb.emitFieldLocal(local_idx, @intCast(offset), arr.elem, Span.fromPos(Pos.zero));
                         }
                     }
 
-                    // Dynamic index - emit addr_index op
-                    // args[0] = local_idx, args[1] = index value, aux = elem_size
+                    // Dynamic index - emit index_local op
                     const idx_node = try self.lowerExpr(index.index);
-                    const addr_node = ir.Node.init(.addr_index, arr.elem, Span.fromPos(Pos.zero))
-                        .withArgs(&.{ @intCast(local_idx), idx_node })
-                        .withAux(@intCast(elem_size));
                     log.debug("  array index (dynamic): elem_size={d}", .{elem_size});
-                    return try fb.emit(addr_node);
+                    return try fb.emitIndexLocal(local_idx, idx_node, elem_size, arr.elem, Span.fromPos(Pos.zero));
                 } else if (local_type == .slice) {
                     // Slice indexing: slice is ptr+len at local, need to load ptr, then index
                     const slice_type = local_type.slice;
@@ -2595,18 +2374,13 @@ pub const Lowerer = struct {
                     const idx_node = try self.lowerExpr(index.index);
 
                     // Emit slice_index op
-                    // args[0] = slice local index, args[1] = index value, aux = elem_size
-                    const slice_idx_node = ir.Node.init(.slice_index, slice_type.elem, Span.fromPos(Pos.zero))
-                        .withArgs(&.{ @intCast(local_idx), idx_node })
-                        .withAux(@intCast(elem_size));
                     log.debug("  slice index: local={d}, elem_size={d}", .{ local_idx, elem_size });
-                    return try fb.emit(slice_idx_node);
+                    return try fb.emitSliceIndex(local_idx, idx_node, elem_size, slice_type.elem, Span.fromPos(Pos.zero));
                 }
             }
         }
 
         // Fall back to index_value for non-local bases (e.g., container.content[i])
-        // args[0] = IR node ref (base value), args[1] = index value
         const base = try self.lowerExpr(index.base);
         const idx = try self.lowerExpr(index.index);
 
@@ -2615,11 +2389,7 @@ pub const Lowerer = struct {
         const elem_type = self.type_ctx.getElementType(base_type_idx) orelse TypeRegistry.VOID;
         const elem_size: u32 = self.type_reg.sizeOf(elem_type);
 
-        const node = ir.Node.init(.index_value, elem_type, Span.fromPos(Pos.zero))
-            .withArgs(&.{ base, idx })
-            .withAux(@intCast(elem_size));
-
-        return try fb.emit(node);
+        return try fb.emitIndexValue(base, idx, elem_size, elem_type, Span.fromPos(Pos.zero));
     }
 
     fn lowerSliceExpr(self: *Lowerer, slice_expr: ast.SliceExpr) Allocator.Error!ir.NodeIndex {
@@ -2652,9 +2422,7 @@ pub const Lowerer = struct {
                 if (slice_expr.start != ast.null_node) {
                     start = try self.lowerExpr(slice_expr.start);
                 } else {
-                    const zero_node = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                        .withAux(0);
-                    start = try fb.emit(zero_node);
+                    start = try fb.emitConstInt(0, Span.fromPos(Pos.zero));
                 }
 
                 // Lower end index (null_node means use length of base)
@@ -2667,21 +2435,19 @@ pub const Lowerer = struct {
                         .array => |a| @intCast(a.length),
                         else => 0,
                     };
-                    const len_node = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                        .withAux(arr_len);
-                    end = try fb.emit(len_node);
+                    end = try fb.emitConstInt(arr_len, Span.fromPos(Pos.zero));
                 }
 
-                // Emit slice_local op: args[0] = local_idx, args[1] = start, args[2] = end
-                // aux = element size for pointer arithmetic
-                const node = ir.Node.init(.slice_local, slice_type, slice_expr.span)
-                    .withArgs(&.{ @as(ir.NodeIndex, @intCast(local_idx)), start, end })
-                    .withAux(@intCast(elem_size));
-
+                // Emit slice_local op
                 log.debug("  slice expr: local={d}, start node={d}, end node={d}, elem_size={d}", .{
                     local_idx, start, end, elem_size,
                 });
-                return try fb.emit(node);
+                return try fb.emit(ir.Node.init(.{ .slice_local = .{
+                    .local_idx = local_idx,
+                    .start = start,
+                    .end = end,
+                    .elem_size = elem_size,
+                } }, slice_type, slice_expr.span));
             }
         }
 
@@ -2694,9 +2460,7 @@ pub const Lowerer = struct {
         if (slice_expr.start != ast.null_node) {
             start = try self.lowerExpr(slice_expr.start);
         } else {
-            const zero_node = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                .withAux(0);
-            start = try fb.emit(zero_node);
+            start = try fb.emitConstInt(0, Span.fromPos(Pos.zero));
         }
 
         // Lower end index
@@ -2706,19 +2470,19 @@ pub const Lowerer = struct {
         } else {
             // For slices without explicit end, we'd need the length
             // For now, require explicit end on non-local bases
-            const zero_node = ir.Node.init(.const_int, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                .withAux(0);
-            end = try fb.emit(zero_node);
+            end = try fb.emitConstInt(0, Span.fromPos(Pos.zero));
         }
 
         log.debug("  slice expr: value base, start={d}, end={d}, elem_size={d}", .{
             start, end, elem_size,
         });
 
-        const node = ir.Node.init(.slice_value, slice_type, slice_expr.span)
-            .withArgs(&.{ base, start, end })
-            .withAux(@intCast(elem_size));
-        return try fb.emit(node);
+        return try fb.emit(ir.Node.init(.{ .slice_value = .{
+            .base = base,
+            .start = start,
+            .end = end,
+            .elem_size = elem_size,
+        } }, slice_type, slice_expr.span));
     }
 
     fn lowerFieldAccess(self: *Lowerer, field: ast.FieldAccess) Allocator.Error!ir.NodeIndex {
@@ -2746,16 +2510,10 @@ pub const Lowerer = struct {
                 self.type_reg.sizeOf(local.type_idx) > 16;
 
             if (chain_info.is_ptr_deref or is_large_struct_param) {
-                const node = ir.Node.init(.ptr_field, chain_info.field_type_idx, Span.fromPos(Pos.zero))
-                    .withArgs(&.{@intCast(local_idx)})
-                    .withAux(@intCast(chain_info.cumulative_offset));
-                return try fb.emit(node);
+                return try fb.emitPtrField(local_idx, @intCast(chain_info.cumulative_offset), chain_info.field_type_idx, Span.fromPos(Pos.zero));
             } else {
                 // Field access on local variable - use field_local (arg = local index)
-                const field_node = ir.Node.init(.field_local, chain_info.field_type_idx, Span.fromPos(Pos.zero))
-                    .withArgs(&.{@intCast(local_idx)})
-                    .withAux(@intCast(chain_info.cumulative_offset));
-                return try fb.emit(field_node);
+                return try fb.emitFieldLocal(local_idx, @intCast(chain_info.cumulative_offset), chain_info.field_type_idx, Span.fromPos(Pos.zero));
             }
         }
 
@@ -2769,9 +2527,7 @@ pub const Lowerer = struct {
                     const et = ty.enum_type;
                     for (et.variants) |variant| {
                         if (std.mem.eql(u8, variant.name, field.field)) {
-                            const const_node = ir.Node.init(.const_int, et.backing_type, Span.fromPos(Pos.zero))
-                                .withAux(variant.value);
-                            return try fb.emit(const_node);
+                            return try fb.emitConstIntTyped(variant.value, et.backing_type, Span.fromPos(Pos.zero));
                         }
                     }
                 }
@@ -2781,10 +2537,7 @@ pub const Lowerer = struct {
         // Fallback for non-local bases (e.g., function call results) - use field_value (arg = IR node ref)
         log.debug("  field_access: fallback for .{s}", .{field.field});
         const base = try self.lowerExpr(field.base);
-        const node = ir.Node.init(.field_value, chain_info.field_type_idx, Span.fromPos(Pos.zero))
-            .withArgs(&.{base})
-            .withAux(@intCast(chain_info.cumulative_offset));
-        return try fb.emit(node);
+        return try fb.emitFieldValue(base, @intCast(chain_info.cumulative_offset), chain_info.field_type_idx, Span.fromPos(Pos.zero));
     }
 
     /// Resolve a chain of field accesses to find the root local and cumulative offset.
@@ -2843,21 +2596,13 @@ pub const Lowerer = struct {
 
         if (is_large_struct_param) {
             // Use ptr_field for large struct params (passed by pointer)
-            key_ptr_node = try fb.emit(ir.Node.init(.ptr_field, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                .withArgs(&.{@intCast(key_local_idx)})
-                .withAux(@intCast(chain_info.cumulative_offset)));
-            key_len_node = try fb.emit(ir.Node.init(.ptr_field, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                .withArgs(&.{@intCast(key_local_idx)})
-                .withAux(@intCast(chain_info.cumulative_offset + 8)));
+            key_ptr_node = try fb.emitPtrField(key_local_idx, @intCast(chain_info.cumulative_offset), TypeRegistry.INT, Span.fromPos(Pos.zero));
+            key_len_node = try fb.emitPtrField(key_local_idx, @intCast(chain_info.cumulative_offset + 8), TypeRegistry.INT, Span.fromPos(Pos.zero));
             log.debug("  string field key (large struct param): ptr at offset {d}, len at offset {d}", .{ chain_info.cumulative_offset, chain_info.cumulative_offset + 8 });
         } else {
             // Use field_local for regular locals
-            key_ptr_node = try fb.emit(ir.Node.init(.field_local, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                .withArgs(&.{@intCast(key_local_idx)})
-                .withAux(@intCast(chain_info.cumulative_offset)));
-            key_len_node = try fb.emit(ir.Node.init(.field_local, TypeRegistry.INT, Span.fromPos(Pos.zero))
-                .withArgs(&.{@intCast(key_local_idx)})
-                .withAux(@intCast(chain_info.cumulative_offset + 8)));
+            key_ptr_node = try fb.emitFieldLocal(key_local_idx, @intCast(chain_info.cumulative_offset), TypeRegistry.INT, Span.fromPos(Pos.zero));
+            key_len_node = try fb.emitFieldLocal(key_local_idx, @intCast(chain_info.cumulative_offset + 8), TypeRegistry.INT, Span.fromPos(Pos.zero));
             log.debug("  string field key (local): ptr at offset {d}, len at offset {d}", .{ chain_info.cumulative_offset, chain_info.cumulative_offset + 8 });
         }
 
@@ -2981,9 +2726,7 @@ pub const Lowerer = struct {
         try self.lowerStructInitInline(si, temp_local_idx);
 
         // Emit a load to get the struct value (returns reference to the temp)
-        const load = ir.Node.init(.load, struct_type_idx, Span.fromPos(Pos.zero))
-            .withArgs(&.{@intCast(temp_local_idx)});
-        return try fb.emit(load);
+        return try fb.emitLoadLocal(temp_local_idx, struct_type_idx, Span.fromPos(Pos.zero));
     }
 
     fn lowerArrayLiteral(self: *Lowerer, al: ast.ArrayLiteral) Allocator.Error!ir.NodeIndex {
@@ -3012,10 +2755,7 @@ pub const Lowerer = struct {
         // Get the result type from the then branch
         const result_type = self.inferTypeFromExpr(if_expr.then_branch);
 
-        const node = ir.Node.init(.select, result_type, Span.fromPos(Pos.zero))
-            .withArgs(&.{ cond, then_val, else_val });
-
-        return try fb.emit(node);
+        return try fb.emitSelect(cond, then_val, else_val, result_type, Span.fromPos(Pos.zero));
     }
 
     /// Lower switch expression.
@@ -3083,9 +2823,7 @@ pub const Lowerer = struct {
                             const et = subject_type.enum_type;
                             for (et.variants) |variant| {
                                 if (std.mem.eql(u8, variant.name, fa.field)) {
-                                    const const_node = ir.Node.init(.const_int, et.backing_type, Span.fromPos(Pos.zero))
-                                        .withAux(variant.value);
-                                    val = try fb.emit(const_node);
+                                    val = try fb.emitConstIntTyped(variant.value, et.backing_type, Span.fromPos(Pos.zero));
                                     break;
                                 }
                             }
@@ -3097,17 +2835,13 @@ pub const Lowerer = struct {
                     val = try self.lowerExpr(val_idx);
                 }
                 // Generate comparison: subject == val
-                const cmp = ir.Node.init(.eq, TypeRegistry.BOOL, Span.fromPos(Pos.zero))
-                    .withArgs(&.{ subject, val });
-                const cmp_idx = try fb.emit(cmp);
+                const cmp_idx = try fb.emitBinary(.eq, subject, val, TypeRegistry.BOOL, Span.fromPos(Pos.zero));
 
                 if (cond == ir.null_node) {
                     cond = cmp_idx;
                 } else {
                     // OR with previous condition
-                    const or_node = ir.Node.init(.@"or", TypeRegistry.BOOL, Span.fromPos(Pos.zero))
-                        .withArgs(&.{ cond, cmp_idx });
-                    cond = try fb.emit(or_node);
+                    cond = try fb.emitBinary(.@"or", cond, cmp_idx, TypeRegistry.BOOL, Span.fromPos(Pos.zero));
                 }
             }
 
@@ -3118,9 +2852,7 @@ pub const Lowerer = struct {
                 if (result == ir.null_node) {
                     result = case_body;
                 } else {
-                    const select = ir.Node.init(.select, result_type, Span.fromPos(Pos.zero))
-                        .withArgs(&.{ cond, case_body, result });
-                    result = try fb.emit(select);
+                    result = try fb.emitSelect(cond, case_body, result, result_type, Span.fromPos(Pos.zero));
                 }
             }
         }
@@ -3140,9 +2872,7 @@ pub const Lowerer = struct {
         const fb = self.current_func orelse return ir.null_node;
 
         // Extract union tag once
-        const tag_node = ir.Node.init(.union_tag, TypeRegistry.U8, Span.fromPos(Pos.zero))
-            .withArgs(&.{subject});
-        const union_tag = try fb.emit(tag_node);
+        const union_tag = try fb.emitUnionTag(subject, Span.fromPos(Pos.zero));
         log.debug("  union switch (branching): extracting tag", .{});
 
         // Allocate result local to hold the switch result
@@ -3178,12 +2908,8 @@ pub const Lowerer = struct {
             const next_block = try fb.newBlock("next");
 
             // Compare tag to variant index
-            const idx_const = ir.Node.init(.const_int, TypeRegistry.U8, Span.fromPos(Pos.zero))
-                .withAux(variant_idx);
-            const idx_val = try fb.emit(idx_const);
-            const cmp = ir.Node.init(.eq, TypeRegistry.BOOL, Span.fromPos(Pos.zero))
-                .withArgs(&.{ union_tag, idx_val });
-            const cond = try fb.emit(cmp);
+            const idx_val = try fb.emitConstIntTyped(@intCast(variant_idx), TypeRegistry.U8, Span.fromPos(Pos.zero));
+            const cond = try fb.emitBinary(.eq, union_tag, idx_val, TypeRegistry.BOOL, Span.fromPos(Pos.zero));
 
             // Branch: if tag matches, go to case_block; else go to next_block
             _ = try fb.emitBranch(cond, case_block, next_block, Span.fromPos(Pos.zero));
@@ -3198,23 +2924,15 @@ pub const Lowerer = struct {
                 log.debug("  payload capture: {s} type={d} size={d}", .{ capture_name, payload_type, payload_size });
 
                 // Extract payload and store in local
-                const payload_node = ir.Node.init(.union_payload, payload_type, Span.fromPos(Pos.zero))
-                    .withAux(variant_idx)
-                    .withArgs(&.{subject});
-                const payload_val = try fb.emit(payload_node);
-
-                const store = ir.Node.init(.store, payload_type, Span.fromPos(Pos.zero))
-                    .withArgs(&.{ @intCast(local_idx), payload_val });
-                _ = try fb.emit(store);
+                const payload_val = try fb.emitUnionPayload(variant_idx, subject, payload_type, Span.fromPos(Pos.zero));
+                _ = try fb.emitStoreLocal(local_idx, payload_val, Span.fromPos(Pos.zero));
             }
 
             // Evaluate case body (only evaluated when this case matches!)
             const case_body = try self.lowerExpr(case.body);
 
             // Store result to result local
-            const store_result = ir.Node.init(.store, result_type, Span.fromPos(Pos.zero))
-                .withArgs(&.{ @intCast(result_local), case_body });
-            _ = try fb.emit(store_result);
+            _ = try fb.emitStoreLocal(result_local, case_body, Span.fromPos(Pos.zero));
 
             // Jump to continuation
             _ = try fb.emitJump(cont_block, Span.fromPos(Pos.zero));
@@ -3226,9 +2944,7 @@ pub const Lowerer = struct {
         // Handle else body (if any) or use default value
         if (switch_expr.else_body) |else_idx| {
             const else_body = try self.lowerExpr(else_idx);
-            const store_else = ir.Node.init(.store, result_type, Span.fromPos(Pos.zero))
-                .withArgs(&.{ @intCast(result_local), else_body });
-            _ = try fb.emit(store_else);
+            _ = try fb.emitStoreLocal(result_local, else_body, Span.fromPos(Pos.zero));
         }
 
         // Jump to continuation (from else or fallthrough)
@@ -3238,9 +2954,7 @@ pub const Lowerer = struct {
         fb.setBlock(cont_block);
 
         // Load and return result from result local
-        const load_result = ir.Node.init(.load, result_type, Span.fromPos(Pos.zero))
-            .withArgs(&.{@intCast(result_local)});
-        return try fb.emit(load_result);
+        return try fb.emitLoadLocal(result_local, result_type, Span.fromPos(Pos.zero));
     }
 
     // ========================================================================

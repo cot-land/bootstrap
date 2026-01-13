@@ -528,7 +528,7 @@ pub const Driver = struct {
 
             // Copy parameter count and frame size
             ssa_func.param_count = @intCast(ir_func.params.len);
-            ssa_func.frame_size = ir_func.frame_size;
+            ssa_func.frame_size = @intCast(ir_func.frame_size);
 
             // Copy local variable info for codegen offset calculations
             var local_infos = std.ArrayList(ssa.LocalInfo){ .items = &.{}, .capacity = 0 };
@@ -574,47 +574,37 @@ pub const Driver = struct {
             const ssa_block_id = ir_block_to_ssa.get(node.block) orelse 0;
             var ssa_block = func.getBlock(ssa_block_id);
 
-            switch (node.op) {
+            switch (node.data) {
                 // Terminators set block metadata, not values
-                .branch => {
-                    // Use ir.Node accessors for branch format (single source of truth)
+                .branch => |br| {
                     ssa_block.kind = .@"if";
 
                     // Get condition SSA value
-                    if (node.getBranchCondition()) |cond_ir| {
-                        if (ir_to_ssa.get(cond_ir)) |cond_ssa| {
-                            ssa_block.setControl(cond_ssa);
-                        }
+                    if (ir_to_ssa.get(br.condition)) |cond_ssa| {
+                        ssa_block.setControl(cond_ssa);
                     }
 
-                    // Set successors using accessor methods
-                    if (node.getBranchThenBlock()) |then_ir_block| {
-                        if (ir_block_to_ssa.get(then_ir_block)) |then_ssa| {
-                            _ = ssa_block.addSucc(then_ssa);
-                        }
+                    // Set successors
+                    if (ir_block_to_ssa.get(br.then_block)) |then_ssa| {
+                        _ = ssa_block.addSucc(then_ssa);
                     }
-                    if (node.getBranchElseBlock()) |else_ir_block| {
-                        if (ir_block_to_ssa.get(else_ir_block)) |else_ssa| {
-                            _ = ssa_block.addSucc(else_ssa);
-                        }
+                    if (ir_block_to_ssa.get(br.else_block)) |else_ssa| {
+                        _ = ssa_block.addSucc(else_ssa);
                     }
                 },
 
-                .jump => {
-                    // aux = target block
+                .jump => |jmp| {
                     ssa_block.kind = .plain;
-                    const target_ir_block: u32 = @intCast(node.aux);
-                    if (ir_block_to_ssa.get(target_ir_block)) |target_ssa| {
+                    if (ir_block_to_ssa.get(jmp.target)) |target_ssa| {
                         _ = ssa_block.addSucc(target_ssa);
                     }
                 },
 
-                .ret => {
+                .ret => |ret| {
                     ssa_block.kind = .ret;
-                    // args[0] = return value (if any)
-                    if (node.args_len >= 1) {
-                        if (ir_to_ssa.get(node.args()[0])) |ret_val| {
-                            ssa_block.setControl(ret_val);
+                    if (ret.value) |ret_val| {
+                        if (ir_to_ssa.get(ret_val)) |ssa_val| {
+                            ssa_block.setControl(ssa_val);
                         }
                     }
                 },
@@ -1119,20 +1109,7 @@ pub const Driver = struct {
                 // Dump nodes (IR ops)
                 std.debug.print("  ops:\n", .{});
                 for (func.nodes, 0..) |node, i| {
-                    std.debug.print("    [{d}] {s}", .{ i, @tagName(node.op) });
-                    if (node.args_len > 0) {
-                        std.debug.print(" args=[", .{});
-                        const args = node.args();
-                        for (args, 0..) |arg, j| {
-                            if (j > 0) std.debug.print(",", .{});
-                            std.debug.print("{d}", .{arg});
-                        }
-                        std.debug.print("]", .{});
-                    }
-                    if (node.aux != 0) {
-                        std.debug.print(" aux={d}", .{node.aux});
-                    }
-                    std.debug.print("\n", .{});
+                    std.debug.print("    [{d}] {s} type={d}\n", .{ i, @tagName(node.data), node.type_idx });
                 }
             }
         }
@@ -1175,288 +1152,621 @@ pub const Driver = struct {
 
 fn convertIRNode(func: *ssa.Func, node: *const ir.Node, ir_to_ssa: *std.AutoHashMap(u32, ssa.ValueID), block: u32) !ssa.ValueID {
     // Note: terminators (branch, jump, ret) are handled in convertIRToSSA as block metadata
-    const ssa_op: ssa.Op = switch (node.op) {
+    // Map IR2 tagged union to SSA op and extract arguments
+
+    var ssa_op: ssa.Op = undefined;
+    var aux_int: i64 = 0;
+    var aux_str: []const u8 = "";
+
+    // First pass: determine SSA op and copy auxiliary data
+    switch (node.data) {
         // Constants
-        .const_int => .const_int,
-        .const_bool => .const_bool,
-        .const_float => .const_float,
-        .const_null => .const_nil,
-        .const_slice => .const_slice,
+        .const_int => |ci| {
+            ssa_op = .const_int;
+            aux_int = ci.value;
+        },
+        .const_float => |cf| {
+            ssa_op = .const_float;
+            // Store float as bits in aux_int
+            aux_int = @bitCast(cf.value);
+        },
+        .const_bool => |cb| {
+            ssa_op = .const_bool;
+            aux_int = if (cb.value) 1 else 0;
+        },
+        .const_null => {
+            ssa_op = .const_nil;
+        },
+        .const_slice => |cs| {
+            ssa_op = .const_slice;
+            aux_int = cs.string_index;
+        },
 
-        // Arithmetic
-        .add => .add,
-        .sub => .sub,
-        .mul => .mul,
-        .div => .div,
-        .mod => .mod,
-        .neg => .neg,
+        // Binary operations
+        .binary => |bin| {
+            ssa_op = switch (bin.op) {
+                .add => .add,
+                .sub => .sub,
+                .mul => .mul,
+                .div => .div,
+                .mod => .mod,
+                .eq => .eq,
+                .ne => .ne,
+                .lt => .lt,
+                .le => .le,
+                .gt => .gt,
+                .ge => .ge,
+                .@"and" => .@"and",
+                .@"or" => .@"or",
+                .bit_and => .bit_and,
+                .bit_or => .bit_or,
+                .bit_xor => .bit_xor,
+                .shl => .shl,
+                .shr => .shr,
+            };
+        },
 
-        // Comparison
-        .eq => .eq,
-        .ne => .ne,
-        .lt => .lt,
-        .le => .le,
-        .gt => .gt,
-        .ge => .ge,
+        // Unary operations
+        .unary => |un| {
+            ssa_op = switch (un.op) {
+                .neg => .neg,
+                .not => .not,
+                .bit_not => .bit_not,
+            };
+        },
 
-        // Logical
-        .@"and" => .@"and",
-        .@"or" => .@"or",
-        .not => .not,
+        // Local variable access
+        .local_ref, .load_local => {
+            ssa_op = .load;
+        },
+        .addr_local => {
+            ssa_op = .addr;
+        },
+        .store_local => {
+            ssa_op = .store;
+        },
 
-        // Memory
-        .local => .load, // Load local variable (aux = local index)
-        .load => .load,
-        .store => .store,
-        .ptr_load => .ptr_load, // Load through pointer
-        .ptr_store => .ptr_store, // Store through pointer
-        .addr_local => .addr,
-        .addr_field => .field, // Field address becomes field op in SSA
-        .ptr_field => .ptr_field,
-        .ptr_field_store => .ptr_field_store,
+        // Field access
+        .field_local => |fl| {
+            ssa_op = .field_local;
+            aux_int = fl.offset;
+        },
+        .store_local_field => |sf| {
+            ssa_op = .store;
+            aux_int = sf.offset;
+        },
+        .field_value => |fv| {
+            ssa_op = .field_value;
+            aux_int = fv.offset;
+        },
 
-        // Function
-        .call => .call,
-        .param => .arg,
-        .select => .select,
+        // Pointer operations
+        .ptr_load => {
+            ssa_op = .ptr_load;
+        },
+        .ptr_store => {
+            ssa_op = .ptr_store;
+        },
+        .ptr_field => |pf| {
+            ssa_op = .ptr_field;
+            aux_int = pf.offset;
+        },
+        .ptr_field_store => |pfs| {
+            ssa_op = .ptr_field_store;
+            aux_int = pfs.offset;
+        },
+        .ptr_load_value => {
+            ssa_op = .ptr_load;
+        },
+        .ptr_store_value => {
+            ssa_op = .ptr_store;
+        },
 
-        // Struct/Array - new distinct ops
-        .field_local => .field_local,
-        .field_value => .field_value,
-        .index_local => .index_local,
-        .index_value => .index_value,
-        // Legacy ops (map to local variants for backwards compatibility)
-        .field => .field_local,
-        .index => .index_local,
-        .addr_index => .index_local, // Dynamic array indexing on local
+        // Address arithmetic
+        .addr_offset => |ao| {
+            ssa_op = .field_value;
+            aux_int = ao.offset;
+        },
+        .addr_index => |ai| {
+            // addr_index computes address without loading
+            ssa_op = .addr_add;
+            aux_int = ai.elem_size;
+        },
 
-        // Slice operations - new distinct ops
-        .slice_local => .slice_local,
-        .slice_value => .slice_value,
-        // Legacy
-        .slice => .slice_local,
-        .slice_index => .slice_index,
+        // Array/slice indexing
+        .index_local => |il| {
+            ssa_op = .index_local;
+            aux_int = il.elem_size;
+        },
+        .index_value => |iv| {
+            ssa_op = .index_value;
+            aux_int = iv.elem_size;
+        },
+        .slice_local => |sl| {
+            ssa_op = .slice_local;
+            aux_int = sl.elem_size;
+        },
+        .slice_value => |sv| {
+            ssa_op = .slice_value;
+            aux_int = sv.elem_size;
+        },
+        .slice_index => |si| {
+            ssa_op = .slice_index;
+            aux_int = si.elem_size;
+        },
+
+        // Control flow
+        .call => |c| {
+            ssa_op = .call;
+            aux_str = c.func_name;
+        },
+        .select => {
+            ssa_op = .select;
+        },
+        .phi => {
+            ssa_op = .phi;
+        },
 
         // Union operations
-        .union_init => .union_init,
-        .union_tag => .union_tag,
-        .union_payload => .union_payload,
+        .union_init => |ui| {
+            ssa_op = .union_init;
+            aux_int = ui.variant_idx;
+        },
+        .union_tag => {
+            ssa_op = .union_tag;
+        },
+        .union_payload => |up| {
+            ssa_op = .union_payload;
+            aux_int = up.variant_idx;
+        },
 
-        // Map operations (FFI)
-        .map_new => .map_new,
-        .map_set => .map_set,
-        .map_get => .map_get,
-        .map_has => .map_has,
-        .map_size => .map_size,
-        .map_free => .map_free,
+        // List operations
+        .list_new => {
+            ssa_op = .list_new;
+        },
+        .list_push => {
+            ssa_op = .list_push;
+        },
+        .list_get => {
+            ssa_op = .list_get;
+        },
+        .list_set => {
+            ssa_op = .list_set;
+        },
+        .list_len => {
+            ssa_op = .list_len;
+        },
+        .list_free => {
+            ssa_op = .list_free;
+        },
+        .list_data_ptr => {
+            ssa_op = .list_data_ptr;
+        },
+        .list_byte_size => {
+            ssa_op = .list_byte_size;
+        },
 
-        // List operations (FFI)
-        .list_new => .list_new,
-        .list_push => .list_push,
-        .list_get => .list_get,
-        .list_set => .list_set,
-        .list_len => .list_len,
-        .list_free => .list_free,
+        // Map operations
+        .map_new => {
+            ssa_op = .map_new;
+        },
+        .map_set => {
+            ssa_op = .map_set;
+        },
+        .map_get => {
+            ssa_op = .map_get;
+        },
+        .map_has => {
+            ssa_op = .map_has;
+        },
+        .map_size => {
+            ssa_op = .map_size;
+        },
+        .map_free => {
+            ssa_op = .map_free;
+        },
 
         // String operations
-        .str_concat => .str_concat,
+        .str_concat => {
+            ssa_op = .str_concat;
+        },
 
-        // File I/O operations
-        .file_read => .file_read,
-        .file_write => .file_write,
-        .file_exists => .file_exists,
-        .file_free => .file_free,
-        .list_data_ptr => .list_data_ptr,
-        .list_byte_size => .list_byte_size,
+        // File I/O
+        .file_read => {
+            ssa_op = .file_read;
+        },
+        .file_write => {
+            ssa_op = .file_write;
+        },
+        .file_exists => {
+            ssa_op = .file_exists;
+        },
+        .file_free => {
+            ssa_op = .file_free;
+        },
 
-        // Command-line arguments
-        .args_count => .args_count,
-        .args_get => .args_get,
+        // Command line args
+        .args_count => {
+            ssa_op = .args_count;
+        },
+        .args_get => {
+            ssa_op = .args_get;
+        },
 
-        else => .copy,
-    };
+        // Conversions
+        .convert => {
+            ssa_op = .copy;
+        },
+        .ptr_cast => {
+            ssa_op = .copy;
+        },
+
+        // Misc
+        .nop => {
+            ssa_op = .copy;
+        },
+
+        // Terminators handled elsewhere
+        .branch, .jump, .ret => unreachable,
+    }
 
     const value_id = try func.newValue(ssa_op, node.type_idx, block);
     var value = func.getValue(value_id);
 
     // Copy auxiliary data
-    value.aux_int = node.aux;
-    if (node.aux_str.len > 0) {
-        value.aux_str = node.aux_str;
+    value.aux_int = aux_int;
+    if (aux_str.len > 0) {
+        value.aux_str = aux_str;
     }
 
-    // Convert arguments based on op type
-    switch (node.op) {
-        .local, .addr_local => {
-            // local/addr_local: aux = local index (stored as arg[0] for codegen)
-            value.args_storage[0] = @intCast(node.aux); // local index from aux
+    // Second pass: convert arguments based on op type
+    switch (node.data) {
+        .const_int, .const_float, .const_bool, .const_null, .const_slice => {
+            // No arguments for constants
+        },
+
+        .binary => |bin| {
+            if (ir_to_ssa.get(bin.left)) |left_ssa| {
+                try value.addArg(left_ssa, func.allocator);
+            }
+            if (ir_to_ssa.get(bin.right)) |right_ssa| {
+                try value.addArg(right_ssa, func.allocator);
+            }
+        },
+
+        .unary => |un| {
+            if (ir_to_ssa.get(un.operand)) |op_ssa| {
+                try value.addArg(op_ssa, func.allocator);
+            }
+        },
+
+        .local_ref => |lr| {
+            value.args_storage[0] = lr.local_idx;
             value.args_len = 1;
         },
-        .load => {
-            // load: args[0] = local index (raw)
-            if (node.args_len > 0) {
-                value.args_storage[0] = node.args()[0]; // local index, raw
-                value.args_len = 1;
-            }
+        .addr_local => |al| {
+            value.args_storage[0] = al.local_idx;
+            value.args_len = 1;
         },
-        .store => {
-            // store: args[0] = local index (raw), args[1] = value to store (SSA ref)
-            // aux_int = field offset (already copied from node.aux above)
-            if (node.args_len > 0) {
-                value.args_storage[0] = node.args()[0]; // local index, raw
-                value.args_len = 1;
-            }
-            if (node.args_len > 1) {
-                if (ir_to_ssa.get(node.args()[1])) |ssa_val| {
-                    value.args_storage[1] = ssa_val;
-                    value.args_len = 2;
-                }
-            }
+        .load_local => |ll| {
+            value.args_storage[0] = ll.local_idx;
+            value.args_len = 1;
         },
-        .ptr_load => {
-            // ptr_load: args[0] = pointer value (SSA ref)
-            if (node.args_len > 0) {
-                if (ir_to_ssa.get(node.args()[0])) |ssa_ptr| {
-                    value.args_storage[0] = ssa_ptr;
-                    value.args_len = 1;
-                }
-            }
-        },
-        .ptr_store => {
-            // ptr_store: args[0] = pointer value (SSA ref), args[1] = value to store (SSA ref)
-            if (node.args_len > 0) {
-                if (ir_to_ssa.get(node.args()[0])) |ssa_ptr| {
-                    value.args_storage[0] = ssa_ptr;
-                    value.args_len = 1;
-                }
-            }
-            if (node.args_len > 1) {
-                if (ir_to_ssa.get(node.args()[1])) |ssa_val| {
-                    value.args_storage[1] = ssa_val;
-                    value.args_len = 2;
-                }
-            }
-        },
-        .field_local, .field, .ptr_field, .addr_field => {
-            // field_local/ptr_field/addr_field: args[0] is always local index (raw)
-            if (node.args_len > 0) {
-                value.args_storage[0] = node.args()[0]; // local index, raw
-                value.args_len = 1;
-            }
-            // aux_int already copied above (contains field offset)
-        },
-        .field_value => {
-            // field_value: args[0] is always IR node ref (convert to SSA)
-            if (node.args_len > 0) {
-                if (ir_to_ssa.get(node.args()[0])) |ssa_ref| {
-                    value.args_storage[0] = ssa_ref;
-                    value.args_len = 1;
-                }
-            }
-            // aux_int already copied above (contains field offset)
-        },
-        .ptr_field_store => {
-            // ptr_field_store: args[0] = local index (raw), args[1] = value (SSA)
-            // aux = field offset
-            if (node.args_len > 0) {
-                value.args_storage[0] = node.args()[0]; // local index, raw
-            }
-            if (node.args_len > 1) {
-                if (ir_to_ssa.get(node.args()[1])) |ssa_val| {
-                    value.args_storage[1] = ssa_val;
-                }
+        .store_local => |sl| {
+            value.args_storage[0] = sl.local_idx;
+            if (ir_to_ssa.get(sl.value)) |val_ssa| {
+                value.args_storage[1] = val_ssa;
             }
             value.args_len = 2;
-            // aux_int already copied above (contains field offset)
         },
-        .slice_local, .slice => {
-            // slice_local: args[0] = local index (raw), args[1] = start (SSA), args[2] = end (SSA)
-            // aux = element size
-            if (node.args_len > 0) {
-                value.args_storage[0] = node.args()[0]; // local index, raw
+
+        .field_local => |fl| {
+            value.args_storage[0] = fl.local_idx;
+            value.args_len = 1;
+        },
+        .store_local_field => |sf| {
+            value.args_storage[0] = sf.local_idx;
+            if (ir_to_ssa.get(sf.value)) |val_ssa| {
+                value.args_storage[1] = val_ssa;
             }
-            if (node.args_len > 1) {
-                if (ir_to_ssa.get(node.args()[1])) |ssa_val| {
-                    value.args_storage[1] = ssa_val; // start value (SSA ref)
-                }
+            value.args_len = 2;
+        },
+        .field_value => |fv| {
+            if (ir_to_ssa.get(fv.base)) |base_ssa| {
+                value.args_storage[0] = base_ssa;
+                value.args_len = 1;
             }
-            if (node.args_len > 2) {
-                if (ir_to_ssa.get(node.args()[2])) |ssa_val| {
-                    value.args_storage[2] = ssa_val; // end value (SSA ref)
-                }
+        },
+
+        .ptr_load => |pl| {
+            value.args_storage[0] = pl.ptr_local;
+            value.args_len = 1;
+        },
+        .ptr_store => |ps| {
+            value.args_storage[0] = ps.ptr_local;
+            if (ir_to_ssa.get(ps.value)) |val_ssa| {
+                value.args_storage[1] = val_ssa;
+            }
+            value.args_len = 2;
+        },
+        .ptr_field => |pf| {
+            value.args_storage[0] = pf.ptr_local;
+            value.args_len = 1;
+        },
+        .ptr_field_store => |pfs| {
+            value.args_storage[0] = pfs.ptr_local;
+            if (ir_to_ssa.get(pfs.value)) |val_ssa| {
+                value.args_storage[1] = val_ssa;
+            }
+            value.args_len = 2;
+        },
+        .ptr_load_value => |plv| {
+            if (ir_to_ssa.get(plv.ptr)) |ptr_ssa| {
+                try value.addArg(ptr_ssa, func.allocator);
+            }
+        },
+        .ptr_store_value => |psv| {
+            if (ir_to_ssa.get(psv.ptr)) |ptr_ssa| {
+                try value.addArg(ptr_ssa, func.allocator);
+            }
+            if (ir_to_ssa.get(psv.value)) |val_ssa| {
+                try value.addArg(val_ssa, func.allocator);
+            }
+        },
+
+        .addr_offset => |ao| {
+            if (ir_to_ssa.get(ao.base)) |base_ssa| {
+                value.args_storage[0] = base_ssa;
+                value.args_len = 1;
+            }
+        },
+        .addr_index => |ai| {
+            if (ir_to_ssa.get(ai.base)) |base_ssa| {
+                value.args_storage[0] = base_ssa;
+            }
+            if (ir_to_ssa.get(ai.index)) |idx_ssa| {
+                value.args_storage[1] = idx_ssa;
+            }
+            value.args_len = 2;
+        },
+
+        .index_local => |il| {
+            value.args_storage[0] = il.local_idx;
+            if (ir_to_ssa.get(il.index)) |idx_ssa| {
+                value.args_storage[1] = idx_ssa;
+            }
+            value.args_len = 2;
+        },
+        .index_value => |iv| {
+            if (ir_to_ssa.get(iv.base)) |base_ssa| {
+                value.args_storage[0] = base_ssa;
+            }
+            if (ir_to_ssa.get(iv.index)) |idx_ssa| {
+                value.args_storage[1] = idx_ssa;
+            }
+            value.args_len = 2;
+        },
+        .slice_local => |sl| {
+            value.args_storage[0] = sl.local_idx;
+            if (ir_to_ssa.get(sl.start)) |start_ssa| {
+                value.args_storage[1] = start_ssa;
+            }
+            if (ir_to_ssa.get(sl.end)) |end_ssa| {
+                value.args_storage[2] = end_ssa;
             }
             value.args_len = 3;
         },
-        .slice_value => {
-            // slice_value: args[0] = base value (SSA), args[1] = start (SSA), args[2] = end (SSA)
-            // aux = element size
-            if (node.args_len > 0) {
-                if (ir_to_ssa.get(node.args()[0])) |ssa_ref| {
-                    value.args_storage[0] = ssa_ref; // base value (SSA ref)
-                }
+        .slice_value => |sv| {
+            if (ir_to_ssa.get(sv.base)) |base_ssa| {
+                value.args_storage[0] = base_ssa;
             }
-            if (node.args_len > 1) {
-                if (ir_to_ssa.get(node.args()[1])) |ssa_val| {
-                    value.args_storage[1] = ssa_val; // start value (SSA ref)
-                }
+            if (ir_to_ssa.get(sv.start)) |start_ssa| {
+                value.args_storage[1] = start_ssa;
             }
-            if (node.args_len > 2) {
-                if (ir_to_ssa.get(node.args()[2])) |ssa_val| {
-                    value.args_storage[2] = ssa_val; // end value (SSA ref)
-                }
+            if (ir_to_ssa.get(sv.end)) |end_ssa| {
+                value.args_storage[2] = end_ssa;
             }
             value.args_len = 3;
         },
-        .slice_index => {
-            // slice_index: args[0] = local index (raw), args[1] = index (SSA)
-            // aux = element size
-            if (node.args_len > 0) {
-                value.args_storage[0] = node.args()[0]; // local index, raw
-            }
-            if (node.args_len > 1) {
-                if (ir_to_ssa.get(node.args()[1])) |ssa_val| {
-                    value.args_storage[1] = ssa_val; // index value (SSA ref)
-                }
+        .slice_index => |si| {
+            value.args_storage[0] = si.slice_local;
+            if (ir_to_ssa.get(si.index)) |idx_ssa| {
+                value.args_storage[1] = idx_ssa;
             }
             value.args_len = 2;
         },
-        .index_local, .index, .addr_index => {
-            // index_local/addr_index: args[0] is always local index (raw), args[1] = index (SSA)
-            // aux = element size
-            if (node.args_len > 0) {
-                value.args_storage[0] = node.args()[0]; // local index, raw
-            }
-            if (node.args_len > 1) {
-                if (ir_to_ssa.get(node.args()[1])) |ssa_val| {
-                    value.args_storage[1] = ssa_val; // index value (SSA ref)
-                }
-            }
-            value.args_len = 2;
-        },
-        .index_value => {
-            // index_value: args[0] = base value (SSA), args[1] = index (SSA)
-            // aux = element size
-            if (node.args_len > 0) {
-                if (ir_to_ssa.get(node.args()[0])) |ssa_ref| {
-                    value.args_storage[0] = ssa_ref; // base value (SSA ref)
-                }
-            }
-            if (node.args_len > 1) {
-                if (ir_to_ssa.get(node.args()[1])) |ssa_val| {
-                    value.args_storage[1] = ssa_val; // index value (SSA ref)
-                }
-            }
-            value.args_len = 2;
-        },
-        else => {
-            // All other ops: convert all args to SSA refs
-            // Use addArg to handle overflow to args_extra properly
-            for (node.args()) |ir_arg| {
+
+        .call => |c| {
+            for (c.args) |ir_arg| {
                 if (ir_to_ssa.get(ir_arg)) |ssa_arg| {
                     try value.addArg(ssa_arg, func.allocator);
                 }
             }
         },
+
+        .select => |s| {
+            if (ir_to_ssa.get(s.condition)) |cond_ssa| {
+                try value.addArg(cond_ssa, func.allocator);
+            }
+            if (ir_to_ssa.get(s.then_value)) |then_ssa| {
+                try value.addArg(then_ssa, func.allocator);
+            }
+            if (ir_to_ssa.get(s.else_value)) |else_ssa| {
+                try value.addArg(else_ssa, func.allocator);
+            }
+        },
+
+        .phi => |p| {
+            for (p.sources) |src| {
+                if (ir_to_ssa.get(src.value)) |val_ssa| {
+                    try value.addArg(val_ssa, func.allocator);
+                }
+            }
+        },
+
+        .union_init => |ui| {
+            if (ui.payload) |payload| {
+                if (ir_to_ssa.get(payload)) |payload_ssa| {
+                    try value.addArg(payload_ssa, func.allocator);
+                }
+            }
+        },
+        .union_tag => |ut| {
+            if (ir_to_ssa.get(ut.value)) |val_ssa| {
+                try value.addArg(val_ssa, func.allocator);
+            }
+        },
+        .union_payload => |up| {
+            if (ir_to_ssa.get(up.value)) |val_ssa| {
+                try value.addArg(val_ssa, func.allocator);
+            }
+        },
+
+        .list_new, .map_new, .args_count => {
+            // No arguments
+        },
+        .list_push => |lp| {
+            if (ir_to_ssa.get(lp.handle)) |h_ssa| {
+                try value.addArg(h_ssa, func.allocator);
+            }
+            if (ir_to_ssa.get(lp.value)) |v_ssa| {
+                try value.addArg(v_ssa, func.allocator);
+            }
+        },
+        .list_get => |lg| {
+            if (ir_to_ssa.get(lg.handle)) |h_ssa| {
+                try value.addArg(h_ssa, func.allocator);
+            }
+            if (ir_to_ssa.get(lg.index)) |i_ssa| {
+                try value.addArg(i_ssa, func.allocator);
+            }
+        },
+        .list_set => |ls| {
+            if (ir_to_ssa.get(ls.handle)) |h_ssa| {
+                try value.addArg(h_ssa, func.allocator);
+            }
+            if (ir_to_ssa.get(ls.index)) |i_ssa| {
+                try value.addArg(i_ssa, func.allocator);
+            }
+            if (ir_to_ssa.get(ls.value)) |v_ssa| {
+                try value.addArg(v_ssa, func.allocator);
+            }
+        },
+        .list_len, .list_free => |ll| {
+            if (ir_to_ssa.get(ll.handle)) |h_ssa| {
+                try value.addArg(h_ssa, func.allocator);
+            }
+        },
+        .list_data_ptr => |ldp| {
+            if (ir_to_ssa.get(ldp.handle)) |h_ssa| {
+                try value.addArg(h_ssa, func.allocator);
+            }
+        },
+        .list_byte_size => |lbs| {
+            if (ir_to_ssa.get(lbs.handle)) |h_ssa| {
+                try value.addArg(h_ssa, func.allocator);
+            }
+        },
+
+        .map_set => |ms| {
+            if (ir_to_ssa.get(ms.handle)) |h_ssa| {
+                try value.addArg(h_ssa, func.allocator);
+            }
+            if (ir_to_ssa.get(ms.key_ptr)) |kp_ssa| {
+                try value.addArg(kp_ssa, func.allocator);
+            }
+            if (ir_to_ssa.get(ms.key_len)) |kl_ssa| {
+                try value.addArg(kl_ssa, func.allocator);
+            }
+            if (ir_to_ssa.get(ms.value)) |v_ssa| {
+                try value.addArg(v_ssa, func.allocator);
+            }
+        },
+        .map_get => |mg| {
+            if (ir_to_ssa.get(mg.handle)) |h_ssa| {
+                try value.addArg(h_ssa, func.allocator);
+            }
+            if (ir_to_ssa.get(mg.key_ptr)) |kp_ssa| {
+                try value.addArg(kp_ssa, func.allocator);
+            }
+            if (ir_to_ssa.get(mg.key_len)) |kl_ssa| {
+                try value.addArg(kl_ssa, func.allocator);
+            }
+        },
+        .map_has => |mh| {
+            if (ir_to_ssa.get(mh.handle)) |h_ssa| {
+                try value.addArg(h_ssa, func.allocator);
+            }
+            if (ir_to_ssa.get(mh.key_ptr)) |kp_ssa| {
+                try value.addArg(kp_ssa, func.allocator);
+            }
+            if (ir_to_ssa.get(mh.key_len)) |kl_ssa| {
+                try value.addArg(kl_ssa, func.allocator);
+            }
+        },
+        .map_size, .map_free => |mz| {
+            if (ir_to_ssa.get(mz.handle)) |h_ssa| {
+                try value.addArg(h_ssa, func.allocator);
+            }
+        },
+
+        .str_concat => |sc| {
+            if (ir_to_ssa.get(sc.left)) |l_ssa| {
+                try value.addArg(l_ssa, func.allocator);
+            }
+            if (ir_to_ssa.get(sc.right)) |r_ssa| {
+                try value.addArg(r_ssa, func.allocator);
+            }
+        },
+
+        .file_read => |fr| {
+            if (ir_to_ssa.get(fr.path)) |p_ssa| {
+                try value.addArg(p_ssa, func.allocator);
+            }
+        },
+        .file_write => |fw| {
+            if (ir_to_ssa.get(fw.path)) |p_ssa| {
+                try value.addArg(p_ssa, func.allocator);
+            }
+            if (ir_to_ssa.get(fw.data_ptr)) |dp_ssa| {
+                try value.addArg(dp_ssa, func.allocator);
+            }
+            if (ir_to_ssa.get(fw.data_len)) |dl_ssa| {
+                try value.addArg(dl_ssa, func.allocator);
+            }
+        },
+        .file_exists => |fe| {
+            if (ir_to_ssa.get(fe.path)) |p_ssa| {
+                try value.addArg(p_ssa, func.allocator);
+            }
+        },
+        .file_free => |ff| {
+            if (ir_to_ssa.get(ff.ptr)) |p_ssa| {
+                try value.addArg(p_ssa, func.allocator);
+            }
+        },
+
+        .args_get => |ag| {
+            if (ir_to_ssa.get(ag.index)) |i_ssa| {
+                try value.addArg(i_ssa, func.allocator);
+            }
+        },
+
+        .convert => |cv| {
+            if (ir_to_ssa.get(cv.operand)) |op_ssa| {
+                try value.addArg(op_ssa, func.allocator);
+            }
+        },
+        .ptr_cast => |pc| {
+            if (ir_to_ssa.get(pc.operand)) |op_ssa| {
+                try value.addArg(op_ssa, func.allocator);
+            }
+        },
+
+        .nop => {},
+
+        // Terminators handled elsewhere
+        .branch, .jump, .ret => unreachable,
     }
 
     return value_id;

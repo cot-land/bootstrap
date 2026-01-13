@@ -7,7 +7,6 @@ const ast = @import("ast.zig");
 const parser = @import("parser.zig");
 const types = @import("types.zig");
 const check = @import("check.zig");
-const ir = @import("ir.zig");
 const lower = @import("lower.zig");
 const ssa = @import("ssa.zig");
 const backend = @import("codegen/backend.zig");
@@ -162,7 +161,6 @@ test {
     _ = parser;
     _ = types;
     _ = check;
-    _ = ir;
     _ = lower;
     _ = ssa;
     _ = backend;

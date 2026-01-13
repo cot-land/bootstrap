@@ -1871,6 +1871,38 @@ pub const CodeGen = struct {
         try self.setResult(value.id, .{ .register = dest });
     }
 
+    /// Generate code for addr_add: compute address without loading
+    /// args[0] = base address (SSA), args[1] = index (SSA), aux_int = elem_size
+    pub fn genAddrAdd(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+        if (args.len < 2) return;
+
+        const elem_size: i64 = if (value.aux_int != 0) value.aux_int else 8;
+
+        // Get base address and index
+        const base_mcv = self.getValue(args[0]);
+        const idx_mcv = self.getValue(args[1]);
+
+        // Load base into x8
+        try self.loadToReg(.x8, base_mcv);
+
+        // Load index into x9
+        try self.loadToReg(.x9, idx_mcv);
+
+        // Compute offset: x9 = x9 * elem_size
+        if (elem_size > 1) {
+            try aarch64.movRegImm64(self.buf, .x10, elem_size);
+            try aarch64.mulRegReg(self.buf, .x9, .x9, .x10);
+        }
+
+        // Add: x8 = x8 + x9
+        try aarch64.addRegReg(self.buf, .x8, .x8, .x9);
+
+        // Result is the computed address (not loaded)
+        self.reg_manager.markUsed(.x8, value.id);
+        try self.setResult(value.id, .{ .register = .x8 });
+    }
+
     /// Generate code for ptr_load: load through a pointer
     /// args[0] = pointer SSA value
     pub fn genPtrLoad(self: *CodeGen, value: *ssa.Value) !void {
@@ -3367,6 +3399,8 @@ pub const CodeGen = struct {
             .args_get => try self.genArgsGet(value),
             .arg => try self.genArg(value),
             .retain, .release, .@"unreachable" => {}, // TODO: implement
+            .bit_and, .bit_or, .bit_xor, .bit_not, .shl, .shr => {}, // TODO: implement bitwise ops
+            .addr_add => try self.genAddrAdd(value),
         }
         // Note: advanceInst is called by driver.zig after each genValue
     }

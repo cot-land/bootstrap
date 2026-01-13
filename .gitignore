@@ -106,3 +106,13 @@ main_boot
 
 # Any test binary in root
 /test_*
+
+# Additional test binaries
+func_return_test
+list_ptr_test
+multi_list_test
+nested_list_test
+offset_test
+parser_only_test
+parser_test
+ptr_test
