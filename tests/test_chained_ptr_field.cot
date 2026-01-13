@@ -1,0 +1,49 @@
+// Test: Chained pointer field access
+// BUG-008: Accessing ptr.*.struct.field crashes or returns wrong value
+//
+// This pattern: ptr.*.options.input_path
+// Where: ptr is *Driver, options is CompileOptions struct, input_path is string
+
+struct Inner {
+    value: int,
+    name: string,
+}
+
+struct Outer {
+    inner: Inner,
+    count: int,
+}
+
+fn getInnerValue(ptr: *Outer) int {
+    // This is the problematic pattern: ptr.*.struct_field.primitive_field
+    return ptr.*.inner.value
+}
+
+fn getInnerName(ptr: *Outer) string {
+    // This pattern with string: ptr.*.struct_field.string_field
+    return ptr.*.inner.name
+}
+
+fn main() int {
+    var inner: Inner = Inner{ .value = 42, .name = "test" }
+    var outer: Outer = Outer{ .inner = inner, .count = 10 }
+
+    // Test 1: Direct access works
+    if outer.inner.value != 42 {
+        return 1
+    }
+
+    // Test 2: Chained access through pointer
+    var result: int = getInnerValue(&outer)
+    if result != 42 {
+        return 2
+    }
+
+    // Test 3: Chained string access through pointer
+    var name: string = getInnerName(&outer)
+    if len(name) != 4 {
+        return 3
+    }
+
+    return 42
+}

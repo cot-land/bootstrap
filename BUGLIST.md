@@ -45,14 +45,15 @@ This is the ONLY way to achieve a stable self-hosting compiler.
 - **Fix:** Added `param` NodeTag, store params in list, assign to `node.args`
 
 ### BUG-005: Struct init fields not stored
-- **Status:** PARTIAL FIX
+- **Status:** PARTIAL FIX (deferred)
 - **Discovered:** 2026-01-14
 - **Location:** `parser_boot.cot:624-672`
 - **Description:** Struct field initializers were parsed but not stored in node
-- **Impact:** Struct initialization won't work
+- **Impact:** Struct initialization won't work in cot0-compiled programs
 - **Test:** `tests/test_struct_init.cot`
 - **Fix (Parser):** Added `struct_init_field` NodeTag, parse each `.field = value` into field nodes, store in `struct_init.args`
-- **Remaining:** Lowering still needs type info (field offsets) to emit proper IR
+- **Remaining:** Lowering needs TypeRegistry with struct definitions to get field offsets
+- **Note:** Deferred - cot0 currently only compiles simple programs. Struct init in bootstrap .cot files is compiled by Zig compiler, not cot0.
 
 ### BUG-006: Duplicate entry block in IR
 - **Status:** OPEN
@@ -82,6 +83,15 @@ var slice_text: string = content[start:end]
 return ParserState{ .tok_text = slice_text, ... }
 ```
 
+### BUG-008: Chained pointer field access for strings crashes
+- **Status:** FIXED
+- **Discovered:** 2026-01-14
+- **Location:** `src/codegen/arm64_codegen.zig:genPtrField`
+- **Description:** When accessing a string field through a pointer dereference chain (`ptr.*.struct_field.string_field`), only the first 8 bytes (ptr) were loaded. The length was set to 0, causing `@fileRead` to receive an empty path and crash.
+- **Impact:** cot0 bootstrap compiler crashed when trying to read input files
+- **Test:** `tests/test_chained_ptr_field.cot`
+- **Fix:** In `genPtrField`, for multi-word fields (>8 bytes), load both words to a temp stack slot instead of just one register. This allows `loadSliceToRegs` to find both ptr and len.
+
 ---
 
 ## Completed Bugs
@@ -91,6 +101,7 @@ return ParserState{ .tok_text = slice_text, ... }
 | BUG-002 | lowerVarStmtNode wrong field | 2026-01-14 |
 | BUG-003 | Call args not stored | 2026-01-14 |
 | BUG-004 | Fn params discarded | 2026-01-14 |
+| BUG-008 | Chained pointer field access for strings | 2026-01-14 |
 
 ---
 

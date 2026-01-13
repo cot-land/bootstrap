@@ -3225,13 +3225,39 @@ pub const CodeGen = struct {
         } else {
             // Local is a pointer, dereference to access field
             const sp_offset = convertOffset(local.offset, self.stack_size);
-            try self.ldrSpOffset(scratch0, sp_offset);
+            try self.ldrSpOffset(scratch0, sp_offset); // scratch0 = pointer value
 
-            // For multi-word fields, we'd need to spill to stack - for now just load first word
-            // TODO: Handle >8 byte fields accessed through pointers
-            const dest = try self.allocReg(value.id);
-            try aarch64.ldrRegImm(self.buf, dest, scratch0, field_offset);
-            try self.setResult(value.id, .{ .register = dest });
+            // For multi-word fields (strings, slices), load both words to stack
+            // This fixes BUG-008: chained pointer field access for strings
+            if (size > 8) {
+                // Allocate temp stack slot for the full value
+                const temp_offset = self.next_spill_offset;
+                self.next_spill_offset +|= @intCast(alignTo(size, 8));
+
+                // Load first word (ptr) from [scratch0 + field_offset]
+                try aarch64.ldrRegImm(self.buf, scratch1, scratch0, field_offset);
+                try self.strSpOffset(scratch1, temp_offset);
+
+                // Load second word (len) from [scratch0 + field_offset + 8]
+                const second_offset: u12 = field_offset + 8;
+                try aarch64.ldrRegImm(self.buf, scratch1, scratch0, second_offset);
+                try self.strSpOffset(scratch1, temp_offset + 8);
+
+                try self.setResult(value.id, .{ .stack = temp_offset });
+            } else {
+                // Single word field - load to register
+                const dest = try self.allocReg(value.id);
+                if (size == 1) {
+                    try aarch64.ldrbRegImm(self.buf, dest, scratch0, field_offset);
+                } else if (size == 2) {
+                    try aarch64.ldrhRegImm(self.buf, dest, scratch0, field_offset);
+                } else if (size == 4) {
+                    try aarch64.ldrwRegImm(self.buf, dest, scratch0, field_offset);
+                } else {
+                    try aarch64.ldrRegImm(self.buf, dest, scratch0, field_offset);
+                }
+                try self.setResult(value.id, .{ .register = dest });
+            }
         }
     }
 
