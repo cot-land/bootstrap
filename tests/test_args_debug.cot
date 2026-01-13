@@ -1,0 +1,7 @@
+// Debug test for args
+fn main() int {
+    var count: int = @argsCount()
+    print("arg count: ")
+    println(count)
+    return count
+}

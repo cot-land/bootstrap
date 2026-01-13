@@ -2125,6 +2125,46 @@ pub const CodeGen = struct {
         try self.setResult(value.id, .{ .register = .rax });
     }
 
+    /// Generate code for args_count: no args
+    /// Calls cot_args_count() -> returns i64 in rax
+    pub fn genArgsCount(self: *CodeGen, value: *ssa.Value) !void {
+        try self.spillCallerSaved();
+
+        // Call cot_args_count()
+        const func_name = if (self.os == .macos) "_cot_args_count" else "cot_args_count";
+        try x86.callSymbol(self.buf, func_name);
+
+        // Result in rax
+        self.reg_manager.markUsed(.rax, value.id);
+        try self.setResult(value.id, .{ .register = .rax });
+    }
+
+    /// Generate code for args_get: args[0]=index
+    /// Calls cot_args_get(index) -> returns (ptr, len) in rax, rdx
+    pub fn genArgsGet(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+        if (args.len < 1) return;
+
+        try self.spillCallerSaved();
+
+        // Load index to rdi
+        const index_mcv = self.getValue(args[0]);
+        try self.loadToReg(.rdi, index_mcv);
+
+        // Call cot_args_get(index)
+        const func_name = if (self.os == .macos) "_cot_args_get" else "cot_args_get";
+        try x86.callSymbol(self.buf, func_name);
+
+        // Result is in rax (ptr), rdx (len) - it's a slice/string
+        // Store to stack as a 16-byte value
+        const temp_offset = self.next_spill_offset;
+        self.next_spill_offset +|= 16;
+        try x86.movMemReg(self.buf, .rbp, temp_offset, .rax);
+        try x86.movMemReg(self.buf, .rbp, temp_offset + 8, .rdx);
+
+        try self.setResult(value.id, .{ .stack = temp_offset });
+    }
+
     /// Generate code for alloc: allocate space on stack (returns address)
     /// aux_int = size to allocate, or uses local slot
     pub fn genAlloc(self: *CodeGen, value: *ssa.Value) !void {
@@ -2441,6 +2481,8 @@ pub const CodeGen = struct {
             .file_free => try self.genFileFree(value),
             .list_data_ptr => try self.genListDataPtr(value),
             .list_byte_size => try self.genListByteSize(value),
+            .args_count => try self.genArgsCount(value),
+            .args_get => try self.genArgsGet(value),
             .arg => try self.genArg(value),
             .retain, .release, .@"unreachable" => {}, // TODO: implement
         }
@@ -2466,6 +2508,20 @@ pub const CodeGen = struct {
     /// - For sret (>16 byte return): hidden pointer arrives in RDI, save it to sret_offset
     /// - All other params shift right by 1 when sret is used
     pub fn genPrologue(self: *CodeGen) !void {
+        // For main: call cot_args_init(argc, argv) BEFORE stack manipulation
+        // At entry, rdi=argc, rsi=argv
+        if (std.mem.eql(u8, self.func.name, "main")) {
+            // Save rdi/rsi (argc/argv) for after the call
+            try x86.pushReg(self.buf, .rdi);
+            try x86.pushReg(self.buf, .rsi);
+            // Call cot_args_init(rdi=argc, rsi=argv) - args already in right registers
+            try self.buf.addRelocation(.pc_rel_32, "cot_args_init", -4);
+            try x86.callRel32(self.buf, 0);
+            // Restore rsi/rdi (reverse order of push)
+            try x86.popReg(self.buf, .rsi);
+            try x86.popReg(self.buf, .rdi);
+        }
+
         // push rbp
         try x86.pushReg(self.buf, .rbp);
         // mov rbp, rsp

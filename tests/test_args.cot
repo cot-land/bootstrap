@@ -1,0 +1,23 @@
+// Test @argsCount and @argsGet builtins
+
+fn main() int {
+    // Should have at least 1 arg (the program name)
+    var count: int = @argsCount()
+    if count < 1 {
+        return 1
+    }
+
+    // Get the first arg (program name)
+    var arg0: string = @argsGet(0)
+    if len(arg0) < 1 {
+        return 2
+    }
+
+    // Out of bounds should return empty string
+    var bad: string = @argsGet(999999)
+    if len(bad) != 0 {
+        return 3
+    }
+
+    return 42
+}

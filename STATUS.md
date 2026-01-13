@@ -146,6 +146,8 @@ zig build test                    # 135+ embedded tests
 | `@minInt(T)` | Done | Min value for type |
 | `@intFromEnum` | Done | Enum to int |
 | `@enumFromInt` | Done | Int to enum |
+| `@argsCount()` | Done | Get command-line argument count |
+| `@argsGet(i)` | Done | Get command-line argument by index |
 
 ### Strings
 
@@ -199,6 +201,9 @@ Location: `runtime/`
 | `cot_list_get` | List index |
 | `cot_list_len` | List length |
 | `cot_list_free` | Free list |
+| `cot_args_init` | Initialize args storage |
+| `cot_args_count` | Get argument count |
+| `cot_args_get` | Get argument by index |
 
 Built with: `zig build` (produces `zig-out/lib/libcot_runtime.a`)
 

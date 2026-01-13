@@ -1678,6 +1678,14 @@ pub const Lowerer = struct {
             return self.lowerBuiltinListByteSize(call);
         }
 
+        // Handle command-line argument builtins (for bootstrap)
+        if (std.mem.eql(u8, func_name, "@argsCount")) {
+            return self.lowerBuiltinArgsCount(call);
+        }
+        if (std.mem.eql(u8, func_name, "@argsGet")) {
+            return self.lowerBuiltinArgsGet(call);
+        }
+
         // Lower arguments for regular call
         var args = std.ArrayList(ir.NodeIndex){ .items = &.{}, .capacity = 0 };
         defer args.deinit(self.allocator);
@@ -2115,6 +2123,31 @@ pub const Lowerer = struct {
         // Emit list_byte_size op - result is i64
         const node = ir.Node.init(.list_byte_size, TypeRegistry.I64, Span.fromPos(Pos.zero))
             .withArgs(&.{handle_node});
+        return try fb.emit(node);
+    }
+
+    /// Lower builtin @argsCount() - get number of command-line arguments
+    fn lowerBuiltinArgsCount(self: *Lowerer, call: ast.Call) Allocator.Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+        _ = call;
+
+        // Emit args_count op - result is i64
+        const node = ir.Node.init(.args_count, TypeRegistry.I64, Span.fromPos(Pos.zero));
+        return try fb.emit(node);
+    }
+
+    /// Lower builtin @argsGet(index) - get command-line argument by index
+    fn lowerBuiltinArgsGet(self: *Lowerer, call: ast.Call) Allocator.Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+
+        if (call.args.len != 1) return ir.null_node;
+
+        // Lower the index argument
+        const index_node = try self.lowerExpr(call.args[0]);
+
+        // Emit args_get op - result is string (ptr, len)
+        const node = ir.Node.init(.args_get, TypeRegistry.STRING, Span.fromPos(Pos.zero))
+            .withArgs(&.{index_node});
         return try fb.emit(node);
     }
 

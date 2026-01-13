@@ -232,6 +232,12 @@ pub const Op = enum(u8) {
     // Get list's total byte size. args[0] = handle. Returns i64.
     list_byte_size,
 
+    // Command-line arguments (for bootstrap compiler)
+    // Get argument count. No args. Returns i64.
+    args_count,
+    // Get argument by index. args[0] = index. Returns string (ptr, len).
+    args_get,
+
     // Function
     call,
     arg,

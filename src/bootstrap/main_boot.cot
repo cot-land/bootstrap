@@ -127,7 +127,6 @@ fn isOptionFlag(arg: string) bool {
 // Test Entry Point
 // =============================================================================
 
-// For now, test with hardcoded paths until we add @argsGet builtin
 fn main() int {
     // Test version functions
     if getVersionMajor() != 0 { return 1 }
@@ -177,6 +176,17 @@ fn main() int {
     // Test string starts with
     if !stringStartsWith("--debug-ir", "--debug") { return 19 }
     if stringStartsWith("--debug-ir", "--other") { return 20 }
+
+    // Test args builtins
+    var argc: int = @argsCount()
+    if argc < 1 { return 21 }  // Should have at least program name
+
+    var arg0: string = @argsGet(0)
+    if len(arg0) < 1 { return 22 }  // Program name should not be empty
+
+    // Out of bounds should return empty string
+    var bad_arg: string = @argsGet(999999)
+    if len(bad_arg) != 0 { return 23 }
 
     return 42
 }

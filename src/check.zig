@@ -784,6 +784,13 @@ pub const Checker = struct {
                 if (std.mem.eql(u8, name, "@listByteSize")) {
                     return self.checkBuiltinListByteSize(c);
                 }
+                // Command-line argument builtins (for bootstrap)
+                if (std.mem.eql(u8, name, "@argsCount")) {
+                    return self.checkBuiltinArgsCount(c);
+                }
+                if (std.mem.eql(u8, name, "@argsGet")) {
+                    return self.checkBuiltinArgsGet(c);
+                }
             }
         }
 
@@ -1116,6 +1123,30 @@ pub const Checker = struct {
         }
         _ = try self.checkExpr(c.args[0]);
         return TypeRegistry.I64;
+    }
+
+    /// Check builtin @argsCount() - get number of command-line arguments
+    fn checkBuiltinArgsCount(self: *Checker, c: ast.Call) CheckError!TypeIndex {
+        if (c.args.len != 0) {
+            self.err.errorWithCode(c.span.start, .E300, "@argsCount() takes no arguments");
+            return invalid_type;
+        }
+        return TypeRegistry.I64;
+    }
+
+    /// Check builtin @argsGet(index) - get command-line argument by index
+    fn checkBuiltinArgsGet(self: *Checker, c: ast.Call) CheckError!TypeIndex {
+        if (c.args.len != 1) {
+            self.err.errorWithCode(c.span.start, .E300, "@argsGet() expects one argument: index");
+            return invalid_type;
+        }
+        const arg_type = try self.checkExpr(c.args[0]);
+        const arg = self.types.get(arg_type);
+        if (!isInteger(arg)) {
+            self.err.errorWithCode(c.span.start, .E300, "@argsGet() index must be an integer");
+            return invalid_type;
+        }
+        return TypeRegistry.STRING; // Returns string (ptr, len)
     }
 
     /// Check index expression.

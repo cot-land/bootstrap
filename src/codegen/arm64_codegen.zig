@@ -3031,6 +3031,47 @@ pub const CodeGen = struct {
         try self.setResult(value.id, .{ .register = .x0 });
     }
 
+    /// Generate code for args_count: no args
+    /// Calls cot_args_count() -> returns i64 in x0
+    pub fn genArgsCount(self: *CodeGen, value: *ssa.Value) !void {
+        try self.spillCallerSaved();
+
+        // Call cot_args_count()
+        const func_name = if (self.os == .macos) "_cot_args_count" else "cot_args_count";
+        try self.buf.addRelocation(.pc_rel_32, func_name, 0);
+        try aarch64.bl(self.buf, 0);
+
+        // Result in x0
+        self.reg_manager.markUsed(.x0, value.id);
+        try self.setResult(value.id, .{ .register = .x0 });
+    }
+
+    /// Generate code for args_get: args[0]=index
+    /// Calls cot_args_get(index) -> returns (ptr, len) in x0, x1
+    pub fn genArgsGet(self: *CodeGen, value: *ssa.Value) !void {
+        const args = value.args();
+        if (args.len < 1) return;
+
+        try self.spillCallerSaved();
+
+        // Load index to x0
+        const index_mcv = self.getValue(args[0]);
+        try self.loadToReg(.x0, index_mcv);
+
+        // Call cot_args_get(index)
+        const func_name = if (self.os == .macos) "_cot_args_get" else "cot_args_get";
+        try self.buf.addRelocation(.pc_rel_32, func_name, 0);
+        try aarch64.bl(self.buf, 0);
+
+        // Result is in x0 (ptr), x1 (len) - it's a slice/string
+        const temp_offset = self.next_spill_offset;
+        self.next_spill_offset +|= 16;
+        try self.strSpOffset(.x0, temp_offset);
+        try self.strSpOffset(.x1, temp_offset + 8);
+
+        try self.setResult(value.id, .{ .stack = temp_offset });
+    }
+
     /// Generate code for alloc: allocate space on stack (returns address)
     /// aux_int = size to allocate, or uses local slot
     pub fn genAlloc(self: *CodeGen, value: *ssa.Value) !void {
@@ -3322,6 +3363,8 @@ pub const CodeGen = struct {
             .file_free => try self.genFileFree(value),
             .list_data_ptr => try self.genListDataPtr(value),
             .list_byte_size => try self.genListByteSize(value),
+            .args_count => try self.genArgsCount(value),
+            .args_get => try self.genArgsGet(value),
             .arg => try self.genArg(value),
             .retain, .release, .@"unreachable" => {}, // TODO: implement
         }
@@ -3336,6 +3379,23 @@ pub const CodeGen = struct {
     }
 
     pub fn genPrologue(self: *CodeGen) !void {
+        // For main: call cot_args_init(argc, argv) BEFORE stack manipulation
+        // At entry, x0=argc, x1=argv. Save lr (bl clobbers it) and x0/x1 (call clobbers them)
+        if (std.mem.eql(u8, self.func.name, "main")) {
+            // Push lr before bl clobbers it
+            try aarch64.stpPreIndex(self.buf, .fp, .lr, .sp, -2); // sp -= 16
+            // Push argc/argv so we can restore after call
+            try aarch64.stpPreIndex(self.buf, .x0, .x1, .sp, -2); // sp -= 16
+            // Call cot_args_init(x0=argc, x1=argv)
+            const func_name = if (self.os == .macos) "_cot_args_init" else "cot_args_init";
+            try self.buf.addRelocation(.pc_rel_32, func_name, 0);
+            try aarch64.bl(self.buf, 0);
+            // Pop argc/argv (restore for parameter spilling)
+            try aarch64.ldpPostIndex(self.buf, .x0, .x1, .sp, 2); // sp += 16
+            // Pop lr
+            try aarch64.ldpPostIndex(self.buf, .fp, .lr, .sp, 2); // sp += 16
+        }
+
         // Allocate stack frame and save fp/lr
         // Three cases based on frame size:
         //   Small (≤504 bytes):  stp fp, lr, [sp, #-N]!

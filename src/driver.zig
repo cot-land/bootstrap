@@ -1269,6 +1269,10 @@ fn convertIRNode(func: *ssa.Func, node: *const ir.Node, ir_to_ssa: *std.AutoHash
         .list_data_ptr => .list_data_ptr,
         .list_byte_size => .list_byte_size,
 
+        // Command-line arguments
+        .args_count => .args_count,
+        .args_get => .args_get,
+
         else => .copy,
     };
 

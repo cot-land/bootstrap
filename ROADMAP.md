@@ -135,6 +135,8 @@ The bootstrap .cot files must use ONLY these features (already working in Zig co
 - `@enumFromInt(T, i)` - int to enum
 - `@maxInt(T)` / `@minInt(T)`
 - `print()` / `println()`
+- `@argsCount()` - command-line argument count
+- `@argsGet(i)` - get command-line argument by index
 
 ### NOT Supported (Must Avoid in Bootstrap) ❌
 

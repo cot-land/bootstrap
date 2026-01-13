@@ -10,6 +10,7 @@ const map = @import("map.zig");
 const list = @import("list.zig");
 const string = @import("string.zig");
 const file = @import("file.zig");
+const args = @import("args.zig");
 
 // Reference the modules to ensure they're not optimized away
 comptime {
@@ -17,6 +18,7 @@ comptime {
     _ = list;
     _ = string;
     _ = file;
+    _ = args;
 }
 
 test {
@@ -25,4 +27,5 @@ test {
     _ = @import("list.zig");
     _ = @import("string.zig");
     _ = @import("file.zig");
+    _ = @import("args.zig");
 }
