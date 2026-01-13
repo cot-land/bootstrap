@@ -3,6 +3,11 @@
 //
 // Based on src/driver.zig patterns.
 // For stage 1 bootstrap, we only need ARM64 macOS output.
+//
+// Note: This module depends on types from parser_boot.cot, lower_boot.cot,
+// ir_boot.cot, and codegen modules. main_boot.cot imports all of these before
+// driver_boot.cot, so those types are available via transitive imports.
+// We don't import codegen directly to avoid duplicate definitions.
 
 // =============================================================================
 // Target Configuration
@@ -98,34 +103,117 @@ fn driverNew(opts: CompileOptions) Driver {
 }
 
 // =============================================================================
-// Import Processing (Bootstrap - Textual Inclusion)
+// Code Generation (IR to Machine Code)
 // =============================================================================
 
-// Skip whitespace characters
-fn skipWhitespace(content: string, start: int) int {
-    var pos: int = start
-    while pos < len(content) {
-        var ch: int = content[pos]
-        if ch != 32 and ch != 9 and ch != 13 {  // space, tab, CR
-            return pos
-        }
-        pos = pos + 1
-    }
-    return pos
-}
-
-// Check if string starts with "import" at position
-fn isImportKeyword(content: string, pos: int) bool {
-    if pos + 6 > len(content) {
+fn generateCodeFromIR(ir: IRProgram, output_path: string) bool {
+    var num_funcs: int = len(ir.funcs)
+    if num_funcs == 0 {
         return false
     }
-    if content[pos] != 105 { return false }      // 'i'
-    if content[pos + 1] != 109 { return false }  // 'm'
-    if content[pos + 2] != 112 { return false }  // 'p'
-    if content[pos + 3] != 111 { return false }  // 'o'
-    if content[pos + 4] != 114 { return false }  // 'r'
-    if content[pos + 5] != 116 { return false }  // 't'
-    return true
+
+    var obj: ObjectFile = objectFileNew()
+    var text_idx: int = objectAddSection(obj, "__text", SectionKind.text)
+    var text_sec: Section = objectGetSection(obj, text_idx)
+
+    println("DEBUG: num funcs in IR")
+    var n_funcs: int = len(ir.funcs)
+    if n_funcs == 0 {
+        println("DEBUG: 0 funcs")
+    } else if n_funcs == 1 {
+        println("DEBUG: 1 func")
+    } else {
+        println("DEBUG: multiple funcs")
+    }
+
+    var func_idx: int = 0
+    while func_idx < n_funcs {
+        var func: IRFunc = ir.funcs.get(func_idx)
+        println("DEBUG: processing func")
+
+        var sym_start: int = sectionSize(text_sec)
+        var sym_name: string = "_" + func.name
+        objectAddSymbol(obj, symbolNew(sym_name, SymbolKind.func, text_idx, sym_start, 0, true))
+        generateFunctionFromIR(&text_sec, func)
+        func_idx = func_idx + 1
+    }
+
+    var output: OutputBuffer = outputBufferNew()
+    writeMachO64(obj, output)
+    var result: int = @fileWriteListBytes(output_path, output.bytes)
+    return result > 0
+}
+
+fn generateFunctionFromIR(text_sec: *Section, func: IRFunc) void {
+    var cg: FullCodeGen = fullCodeGenInit(func.frame_size)
+    cgGenPrologue(&cg, func.frame_size)
+
+    println("DEBUG: generating blocks")
+    var block_idx: int = 0
+    while block_idx < len(func.blocks) {
+        println("DEBUG: processing block")
+        var block: IRBlock = func.blocks.get(block_idx)
+
+        var node_idx: int = 0
+        var node_count: int = len(block.nodes)
+        while node_idx < node_count {
+            var ir_node_idx: IRNodeIndex = block.nodes.get(node_idx)
+            var ir_node: IRNode = func.nodes.get(ir_node_idx)
+            generateNodeFromIR(&cg, ir_node, ir_node_idx)
+            node_idx = node_idx + 1
+        }
+        block_idx = block_idx + 1
+    }
+
+    var byte_count: int = len(cg.buf.bytes)
+    println("DEBUG: generateFunction copying bytes")
+    var i: int = 0
+    while i < byte_count {
+        var byte_val: int = cg.buf.bytes.get(i)
+        sectionAppendByte(text_sec, byte_val)
+        i = i + 1
+    }
+    println("DEBUG: done copying")
+}
+
+fn generateNodeFromIR(cg: *FullCodeGen, node: IRNode, node_idx: IRNodeIndex) void {
+    println("DEBUG: generateNode called")
+    var op: Op = node.op
+    if op == Op.const_int {
+        println("DEBUG: generating const_int")
+        cgGenConstInt(cg, node_idx, node.aux)
+    } else if op == Op.add {
+        cgGenAdd(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
+    } else if op == Op.sub {
+        cgGenSub(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
+    } else if op == Op.mul {
+        cgGenMul(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
+    } else if op == Op.div {
+        cgGenDiv(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
+    } else if op == Op.eq {
+        cgGenCmpEq(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
+    } else if op == Op.ne {
+        cgGenCmpNe(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
+    } else if op == Op.lt {
+        cgGenCmpLt(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
+    } else if op == Op.le {
+        cgGenCmpLe(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
+    } else if op == Op.gt {
+        cgGenCmpGt(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
+    } else if op == Op.ge {
+        cgGenCmpGe(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
+    } else if op == Op.neg {
+        cgGenNeg(cg, node_idx, irNodeGetArg(node, 0))
+    } else if op == Op.local {
+        cgGenLoadStack(cg, node_idx, 0 - (node.aux + 1) * 8, 8)
+    } else if op == Op.store {
+        cgGenStoreStack(cg, irNodeGetArg(node, 0), 0 - (node.aux + 1) * 8, 8)
+    } else if op == Op.ret {
+        println("DEBUG: generating ret")
+        cgGenReturn(cg, irNodeGetArg(node, 0))
+    } else {
+        println("DEBUG: unknown op")
+    }
 }
 
 // =============================================================================
@@ -136,28 +224,33 @@ fn driverCompile(driver: *Driver) CompileResult {
     // Phase 1: Read source file
     var content: string = @fileRead(driver.*.options.input_path)
     if len(content) == 0 {
-        // Error: cannot read source file
         return compileResultFailure(1)
     }
     driver.*.source_content = content
 
     // Phase 2: Parse
-    // TODO: Call parser_boot functions
+    var parser: ParserState = parserInit(content)
+    parser = parseFile(parser)
 
-    // Phase 3: Type check
-    // TODO: Call check_boot functions
+    if len(parser.nodes) == 0 {
+        return compileResultFailure(2)
+    }
 
-    // Phase 4: Lower to IR
-    // TODO: Call lower_boot functions
+    // Phase 3: Lower AST to IR
+    var lowerer: Lowerer = lowererInit(parser.nodes)
+    lowerProgram(&lowerer)
 
-    // Phase 5: Convert to SSA
-    // TODO: Call ssa_boot functions
+    if lowerer.error_count > 0 {
+        return compileResultFailure(lowerer.error_count)
+    }
 
-    // Phase 6: Generate code
-    // TODO: Call arm64_boot functions
+    // Phase 4: Generate code from IR
+    var ir: IRProgram = lowerer.ir_builder.ir
+    var success: bool = generateCodeFromIR(ir, driver.*.options.output_path)
 
-    // Phase 7: Write object file
-    // TODO: Call object_boot functions
+    if not success {
+        return compileResultFailure(1)
+    }
 
     return compileResultSuccess()
 }
@@ -166,7 +259,7 @@ fn driverCompile(driver: *Driver) CompileResult {
 // Public Entry Point
 // =============================================================================
 
-fn compile(input_path: string, output_path: string) CompileResult {
+fn compileFile(input_path: string, output_path: string) CompileResult {
     var opts: CompileOptions = compileOptionsNew(input_path, output_path)
     var driver: Driver = driverNew(opts)
     return driverCompile(&driver)

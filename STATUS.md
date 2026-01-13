@@ -4,6 +4,9 @@
 
 > **Claude: Update this file whenever you complete a feature or fix a test.**
 
+> **Bug Tracking:** When encountering bugs, follow the process in `BUGLIST.md`:
+> Discover -> Document -> Test -> Fix -> Verify -> Complete
+
 ## Test Results
 
 | Platform | Status | Notes |
@@ -90,6 +93,28 @@ zig cc -o test_exe a.out && ./test_exe
 2. Fixed MOV fp, sp encoding (SP requires ADD not ORR)
 3. Fixed number parsing loop (cot `and` in while conditions)
 4. Added proper function epilogue emission
+
+### Bootstrap Architecture (2026-01-14)
+
+The bootstrap .cot modules now follow a modular architecture matching the Zig compiler:
+
+```
+main_boot.cot        → CLI entry point, arg parsing only
+  ↓ imports
+parser_boot.cot      → Lexer + Parser (uses scanner_boot.cot)
+  ↓
+lower_boot.cot       → AST to IR conversion (Lowerer struct)
+  ↓
+driver_boot.cot      → Compilation pipeline + codegen orchestration
+  ↓
+codegen/*_boot.cot   → ARM64 code generation + Mach-O output
+```
+
+**Module responsibilities:**
+- `scanner_boot.cot`: Token enumeration + `scanNext()` tokenizer function
+- `parser_boot.cot`: Uses scanner for tokenization, builds AST
+- `lower_boot.cot`: `Lowerer` struct with `lowerProgram()` entry point
+- `driver_boot.cot`: `compileFile()` orchestrates parse → lower → codegen
 
 ### Known Language Bugs (Workarounds Applied)
 

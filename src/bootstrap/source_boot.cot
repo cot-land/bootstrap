@@ -90,6 +90,49 @@ fn spanMerge(a: Span, b: Span) Span {
     return result
 }
 
+// Source file content holder.
+// This is the main struct that holds the file being compiled.
+struct Source {
+    path: string,
+    content: string,
+    len: int,
+}
+
+// Create a Source from path and content.
+fn sourceInit(path: string, content: string) Source {
+    return Source{
+        .path = path,
+        .content = content,
+        .len = len(content),
+    }
+}
+
+// Get character at offset (returns 0 if past end).
+fn sourceAt(src: Source, offset: int) int {
+    if offset >= src.len {
+        return 0
+    }
+    var c: u8 = src.content[offset]
+    return 0 + c
+}
+
+// Get slice of content.
+fn sourceSlice(src: Source, start: int, end: int) string {
+    if start >= src.len {
+        return ""
+    }
+    var actual_end: int = end
+    if actual_end > src.len {
+        actual_end = src.len
+    }
+    return src.content[start:actual_end]
+}
+
+// Get text for a span.
+fn sourceSpanText(src: Source, span: Span) string {
+    return sourceSlice(src, span.start.offset, span.end.offset)
+}
+
 // Human-readable location (for error messages).
 // Note: In bootstrap, we use offset only. Line/column computed later.
 struct Location {

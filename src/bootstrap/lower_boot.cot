@@ -1,4 +1,10 @@
 // AST-to-IR lowering pass for cot bootstrap.
+// This module converts AST nodes (from parser) into IR (for codegen).
+//
+// Note: This module depends on types from parser_boot.cot (Node, NodeTag, Token).
+// main_boot.cot imports parser_boot.cot before lower_boot.cot, so those types
+// are available via transitive imports. We don't import parser_boot.cot directly
+// to avoid duplicate definitions.
 import "ir_boot.cot"
 
 // Pre-defined type indices (must match types_boot.cot)
@@ -25,6 +31,12 @@ struct LoopContext {
 // =============================================================================
 
 struct Lowerer {
+    // Parser nodes (AST) - reference to parsed AST
+    nodes: List<Node>,
+
+    // IR program builder - where we emit IR
+    ir_builder: IRProgramBuilder,
+
     // Current function being lowered
     current_func_name: string,
     has_current_func: bool,
@@ -40,16 +52,22 @@ struct Lowerer {
 
     // For-loop counter for unique names
     for_counter: int,
+
+    // Error tracking
+    error_count: int,
 }
 
-fn lowererInit() Lowerer {
+fn lowererInit(nodes: List<Node>) Lowerer {
     return Lowerer{
+        .nodes = nodes,
+        .ir_builder = irProgramBuilderInit(),
         .current_func_name = "",
         .has_current_func = false,
         .string_literals = new List<string>(),
         .loop_stack = new List<LoopContext>(),
         .const_values = new Map<string, int>(),
         .for_counter = 0,
+        .error_count = 0,
     }
 }
 
@@ -536,14 +554,343 @@ fn lowerStrConcat(l: *Lowerer, fb: *IRFuncBuilder, left: IRNodeIndex, right: IRN
 }
 
 // =============================================================================
+// AST Node Accessors
+// =============================================================================
+
+fn lowererGetNode(l: Lowerer, idx: NodeIndex) Node {
+    return l.nodes.get(idx)
+}
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+fn parseIntLiteral(text: string) int {
+    var result: int = 0
+    var i: int = 0
+    var negative: bool = false
+
+    // Check for negative
+    if len(text) > 0 and text[0] == 45 {  // '-'
+        negative = true
+        i = 1
+    }
+
+    while i < len(text) {
+        var c: int = text[i]
+        if c >= 48 and c <= 57 {  // '0'-'9'
+            result = result * 10 + (c - 48)
+        }
+        i = i + 1
+    }
+
+    if negative {
+        result = 0 - result
+    }
+
+    return result
+}
+
+fn tokenToIROp(tok: Token) Op {
+    if tok == Token.plus { return Op.add }
+    if tok == Token.minus { return Op.sub }
+    if tok == Token.star { return Op.mul }
+    if tok == Token.slash { return Op.div }
+    if tok == Token.percent { return Op.mod }
+    if tok == Token.equal_equal { return Op.eq }
+    if tok == Token.bang_equal { return Op.ne }
+    if tok == Token.less { return Op.lt }
+    if tok == Token.less_equal { return Op.le }
+    if tok == Token.greater { return Op.gt }
+    if tok == Token.greater_equal { return Op.ge }
+    if tok == Token.kw_and { return Op.op_and }
+    if tok == Token.kw_or { return Op.op_or }
+    return Op.nop
+}
+
+// =============================================================================
+// Expression Lowering (AST to IR)
+// =============================================================================
+
+fn lowerExprNode(l: *Lowerer, fb: *IRFuncBuilder, node_idx: NodeIndex) NodeIndex {
+    if node_idx == null_node {
+        return null_node
+    }
+
+    var node: Node = l.*.nodes.get(node_idx)
+    var span_start: int = node.span.start.offset
+    var span_end: int = node.span.end.offset
+    var tag: NodeTag = node.tag
+
+    if tag == NodeTag.int_literal {
+        return lowerIntLiteralExpr(l, fb, node, span_start, span_end)
+    }
+    if tag == NodeTag.bool_literal {
+        return lowerBoolLiteralExpr(l, fb, node, span_start, span_end)
+    }
+    if tag == NodeTag.string_literal {
+        return lowerStringLiteralExpr(l, fb, node, span_start, span_end)
+    }
+    if tag == NodeTag.identifier {
+        return lowerIdentifierExpr(l, fb, node, span_start, span_end)
+    }
+    if tag == NodeTag.binary_expr {
+        return lowerBinaryExpr(l, fb, node, span_start, span_end)
+    }
+    if tag == NodeTag.unary_expr {
+        return lowerUnaryExpr(l, fb, node, span_start, span_end)
+    }
+    if tag == NodeTag.call_expr {
+        return lowerCallExpr(l, fb, node, span_start, span_end)
+    }
+    if tag == NodeTag.paren_expr {
+        return lowerExprNode(l, fb, node.left)
+    }
+    return null_node
+}
+
+fn lowerIntLiteralExpr(l: *Lowerer, fb: *IRFuncBuilder, node: Node, span_start: int, span_end: int) NodeIndex {
+    var value: int = parseIntLiteral(node.text)
+    return irFuncBuilderEmitConstInt(fb, value, TYPE_INT, span_start, span_end)
+}
+
+fn lowerBoolLiteralExpr(l: *Lowerer, fb: *IRFuncBuilder, node: Node, span_start: int, span_end: int) NodeIndex {
+    var value: bool = node.text == "true"
+    return irFuncBuilderEmitConstBool(fb, value, span_start, span_end)
+}
+
+fn lowerStringLiteralExpr(l: *Lowerer, fb: *IRFuncBuilder, node: Node, span_start: int, span_end: int) NodeIndex {
+    var idx: int = len(l.*.string_literals)
+    l.*.string_literals.push(node.text)
+    return irFuncBuilderEmitConstSlice(fb, idx, TYPE_STRING, span_start, span_end)
+}
+
+fn lowerIdentifierExpr(l: *Lowerer, fb: *IRFuncBuilder, node: Node, span_start: int, span_end: int) NodeIndex {
+    var local_idx: int = irFuncBuilderLookupLocal(fb.*, node.name)
+    if local_idx >= 0 {
+        return irFuncBuilderEmitLocalLoad(fb, local_idx, TYPE_INT, span_start, span_end)
+    }
+    // Not found - error
+    l.*.error_count = l.*.error_count + 1
+    return null_node
+}
+
+fn lowerBinaryExpr(l: *Lowerer, fb: *IRFuncBuilder, node: Node, span_start: int, span_end: int) NodeIndex {
+    var left: NodeIndex = lowerExprNode(l, fb, node.left)
+    var right: NodeIndex = lowerExprNode(l, fb, node.right)
+    var ir_op: Op = tokenToIROp(node.op)
+    return irFuncBuilderEmitBinary(fb, ir_op, left, right, TYPE_INT, span_start, span_end)
+}
+
+fn lowerUnaryExpr(l: *Lowerer, fb: *IRFuncBuilder, node: Node, span_start: int, span_end: int) NodeIndex {
+    var operand: NodeIndex = lowerExprNode(l, fb, node.left)
+    var ir_op: Op = Op.nop
+    var tok: Token = node.op
+    if tok == Token.minus { ir_op = Op.neg }
+    if tok == Token.bang { ir_op = Op.op_not }
+    return irFuncBuilderEmitUnary(fb, ir_op, operand, TYPE_INT, span_start, span_end)
+}
+
+fn lowerCallExpr(l: *Lowerer, fb: *IRFuncBuilder, node: Node, span_start: int, span_end: int) NodeIndex {
+    var callee_node: Node = l.*.nodes.get(node.left)
+    var func_name: string = callee_node.name
+
+    var arg0: NodeIndex = null_node
+    var arg1: NodeIndex = null_node
+    var arg2: NodeIndex = null_node
+    var arg3: NodeIndex = null_node
+    var num_args: int = len(node.args)
+
+    if num_args > 0 {
+        arg0 = lowerExprNode(l, fb, node.args.get(0))
+    }
+    if num_args > 1 {
+        arg1 = lowerExprNode(l, fb, node.args.get(1))
+    }
+    if num_args > 2 {
+        arg2 = lowerExprNode(l, fb, node.args.get(2))
+    }
+    if num_args > 3 {
+        arg3 = lowerExprNode(l, fb, node.args.get(3))
+    }
+
+    var n: IRNode = irNodeInit(Op.call, TYPE_INT, span_start, span_end)
+    n.aux_str = func_name
+    if num_args > 0 { n = irNodeWithArg0(n, arg0) }
+    if num_args > 1 { n.args1 = arg1; n.args_len = 2 }
+    if num_args > 2 { n.args2 = arg2; n.args_len = 3 }
+    if num_args > 3 { n.args3 = arg3; n.args_len = 4 }
+
+    return irFuncBuilderEmit(fb, n)
+}
+
+// =============================================================================
+// Statement Lowering (AST to IR)
+// =============================================================================
+
+fn lowerStmtNode(l: *Lowerer, fb: *IRFuncBuilder, node_idx: NodeIndex) void {
+    if node_idx == null_node {
+        return
+    }
+
+    var node: Node = l.*.nodes.get(node_idx)
+    var span_start: int = node.span.start.offset
+    var span_end: int = node.span.end.offset
+    var tag: NodeTag = node.tag
+
+    if tag == NodeTag.return_stmt {
+        lowerReturnStmt(l, fb, node, span_start, span_end)
+    } else if tag == NodeTag.var_stmt {
+        lowerVarStmtAST(l, fb, node, span_start, span_end)
+    } else if tag == NodeTag.assign_stmt {
+        lowerAssignStmt(l, fb, node, span_start, span_end)
+    } else if tag == NodeTag.if_stmt {
+        lowerIfStmt(l, fb, node, span_start, span_end)
+    } else if tag == NodeTag.while_stmt {
+        lowerWhileStmt(l, fb, node, span_start, span_end)
+    } else if tag == NodeTag.block_stmt {
+        lowerBlockStmt(l, fb, node)
+    } else if tag == NodeTag.expr_stmt {
+        lowerExprStmt(l, fb, node)
+    }
+}
+
+fn lowerReturnStmt(l: *Lowerer, fb: *IRFuncBuilder, node: Node, span_start: int, span_end: int) void {
+    var value: NodeIndex = null_node
+    if node.left != null_node {
+        value = lowerExprNode(l, fb, node.left)
+    }
+    irFuncBuilderEmitReturn(fb, value, span_start, span_end)
+}
+
+fn lowerVarStmtAST(l: *Lowerer, fb: *IRFuncBuilder, node: Node, span_start: int, span_end: int) void {
+    var local_idx: int = irFuncBuilderAddLocal(fb, node.name, TYPE_INT, true)
+    // Parser stores initializer in node.left
+    if node.left != null_node {
+        var init_val: NodeIndex = lowerExprNode(l, fb, node.left)
+        irFuncBuilderEmitLocalStore(fb, local_idx, init_val, TYPE_INT, span_start, span_end)
+    }
+}
+
+fn lowerAssignStmt(l: *Lowerer, fb: *IRFuncBuilder, node: Node, span_start: int, span_end: int) void {
+    var target_node: Node = l.*.nodes.get(node.left)
+    var local_idx: int = irFuncBuilderLookupLocal(fb.*, target_node.name)
+    if local_idx >= 0 {
+        var value: NodeIndex = lowerExprNode(l, fb, node.right)
+        irFuncBuilderEmitLocalStore(fb, local_idx, value, TYPE_INT, span_start, span_end)
+    }
+}
+
+fn lowerIfStmt(l: *Lowerer, fb: *IRFuncBuilder, node: Node, span_start: int, span_end: int) void {
+    var has_else: bool = node.else_body != null_node
+    var cond: NodeIndex = lowerExprNode(l, fb, node.cond)
+
+    var then_block: IRBlockIndex = irFuncBuilderNewBlock(fb, "then")
+    var else_block: IRBlockIndex = irFuncBuilderNewBlock(fb, "else")
+    var merge_block: IRBlockIndex = irFuncBuilderNewBlock(fb, "merge")
+
+    irFuncBuilderEmitBranch(fb, cond, then_block, else_block, span_start, span_end)
+
+    irFuncBuilderSetBlock(fb, then_block)
+    lowerStmtNode(l, fb, node.body)
+    irFuncBuilderEmitJump(fb, merge_block, span_start, span_end)
+
+    irFuncBuilderSetBlock(fb, else_block)
+    if has_else {
+        lowerStmtNode(l, fb, node.else_body)
+    }
+    irFuncBuilderEmitJump(fb, merge_block, span_start, span_end)
+
+    irFuncBuilderSetBlock(fb, merge_block)
+}
+
+fn lowerWhileStmt(l: *Lowerer, fb: *IRFuncBuilder, node: Node, span_start: int, span_end: int) void {
+    var cond_block: IRBlockIndex = irFuncBuilderNewBlock(fb, "while.cond")
+    var body_block: IRBlockIndex = irFuncBuilderNewBlock(fb, "while.body")
+    var exit_block: IRBlockIndex = irFuncBuilderNewBlock(fb, "while.exit")
+
+    irFuncBuilderEmitJump(fb, cond_block, span_start, span_end)
+
+    irFuncBuilderSetBlock(fb, cond_block)
+    var cond: NodeIndex = lowerExprNode(l, fb, node.cond)
+    irFuncBuilderEmitBranch(fb, cond, body_block, exit_block, span_start, span_end)
+
+    irFuncBuilderSetBlock(fb, body_block)
+    lowerStmtNode(l, fb, node.body)
+    irFuncBuilderEmitJump(fb, cond_block, span_start, span_end)
+
+    irFuncBuilderSetBlock(fb, exit_block)
+}
+
+fn lowerBlockStmt(l: *Lowerer, fb: *IRFuncBuilder, node: Node) void {
+    var arg_count: int = len(node.args)
+    var i: int = 0
+    while i < arg_count {
+        lowerStmtNode(l, fb, node.args.get(i))
+        i = i + 1
+    }
+}
+
+fn lowerExprStmt(l: *Lowerer, fb: *IRFuncBuilder, node: Node) void {
+    lowerExprNode(l, fb, node.left)
+}
+
+// =============================================================================
+// Function Declaration Lowering
+// =============================================================================
+
+fn lowerFnDeclNode(l: *Lowerer, node_idx: NodeIndex) void {
+    var node: Node = l.*.nodes.get(node_idx)
+    var span_start: int = node.span.start.offset
+    var span_end: int = node.span.end.offset
+
+    var fb: IRFuncBuilder = irFuncBuilderInit(node.name, 0, TYPE_INT, span_start, span_end)
+
+    var entry_block: IRBlockIndex = irFuncBuilderNewBlock(&fb, "entry")
+    irFuncBuilderSetBlock(&fb, entry_block)
+
+    if node.body != null_node {
+        lowerStmtNode(l, &fb, node.body)
+    }
+
+    var func: IRFunc = irFuncBuilderBuild(fb)
+    l.*.ir_builder.ir.funcs.push(func)
+}
+
+// =============================================================================
+// Main Program Lowering Entry Point
+// =============================================================================
+
+fn lowerProgram(l: *Lowerer) void {
+    var i: int = 0
+    var count: int = len(l.*.nodes)
+
+    while i < count {
+        var node: Node = l.*.nodes.get(i)
+        var tag: NodeTag = node.tag
+
+        if tag == NodeTag.fn_decl {
+            lowerFnDeclNode(l, i)
+        }
+        // TODO: Handle struct_decl, enum_decl, etc.
+
+        i = i + 1
+    }
+}
+
+// =============================================================================
 // Simple Test
 // =============================================================================
 
 fn test_lower() int {
     // Test lowerer initialization
-    var l: Lowerer = lowererInit()
+    var empty_nodes: List<Node> = new List<Node>()
+    var l: Lowerer = lowererInit(empty_nodes)
     if l.for_counter != 0 {
         return 1
+    }
+    if l.error_count != 0 {
+        return 100
     }
 
     // Test string literal addition

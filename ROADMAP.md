@@ -4,6 +4,9 @@
 
 > **Claude: Update this file when you start or complete a roadmap item.**
 
+> **Bug Tracking:** When encountering bugs, follow the process in `BUGLIST.md`:
+> Discover -> Document -> Test -> Fix -> Verify -> Complete
+
 ---
 
 ## The Bootstrap Strategy
@@ -59,8 +62,8 @@ Every Zig source file needs a corresponding bootstrap .cot file that uses only s
 | `src/lower.zig` | `src/bootstrap/lower_boot.cot` | ✅ | ✅ | AST → IR lowering |
 | `src/ssa.zig` | `src/bootstrap/ssa_boot.cot` | ✅ | ✅ | SSA conversion |
 | `src/liveness.zig` | `src/bootstrap/liveness_boot.cot` | ✅ | ✅ | Liveness analysis |
-| `src/driver.zig` | `src/bootstrap/driver_boot.cot` | ✅ | ✅ | Compilation driver |
-| `src/main.zig` | `src/bootstrap/main_boot.cot` | ✅ | ✅ | Self-hosting works! |
+| `src/driver.zig` | `src/bootstrap/driver_boot.cot` | ✅ | ✅ | Full compilation pipeline + codegen |
+| `src/main.zig` | `src/bootstrap/main_boot.cot` | ✅ | ✅ | CLI entry point (uses driver) |
 | `src/codegen/backend.zig` | `src/bootstrap/codegen/backend_boot.cot` | ✅ | ✅ | Backend utilities |
 | `src/codegen/arm64_codegen.zig` | `src/bootstrap/codegen/arm64_boot.cot` | ✅ | ✅ | ARM64 code generation |
 | `src/codegen/amd64_codegen.zig` | `src/bootstrap/codegen/amd64_boot.cot` | ❌ | - | Not created |

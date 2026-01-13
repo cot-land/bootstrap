@@ -1774,9 +1774,20 @@ pub const Lowerer = struct {
         // Lower the argument
         const arg_node = try self.lowerExpr(call.args[0]);
 
-        // Emit as a call node - codegen will recognize "print"/"println" and emit syscall
-        log.debug("  {s}: builtin", .{func_name});
-        return try fb.emitCall(func_name, &.{arg_node}, true, TypeRegistry.VOID, Span.fromPos(Pos.zero));
+        // Check if argument is an integer type - use print_int/println_int
+        const arg_ir_node = fb.nodes.items[arg_node];
+        const arg_type = arg_ir_node.type_idx;
+        const is_int = self.type_reg.isIntType(arg_type);
+
+        // Choose the right function name based on argument type
+        const actual_func_name = if (is_int)
+            (if (std.mem.eql(u8, func_name, "println")) "println_int" else "print_int")
+        else
+            func_name;
+
+        // Emit as a call node
+        log.debug("  {s}: builtin (actual: {s})", .{ func_name, actual_func_name });
+        return try fb.emitCall(actual_func_name, &.{arg_node}, true, TypeRegistry.VOID, Span.fromPos(Pos.zero));
     }
 
     fn lowerBuiltinIntFromEnum(self: *Lowerer, call: ast.Call) Allocator.Error!ir.NodeIndex {
