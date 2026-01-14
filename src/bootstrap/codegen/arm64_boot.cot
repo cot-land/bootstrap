@@ -449,15 +449,17 @@ struct FullCodeGen {
     buf: CodeBuffer,
     stack_size: int,
     next_spill_offset: int,
+    locals: List<IRLocal>,
 }
 
-fn fullCodeGenInit(stack_size: int) FullCodeGen {
+fn fullCodeGenInit(stack_size: int, locals: List<IRLocal>) FullCodeGen {
     var cg: FullCodeGen = FullCodeGen{
         .reg_manager = regManagerInit(),
         .value_locations = new List<MCValue>(),
         .buf = codeBufferInit(),
         .stack_size = stack_size,
         .next_spill_offset = 96,
+        .locals = locals,
     }
     var i: int = 0
     while i < 256 {
@@ -588,6 +590,108 @@ fn cgGenReturn(cg: *FullCodeGen, ret_value_id: int) void {
     cgLoadToReg(cg, REG_X0, ret_mcv)
     // Emit epilogue - restore fp/lr and deallocate stack
     cgGenEpilogue(cg, cg.*.stack_size)
+}
+
+// Generate address of local variable
+fn cgGenAddrLocal(cg: *FullCodeGen, value_id: int, slot_idx: int) void {
+    // Calculate offset from fp: fp + (-(slot_idx + 1) * 8)
+    // Equivalent to fp - ((slot_idx + 1) * 8)
+    var fp_offset: int = 0 - (slot_idx + 1) * 8
+    // Also need to account for stack frame - actually relative to sp
+    var sp_offset: int = cg.*.stack_size + 16 + fp_offset
+
+    // Allocate a register for the result
+    var reg: int = regManagerTryAlloc(cg.*.reg_manager, value_id)
+    if reg == REG_NONE {
+        reg = REG_X9
+        cgSpillReg(cg, reg)
+        regManagerMarkUsed(cg.*.reg_manager, reg, value_id)
+    }
+
+    // add reg, sp, #sp_offset
+    addRegImm12(&cg.*.buf, reg, REG_SP, sp_offset)
+    cgSetResult(cg, value_id, mcvRegister(reg))
+}
+
+// Generate pointer load (dereference)
+fn cgGenPtrLoad(cg: *FullCodeGen, value_id: int, ptr_id: int) void {
+    // Get the pointer value
+    var ptr_mcv: MCValue = cgGetValue(cg, ptr_id)
+
+    // Allocate a register for the result
+    var reg: int = regManagerTryAlloc(cg.*.reg_manager, value_id)
+    if reg == REG_NONE {
+        reg = REG_X9
+        cgSpillReg(cg, reg)
+        regManagerMarkUsed(cg.*.reg_manager, reg, value_id)
+    }
+
+    // Load the pointer into a temp register if needed
+    var ptr_reg: int = REG_X10
+    cgLoadToReg(cg, ptr_reg, ptr_mcv)
+
+    // ldr reg, [ptr_reg]
+    ldrRegImm(&cg.*.buf, reg, ptr_reg, 0)
+    cgSetResult(cg, value_id, mcvRegister(reg))
+}
+
+// Generate field_local: load a field from a local struct variable
+// local_idx = index of the local struct, field_offset = byte offset of field
+fn cgGenFieldLocal(cg: *FullCodeGen, value_id: int, local_idx: int, field_offset: int) void {
+    // Get the actual local offset from the locals list
+    var local: IRLocal = cg.*.locals.get(local_idx)
+    // local.offset is negative (rbp-relative), convert to sp-relative
+    var sp_offset: int = cg.*.stack_size + 16 + local.offset + field_offset
+
+    // Allocate result register
+    var reg: int = regManagerTryAlloc(cg.*.reg_manager, value_id)
+    if reg == REG_NONE {
+        reg = REG_X9
+        cgSpillReg(cg, reg)
+        regManagerMarkUsed(cg.*.reg_manager, reg, value_id)
+    }
+
+    // ldr reg, [sp, #offset]
+    ldrRegImm(&cg.*.buf, reg, REG_SP, sp_offset)
+    cgSetResult(cg, value_id, mcvRegister(reg))
+}
+
+// Generate store_local_field: store a value to a field in a local struct variable
+// local_idx = index of the local struct, value_id = value to store, field_offset = byte offset of field
+fn cgGenStoreLocalField(cg: *FullCodeGen, local_idx: int, value_id: int, field_offset: int) void {
+    // Get the actual local offset from the locals list
+    var local: IRLocal = cg.*.locals.get(local_idx)
+    // local.offset is negative (rbp-relative), convert to sp-relative
+    var sp_offset: int = cg.*.stack_size + 16 + local.offset + field_offset
+
+    // Get the value to store
+    var value_mcv: MCValue = cgGetValue(cg, value_id)
+    var value_reg: int = REG_X10
+    cgLoadToReg(cg, value_reg, value_mcv)
+
+    // str value_reg, [sp, #offset]
+    strRegImm(&cg.*.buf, value_reg, REG_SP, sp_offset)
+}
+
+// Generate field_value: load a field from a struct value (in a register)
+fn cgGenFieldValue(cg: *FullCodeGen, value_id: int, struct_id: int, field_offset: int) void {
+    var struct_mcv: MCValue = cgGetValue(cg, struct_id)
+
+    // Allocate result register
+    var reg: int = regManagerTryAlloc(cg.*.reg_manager, value_id)
+    if reg == REG_NONE {
+        reg = REG_X9
+        cgSpillReg(cg, reg)
+        regManagerMarkUsed(cg.*.reg_manager, reg, value_id)
+    }
+
+    // Load the struct pointer/base into a temp register
+    var base_reg: int = REG_X10
+    cgLoadToReg(cg, base_reg, struct_mcv)
+
+    // ldr reg, [base_reg, #field_offset]
+    ldrRegImm(&cg.*.buf, reg, base_reg, field_offset)
+    cgSetResult(cg, value_id, mcvRegister(reg))
 }
 
 // =============================================================================
@@ -1172,6 +1276,22 @@ fn cgSpillParamToStack(cg: *FullCodeGen, reg_idx: int, slot_idx: int) void {
     strRegImm(&cg.*.buf, src_reg, REG_SP, sp_offset)
 }
 
+// BUG-033 fix: Spill parameter register to a specific stack offset
+// reg_idx: parameter register (0=x0, 1=x1, etc.)
+// local_offset: offset within local stack area (from frame pointer)
+// size: size of data to spill (for alignment/instruction selection)
+fn cgSpillParamToStackWithOffset(cg: *FullCodeGen, reg_idx: int, local_offset: int, size: int) void {
+    // Convert local offset to SP-relative offset
+    // Local offset is FP-relative (negative), SP offset is positive from SP
+    var sp_offset: int = cg.*.stack_size + 16 + local_offset
+
+    // Map reg_idx to actual register
+    var src_reg: int = REG_X0 + reg_idx
+
+    // Store parameter register to stack
+    strRegImm(&cg.*.buf, src_reg, REG_SP, sp_offset)
+}
+
 // Load from pointer (base + offset)
 fn cgGenLoadPtr(cg: *FullCodeGen, value_id: int, base_id: int, offset: int, size: int) void {
     cgEnsureRegFree(cg, REG_X0)
@@ -1488,7 +1608,8 @@ fn test_arm64() int {
     }
 
     // Test FullCodeGen and CodeBuffer
-    var fcg: FullCodeGen = fullCodeGenInit(128)
+    var test_locals: List<IRLocal> = new List<IRLocal>()
+    var fcg: FullCodeGen = fullCodeGenInit(128, test_locals)
     if fcg.stack_size != 128 {
         return 15
     }

@@ -49,6 +49,7 @@ pub const Decl = union(enum) {
     enum_decl: EnumDecl,
     union_decl: UnionDecl,
     type_alias: TypeAliasDecl,
+    import_decl: ImportDecl,
     // For error recovery
     bad_decl: BadDecl,
 
@@ -61,6 +62,7 @@ pub const Decl = union(enum) {
             .enum_decl => |d| d.span,
             .union_decl => |d| d.span,
             .type_alias => |d| d.span,
+            .import_decl => |d| d.span,
             .bad_decl => |d| d.span,
         };
     }
@@ -145,6 +147,13 @@ pub const UnionVariant = struct {
 pub const TypeAliasDecl = struct {
     name: []const u8,
     target_type: NodeIndex, // the type being aliased
+    span: Span,
+};
+
+/// import "path/to/file.cot"
+/// Import declaration - brings in declarations from another file
+pub const ImportDecl = struct {
+    path: []const u8, // the file path (without quotes)
     span: Span,
 };
 

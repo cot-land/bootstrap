@@ -332,6 +332,7 @@ pub const Checker = struct {
                     false,
                 ));
             },
+            .import_decl => {}, // Imports are processed textually before parsing
             .bad_decl => {},
         }
     }
@@ -414,6 +415,7 @@ pub const Checker = struct {
             .enum_decl => {}, // Already processed in collectDecl
             .union_decl => {}, // Already processed in collectDecl
             .type_alias => {}, // Already processed in collectDecl
+            .import_decl => {}, // Imports are processed textually before parsing
             .bad_decl => {},
         }
     }
@@ -1387,6 +1389,15 @@ pub const Checker = struct {
                     return try self.types.add(.{ .func = .{
                         .params = params,
                         .return_type = lt.elem,
+                    } });
+                } else if (std.mem.eql(u8, f.field, "set")) {
+                    // set(index, value) returns void
+                    const params = try self.allocator.alloc(types.FuncParam, 2);
+                    params[0] = .{ .name = "index", .type_idx = TypeRegistry.INT };
+                    params[1] = .{ .name = "value", .type_idx = lt.elem };
+                    return try self.types.add(.{ .func = .{
+                        .params = params,
+                        .return_type = TypeRegistry.VOID,
                     } });
                 } else if (std.mem.eql(u8, f.field, "len")) {
                     // len() returns int

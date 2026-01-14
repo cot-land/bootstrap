@@ -303,7 +303,7 @@ fn parseBinaryExpr(state: ParserState, min_prec: int) ParseResult {
 }
 
 fn parseUnaryExpr(state: ParserState) ParseResult {
-    if state.tok == Token.minus or state.tok == Token.kw_not or state.tok == Token.bang {
+    if state.tok == Token.minus or state.tok == Token.kw_not or state.tok == Token.bang or state.tok == Token.ampersand or state.tok == Token.star {
         var op: Token = state.tok
         var start: Pos = parserPos(state)
         var next: ParserState = parserAdvance(state)
@@ -361,6 +361,19 @@ fn parsePrimaryExpr(state: ParserState) ParseResult {
             }
             current = field_result.state
             base = field_result.node_idx
+        } else if current.tok == Token.dot_star {
+            // Dereference .*
+            current = parserAdvance(current)
+            var base_node: Node = current.nodes.get(base)
+            var span: Span = spanInit(base_node.span.start, parserPos(current))
+
+            var deref_node: Node = makeNode(NodeTag.unary_expr, span)
+            deref_node.op = Token.star
+            deref_node.left = base
+
+            var deref_result: ParseResult = addNode(current, deref_node)
+            current = deref_result.state
+            base = deref_result.node_idx
         } else if current.tok == Token.dot_question {
             // Optional unwrap .?
             current = parserAdvance(current)
@@ -442,26 +455,13 @@ fn parseOperand(state: ParserState) ParseResult {
             return parseStructInit(next, name, span.start)
         }
 
-        // Check for enum/union variant: Name.variant
-        if next.tok == Token.dot {
-            var dot_next: ParserState = parserAdvance(next)
-            if dot_next.tok == Token.identifier {
-                var variant_name: string = dot_next.tok_text
-                var after_variant: ParserState = parserAdvance(dot_next)
+        // NOTE: Don't handle identifier.identifier here!
+        // Let parsePrimaryExpr's postfix loop call parseFieldAccess for ALL .field cases.
+        // This ensures both enum variant access (NodeTag.field_access) and struct field
+        // access (s.x) go through parseFieldAccess which correctly sets .left = base.
 
-                // Check for union constructor: Type.variant(value)
-                if after_variant.tok == Token.lparen {
-                    return parseUnionConstructor(after_variant, name, variant_name, span.start)
-                }
-
-                // Plain enum variant
-                var combined_span: Span = spanInit(span.start, posFromOffset(dot_next.tok_end))
-                var node: Node = makeNode(NodeTag.field_access, combined_span)
-                node.name = name
-                node.text = variant_name
-                return addNode(after_variant, node)
-            }
-        }
+        // Union constructor handling is now done in parseFieldAccess or parsePostfix
+        // (We check for Type.variant(value) pattern elsewhere)
 
         // Plain identifier
         var node: Node = makeNode(NodeTag.identifier, span)
@@ -606,6 +606,16 @@ fn parseFieldAccess(state: ParserState, base: NodeIndex) ParseResult {
     var start_pos: Pos = state.nodes.get(base).span.start
     var current: ParserState = parserAdvance(state)  // consume '.'
 
+    // Handle .* (dereference)
+    if current.tok == Token.star {
+        current = parserAdvance(current)  // consume '*'
+        var span: Span = spanInit(start_pos, parserPos(current))
+        var node: Node = makeNode(NodeTag.unary_expr, span)
+        node.op = Token.star
+        node.left = base
+        return addNode(current, node)
+    }
+
     if current.tok != Token.identifier {
         return ParseResult{ .state = current, .node_idx = null_node }
     }
@@ -614,9 +624,22 @@ fn parseFieldAccess(state: ParserState, base: NodeIndex) ParseResult {
     current = parserAdvance(current)
 
     var span: Span = spanInit(start_pos, parserPos(current))
-    var node: Node = makeNode(NodeTag.field_access, span)
-    node.left = base
-    node.name = field_name
+
+    // Create node with all fields inline to ensure left is set
+    var node: Node = Node{
+        .tag = NodeTag.field_access,
+        .name = field_name,
+        .text = "",
+        .op = Token.invalid,
+        .left = base,
+        .right = null_node,
+        .cond = null_node,
+        .body = null_node,
+        .else_body = null_node,
+        .type_expr = null_node,
+        .args = new List<NodeIndex>(),
+        .span = span,
+    }
     return addNode(current, node)
 }
 

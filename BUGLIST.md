@@ -258,6 +258,80 @@ This is the ONLY way to achieve a stable self-hosting compiler.
   1. Added `cgSpillParamToStack` function to arm64_boot.cot
   2. Modified `generateFunctionFromIR` to spill x0-x3 to stack slots after prologue
 
+### BUG-027: cot0 field_access returns 0 (node.left appears null)
+- **Status:** FIXED
+- **Discovered:** 2026-01-14
+- **Location:** `parser_boot.cot:469-486` (was in parseOperand)
+- **Description:** When parsing `identifier.identifier` patterns (like `s.x`), the parser in parseOperand was incorrectly handling them as enum variant access. This created field_access nodes using `makeNode()` which sets `left = null_node`. Actual struct field access (like `s.x`) should be handled by parseFieldAccess which sets `left = base` correctly.
+- **Impact:** Any struct field access in cot0-compiled programs returned 0 (exit 111)
+- **Test:** `tests/bootstrap/test_field_access.cot`
+- **Root Cause:** The code at parseOperand lines 469-486 was meant for enum variant access like `NodeTag.field_access`, but it caught ALL `identifier.identifier` patterns including struct field access.
+- **Fix:** Removed the special `identifier.identifier` handling from parseOperand. Now ALL `.field` patterns go through parseFieldAccess in the postfix loop, which correctly sets `.left = base`.
+
+### BUG-028: cot0 struct field offsets assume all fields are 8 bytes
+- **Status:** WORKAROUND IN PLACE
+- **Discovered:** 2026-01-14
+- **Location:** `lower_boot.cot:924,933`
+- **Description:** `lowerVarStmtAST` uses `struct_size = num_fields * 8` and `field_offset = i * 8`. This is wrong for structs with string fields (16 bytes) or other multi-word types.
+- **Impact:** Struct initialization with string fields stores values at wrong offsets; field access reads from wrong offsets
+- **Test:** `tests/bootstrap/test_string_struct.cot`
+- **Workaround:** Added hardcoded `getNodeFieldOffset`, `getSpanFieldOffset`, `getPosFieldOffset` functions with manually computed offsets for known struct types.
+- **Proper Fix:** Implement proper type registry lookup in cot0 lowerer to compute field offsets dynamically.
+- **Debug Info:**
+  - For `struct { tag: int, name: string, left: int }`, left should be at offset 24 (8+16), not offset 16 (8+8)
+  - Disassembly shows same value stored to multiple consecutive slots
+
+### BUG-029: Inconsistent null_node definitions across modules
+- **Status:** FIXED
+- **Discovered:** 2026-01-14
+- **Location:** `ast_boot.cot:10`, `parser_boot.cot:43`, `check_boot.cot:44`
+- **Description:** `null_node` is defined with different types and values in different files:
+  - `ast_boot.cot`: `const null_node: u32 = @maxInt(u32)` = 4294967295 (was wrong)
+  - `parser_boot.cot`: `const null_node: int = @maxInt(int)` = 9223372036854775807
+  - `check_boot.cot`: `const null_node: NodeIndex = @maxInt(i64)` = 9223372036854775807
+- **Impact:** When comparing node indices across modules, comparison may fail if one module stores u32 max and another expects i64 max.
+- **Test:** `tests/bootstrap/test_field_access.cot`
+- **Fix:** Changed `ast_boot.cot` to use `type NodeIndex = int` and `const null_node: int = @maxInt(int)` to match parser_boot.cot and check_boot.cot. All modules now use 64-bit null_node value consistently.
+
+### BUG-030: generateListPush doesn't pass pointer for large structs
+- **Status:** OPEN
+- **Discovered:** 2026-01-14
+- **Location:** `driver_boot.cot:379-386`
+- **Description:** For structs >8 bytes, `cot_list_push` expects x1 to contain a POINTER to the struct data. But `generateListPush` just loads the value into x1 via `cgPrepareArg`. This causes only 8 bytes to be pushed instead of the full struct.
+- **Impact:** List<Node> and other large struct lists have corrupted data after push operations.
+- **Test:** `tests/bootstrap/test_large_struct_list.cot` (TBD)
+- **Fix:** In `generateListPush`, check elem_size. If >8 bytes, compute address of value on stack and pass that in x1 instead of loading the value.
+
+### BUG-031: lowerListGet doesn't pass elem_size to codegen
+- **Status:** PARTIAL FIX
+- **Discovered:** 2026-01-14
+- **Location:** `lower_boot.cot:519-523`, callers of lowerListGet
+- **Description:** `lowerListGet` signature was updated to take `elem_size` parameter and store it in `node.aux`, but callers haven't been updated to pass the correct elem_size.
+- **Impact:** `generateListGet` reads elem_size from aux field, but it's not set correctly, so large struct handling doesn't trigger.
+- **Test:** TBD
+- **Fix:** Find all callers of lowerListGet and update them to pass the correct element size.
+
+### BUG-032: Multiple ret nodes in same IR block - only last takes effect
+- **Status:** WORKAROUND IN PLACE
+- **Discovered:** 2026-01-14
+- **Location:** `driver.zig:convertToSSA`
+- **Description:** When if/else branches both have return statements, the IR has multiple ret nodes in the same block. Only the last ret is processed because ret is a terminator. Earlier rets are silently ignored.
+- **Impact:** Functions with `if x { return a } else { return b }` pattern always return from the else branch.
+- **Workaround:** Added `terminated_blocks` HashMap to track which blocks have been terminated, skip duplicate terminators.
+- **Proper Fix:** Restructure IR lowering to create separate basic blocks for each return path, or ensure proper control flow graph structure.
+
+### BUG-033: cot0 struct arguments to functions return wrong values
+- **Status:** OPEN
+- **Discovered:** 2026-01-14
+- **Location:** `lower_boot.cot` and/or `driver_boot.cot`
+- **Description:** When a struct is passed to a function, accessing fields of that struct returns 0 instead of the correct value.
+- **Impact:** Functions that take struct arguments can't access their fields correctly
+- **Test:** `fn getX(p: Point) int { return p.x }` with Point{.x=42, .y=0} returns 0 instead of 42
+- **Root Cause:** TBD - likely related to how struct parameters are handled in callee (spilling, local lookup, or field access)
+- **Debug Info:**
+  - Struct field access on local variables works (`var p: Point = ...; return p.x` returns 42)
+  - The issue is specific to struct parameters
+
 ---
 
 ## Completed Bugs
@@ -282,6 +356,8 @@ This is the ONLY way to achieve a stable self-hosting compiler.
 | BUG-024 | cot0 crashes on `<` operator (same as BUG-022) | 2026-01-14 |
 | BUG-025 | Function calls produce infinite loops | 2026-01-14 |
 | BUG-026 | Function parameters not spilled to stack | 2026-01-14 |
+| BUG-027 | cot0 field_access returns 0 (parser bug) | 2026-01-14 |
+| BUG-029 | Inconsistent null_node definitions | 2026-01-14 |
 
 ---
 

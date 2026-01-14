@@ -331,7 +331,7 @@ After self-hosting, we can gradually migrate from bootstrap files to wireframe f
 |---------|--------|----------|
 | ~~No address-of `&x`~~ | ~~Can't take pointers~~ | ✅ **RESOLVED** - Full pointer support |
 | No error handling | Can't propagate errors | Return error codes |
-| No imports | Single file compilation | File concatenation |
+| ~~No imports~~ | ~~Single file compilation~~ | ✅ **RESOLVED** - Text-based import support |
 
 ---
 

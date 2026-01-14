@@ -177,11 +177,35 @@ pub const Parser = struct {
             .kw_enum => try self.parseEnumDecl(),
             .kw_union => try self.parseUnionDecl(),
             .kw_type => try self.parseTypeAlias(),
+            .kw_import => try self.parseImportDecl(),
             else => {
                 self.syntaxError("expected declaration");
                 return null;
             },
         };
+    }
+
+    /// Parse import declaration: import "path/to/file.cot"
+    fn parseImportDecl(self: *Parser) !?NodeIndex {
+        const start = self.pos();
+        self.advance(); // consume 'import'
+
+        // Expect string literal with path
+        if (!self.check(.string_literal)) {
+            self.err.errorWithCode(self.pos(), .E203, "expected string literal for import path");
+            return null;
+        }
+        const path = self.tok.text;
+        self.advance();
+
+        return try self.ast.addNode(.{
+            .decl = .{
+                .import_decl = .{
+                    .path = path,
+                    .span = Span.init(start, self.tok.span.start),
+                },
+            },
+        });
     }
 
     /// Parse function declaration: fn name(params) type { body }

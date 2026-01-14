@@ -211,6 +211,39 @@ fn getFieldFromStruct(st: StructType, field_name: string) TypeIndex {
     return invalid_type
 }
 
+// Get a struct field's offset by field name (returns -1 if not found)
+fn getFieldOffset(reg: TypeRegistry, struct_type_idx: TypeIndex, field_name: string) int {
+    var t: Type = typeRegistryGet(reg, struct_type_idx)
+    return switch t {
+        .struct_type |st| => getFieldOffsetFromStruct(st, field_name),
+        else => -1,
+    }
+}
+
+fn getFieldOffsetFromStruct(st: StructType, field_name: string) int {
+    for field in st.fields {
+        if field.name == field_name {
+            return field.offset
+        }
+    }
+    return -1
+}
+
+// Get a struct field's offset by index (returns -1 if out of bounds)
+fn getFieldOffsetByIndex(reg: TypeRegistry, struct_type_idx: TypeIndex, field_idx: int) int {
+    var t: Type = typeRegistryGet(reg, struct_type_idx)
+    return switch t {
+        .struct_type |st| => getFieldOffsetByIdxFromStruct(st, field_idx),
+        else => -1,
+    }
+}
+
+fn getFieldOffsetByIdxFromStruct(st: StructType, field_idx: int) int {
+    if field_idx < 0 { return -1 }
+    if field_idx >= len(st.fields) { return -1 }
+    return st.fields[field_idx].offset
+}
+
 // Get the element type of an array, slice, or list
 fn getElementType(reg: TypeRegistry, type_idx: TypeIndex) TypeIndex {
     var t: Type = typeRegistryGet(reg, type_idx)

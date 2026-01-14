@@ -124,6 +124,7 @@ pub const Lowerer = struct {
             .enum_decl => {}, // Type-only, no codegen needed
             .union_decl => {}, // Type-only, no codegen needed
             .type_alias => {}, // Type-only, no codegen needed
+            .import_decl => {}, // Imports are processed textually before parsing
             .bad_decl => {}, // Skip invalid declarations
         }
     }

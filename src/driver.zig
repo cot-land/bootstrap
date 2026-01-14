@@ -563,6 +563,10 @@ pub const Driver = struct {
         var ir_block_to_ssa = std.AutoHashMap(u32, u32).init(func.allocator);
         defer ir_block_to_ssa.deinit();
 
+        // Track which blocks have already been terminated (for dead code handling)
+        var terminated_blocks = std.AutoHashMap(u32, bool).init(func.allocator);
+        defer terminated_blocks.deinit();
+
         // Create SSA blocks for each IR block
         for (ir_func.blocks, 0..) |_, idx| {
             const block_id = func.newBlock();
@@ -572,6 +576,12 @@ pub const Driver = struct {
         // Convert each IR node - handle terminators specially (Go-style)
         for (ir_func.nodes, 0..) |*node, idx| {
             const ssa_block_id = ir_block_to_ssa.get(node.block) orelse 0;
+
+            // Skip if this block has already been terminated (dead code)
+            if (terminated_blocks.get(node.block) orelse false) {
+                continue;
+            }
+
             var ssa_block = func.getBlock(ssa_block_id);
 
             switch (node.data) {
@@ -591,6 +601,9 @@ pub const Driver = struct {
                     if (ir_block_to_ssa.get(br.else_block)) |else_ssa| {
                         _ = ssa_block.addSucc(else_ssa);
                     }
+
+                    // Mark block as terminated
+                    try terminated_blocks.put(node.block, true);
                 },
 
                 .jump => |jmp| {
@@ -598,6 +611,9 @@ pub const Driver = struct {
                     if (ir_block_to_ssa.get(jmp.target)) |target_ssa| {
                         _ = ssa_block.addSucc(target_ssa);
                     }
+
+                    // Mark block as terminated
+                    try terminated_blocks.put(node.block, true);
                 },
 
                 .ret => |ret| {
@@ -607,6 +623,9 @@ pub const Driver = struct {
                             ssa_block.setControl(ssa_val);
                         }
                     }
+
+                    // Mark block as terminated - any subsequent code in this block is dead
+                    try terminated_blocks.put(node.block, true);
                 },
 
                 // Non-terminators become SSA values

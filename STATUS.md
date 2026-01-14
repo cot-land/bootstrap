@@ -222,6 +222,14 @@ codegen/*_boot.cot   → ARM64 code generation + Mach-O output
 | Optional unwrap | Done | `.?` |
 | String equality | Done | `s1 == s2` |
 
+### Imports
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `import "path/to/file.cot"` | Done | Text-based file inclusion |
+| Recursive imports | Done | Imports can import other files |
+| Duplicate detection | Done | Same file not included twice |
+
 ### Built-ins
 
 | Feature | Status | Notes |
