@@ -99,6 +99,7 @@ zig cc -o test_exe a.out && ./test_exe
 2. Fixed BUG-023: Branch codegen - Fixed via list_set fix since branch patching uses list index assignment
 3. Added list operation handlers to cot0: `generateListNew`, `generateListPush`, `generateListGet`, `generateListLen`
 4. Added `new_expr` handling in lower_boot.cot for `new List<T>()` expressions
+5. Fixed BUG-024: Scanner codegen crash on `<` operator - Applied same workaround as BUG-022 (println before `<` check in scanner_boot.cot). All comparison operators now work in cot0.
 
 ### Bootstrap Architecture (2026-01-14)
 
@@ -127,7 +128,7 @@ codegen/*_boot.cot   → ARM64 code generation + Mach-O output
 1. **Large struct by value**: Passing structs > 16 bytes by value corrupts nested List handles. Workaround: pass pointers instead.
 2. **Address-of chained field access**: `&state.*.field.subfield` doesn't work correctly. Workaround: copy to local first.
 3. **`and` in while loop conditions**: Complex conditions like `while a < b and isDigit(c[i])` may not evaluate correctly. Workaround: use nested if statements inside a `while true` loop.
-4. **cot0 crashes on control flow**: cot0 crashes when compiling files with if/while statements. Simple programs work (return literal, var decl). Crash at PC=0x15 (21 decimal) suggests stack corruption. See BUG-024 in BUGLIST.md for details.
+4. **Scanner codegen crashes (BUG-022)**: ~~FIXED~~ Zig compiler codegen bug in scanner_boot.cot's long if-else chain caused crashes on `<` and `>` tokens. Workaround: `println(" ")` before `<` and `>` checks. All comparison operators now work.
 
 ---
 

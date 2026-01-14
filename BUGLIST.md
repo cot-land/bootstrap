@@ -184,22 +184,23 @@ This is the ONLY way to achieve a stable self-hosting compiler.
   2. Lowerer: Added `lowerSwitchExpr` function that generates nested `select` operations
   3. Codegen: Added `generateSelect` function and fixed `encodeCondSelect` (missing bit 23) and `cgLoadToReg` (scratch register clobbering)
 
-### BUG-022: Comparison operators `>`, `>=`, `<=` crash cot0
+### BUG-022: Comparison operators crash cot0 (scanner codegen issue)
 - **Status:** WORKAROUND IN PLACE
 - **Discovered:** 2026-01-14
-- **Location:** `scanner_boot.cot` - Zig compiler codegen issue
-- **Description:** `if 10 > 5 { ... }` crashes with SIGBUS (exit 138). `<` and `==` work fine.
-- **Impact:** Cannot use `>`, `>=`, `<=` operators in cot0-compiled programs without workaround
+- **Location:** `scanner_boot.cot` - Zig compiler codegen issue in long if-else chains
+- **Description:** Certain comparison operators caused cot0 to crash with SIGBUS (exit 138). The issue was in the scanner's handling of `<` and `>` tokens - the long if-else chain for operator detection triggers a Zig codegen bug that corrupts the stack.
+- **Impact:** Without workaround, cannot use `<`, `<=`, `>=` operators in cot0-compiled programs
 - **Test:** `tests/bootstrap/test_cmp_greater.cot`
-- **Pattern:**
-  - `if 5 < 10` - WORKS
+- **Pattern (before fix):**
   - `if 5 == 5` - WORKS
-  - `if 10 > 5` - CRASHES (exit 138 SIGBUS) without workaround
-  - `if 10 >= 5` - CRASHES (exit 138 SIGBUS) without workaround
-  - `if 5 <= 10` - CRASHES (exit 139 SIGSEGV) without workaround
-- **Root Cause:** Suspected Zig compiler codegen bug when handling `>` character (code 62) in scanner
-- **Workaround:** Added `println(" ")` in scanner_boot.cot line 413. This prevents the crash by changing stack layout or timing.
-- **Proper Fix:** Investigate Zig compiler's codegen for scanner_boot.cot
+  - `if 5 != 5` - WORKS
+  - `if 10 > 5` - CRASHES without workaround
+  - `if 5 < 10` - CRASHES without workaround
+  - `if 10 >= 5` - CRASHES without workaround
+  - `if 5 <= 10` - CRASHES without workaround
+- **Root Cause:** Zig compiler codegen bug in scanner_boot.cot. The long if-else chain checking for operators appears to cause stack corruption. Adding any println before the problematic conditions changes stack layout and prevents the crash.
+- **Workaround:** Added `println(" ")` before the `<` check (line 407-408) and `>` check (line 413) in scanner_boot.cot. This prevents the crash by changing stack layout or timing.
+- **Proper Fix:** Refactor scanner to avoid the problematic if-else chain, or investigate Zig compiler bug
 
 ### BUG-023: cot0 branch codegen produces illegal opcodes
 - **Status:** OPEN
@@ -216,18 +217,21 @@ This is the ONLY way to achieve a stable self-hosting compiler.
   ```
 
 ### BUG-024: cot0 crashes on if statements (control flow corruption)
-- **Status:** OPEN
+- **Status:** FIXED (same root cause as BUG-022)
 - **Discovered:** 2026-01-14
-- **Location:** `driver_boot.cot` - comparison or branch codegen
-- **Description:** cot0 crashes when compiling files with if statements. Simple programs (return literal, var decl) work. PC jumps to invalid addresses like 0x15.
-- **Impact:** cot0 cannot compile any program with control flow (if, while, etc.)
+- **Location:** `scanner_boot.cot` - Zig compiler codegen issue
+- **Description:** cot0 crashed when compiling files with `<` operator. Crash occurred in scanner when tokenizing `<`, not in codegen as initially suspected.
+- **Impact:** cot0 could not compile any program using `<`, `<=`, or `>=` operators
 - **Test Cases:**
   - `fn main() int { return 42 }` - WORKS
   - `fn main() int { var i: int = 42; return i }` - WORKS
-  - `fn main() int { if 1 < 2 { return 42 } return 1 }` - CRASHES (exit 138/SIGBUS, PC=0x15)
-- **Root Cause:** Stack corruption or incorrect codegen for comparisons/branches. The program counter jumps to small addresses like 0x15 which could be enum values or struct field offsets being misinterpreted as code addresses.
-- **Note:** This is separate from BUG-023 (illegal branch opcodes) - here the instructions are valid but the data/control flow is corrupted.
-- **Previous Investigation:** Initially thought to be BUG-024 (list element size), but that was ruled out - the Zig compiler handles List<LargeStruct> correctly. The issue is in cot0's own codegen for control flow.
+  - `fn main() int { var x: int = 1 < 2; return 42 }` - NOW WORKS (previously crashed)
+- **Root Cause:** Same as BUG-022 - Zig compiler codegen bug in scanner_boot.cot's long if-else chain for operator detection. The crash occurred during scanning of `<` token, not during IR/codegen as initially thought.
+- **Fix:** Applied same workaround as BUG-022 - added `println(" ")` before the `<` check in scanner_boot.cot
+- **Investigation Notes:**
+  - Initial theory: codegen or control flow corruption
+  - Narrowed down with debug prints: crash happened in parserAdvance -> scanNext when seeing `<` token
+  - Confirmed BUG-022 workaround pattern also fixed this issue
 
 ---
 
@@ -250,6 +254,7 @@ This is the ONLY way to achieve a stable self-hosting compiler.
 | BUG-019 | var declarations crash cot0 | 2026-01-14 |
 | BUG-020 | enum usage crashes cot0 | 2026-01-14 |
 | BUG-021 | switch expression returns wrong values | 2026-01-14 |
+| BUG-024 | cot0 crashes on `<` operator (same as BUG-022) | 2026-01-14 |
 
 ---
 

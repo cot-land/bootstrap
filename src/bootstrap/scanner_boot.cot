@@ -404,6 +404,8 @@ fn scanNext(state: ScannerState) TokenResult {
         return TokenResult{ .tok = Token.bang, .start = start, .end = pos }
     }
     if c == 60 {
+        // BUG-022 workaround: println prevents crash (Zig codegen issue)
+        println(" ")
         if next == 61 { return TokenResult{ .tok = Token.less_equal, .start = start, .end = pos + 1 } }
         if next == 60 { return TokenResult{ .tok = Token.less_less, .start = start, .end = pos + 1 } }
         return TokenResult{ .tok = Token.less, .start = start, .end = pos }
