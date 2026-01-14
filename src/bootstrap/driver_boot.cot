@@ -153,7 +153,7 @@ fn generateCodeFromIR(ir: IRProgram, output_path: string) bool {
 }
 
 fn generateFunctionFromIR(text_sec: *Section, func: IRFunc) void {
-    var cg: FullCodeGen = fullCodeGenInit(func.frame_size)
+    var cg: FullCodeGen = fullCodeGenInit(func.frame_size, func.locals)
     cgGenPrologue(&cg, func.frame_size)
 
     // Spill parameter registers to their stack slots

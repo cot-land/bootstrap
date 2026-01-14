@@ -332,6 +332,15 @@ This is the ONLY way to achieve a stable self-hosting compiler.
   - Struct field access on local variables works (`var p: Point = ...; return p.x` returns 42)
   - The issue is specific to struct parameters
 
+### BUG-034: fullCodeGenInit argument mismatch in driver_boot.cot
+- **Status:** FIXED
+- **Discovered:** 2026-01-14
+- **Location:** `driver_boot.cot:156`
+- **Description:** `fullCodeGenInit` was called with only 1 argument (stack_size) but the function requires 2 arguments (stack_size and locals).
+- **Impact:** Bootstrap modules failed to compile with "wrong number of arguments" error
+- **Test:** `./test_bootstrap_modules.sh` - main_boot.cot compile test
+- **Fix:** Added `func.locals` as second argument to `fullCodeGenInit(func.frame_size, func.locals)`
+
 ---
 
 ## Completed Bugs
@@ -358,6 +367,7 @@ This is the ONLY way to achieve a stable self-hosting compiler.
 | BUG-026 | Function parameters not spilled to stack | 2026-01-14 |
 | BUG-027 | cot0 field_access returns 0 (parser bug) | 2026-01-14 |
 | BUG-029 | Inconsistent null_node definitions | 2026-01-14 |
+| BUG-034 | fullCodeGenInit argument mismatch | 2026-01-14 |
 
 ---
 

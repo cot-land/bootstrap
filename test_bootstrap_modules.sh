@@ -362,8 +362,9 @@ fi
 # Test 20: main_boot.cot can compile a simple file (self-hosting test)
 printf "%-30s " "main_boot.cot (self-host):"
 if $COT src/bootstrap/main_boot.cot -o /tmp/cot0 2>/dev/null; then
-    # Try to compile a simple test file
-    result=$(/tmp/cot0 tests/test_return.cot -o /tmp/test_from_cot0 2>/dev/null; echo $?)
+    # Try to compile a simple test file (redirect stdout too, cot0 may print debug output)
+    /tmp/cot0 tests/test_return.cot -o /tmp/test_from_cot0 >/dev/null 2>&1
+    result=$?
     rm -f /tmp/cot0 /tmp/test_from_cot0
     if [ "$result" = "0" ]; then
         echo "PASS"
