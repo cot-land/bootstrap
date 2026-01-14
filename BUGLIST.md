@@ -233,6 +233,31 @@ This is the ONLY way to achieve a stable self-hosting compiler.
   - Narrowed down with debug prints: crash happened in parserAdvance -> scanNext when seeing `<` token
   - Confirmed BUG-022 workaround pattern also fixed this issue
 
+### BUG-025: cot0 function calls produce infinite loops (BL jumps to itself)
+- **Status:** FIXED
+- **Discovered:** 2026-01-14
+- **Location:** `driver_boot.cot`
+- **Description:** BL instructions for function calls were emitted with offset 0, causing infinite loops. Two issues:
+  1. `emitCallPlaceholder` was called but no relocation was recorded
+  2. `applyLocalRelocations` was never called to patch the BL instructions
+- **Impact:** Any function call in cot0-compiled programs caused infinite loop
+- **Test:** `tests/test_fn_call.cot` (now in /tmp)
+- **Fix:**
+  1. Added `CallRelocation` struct to track call sites
+  2. Modified `generateCall` to record relocations in `call_relocs` list
+  3. Added call to `applyLocalRelocations(&obj)` before `writeMachO64`
+
+### BUG-026: cot0 function parameters not spilled to stack
+- **Status:** FIXED
+- **Discovered:** 2026-01-14
+- **Location:** `driver_boot.cot:generateFunctionFromIR`, `arm64_boot.cot`
+- **Description:** ARM64 calling convention passes first 8 args in x0-x7, but `Op.local` reads from stack slots. Parameters were never copied from registers to their stack slots.
+- **Impact:** Functions with parameters returned garbage values (read uninitialized stack)
+- **Test:** `fn add(a: int, b: int) int { return a + b }` returned wrong values
+- **Fix:**
+  1. Added `cgSpillParamToStack` function to arm64_boot.cot
+  2. Modified `generateFunctionFromIR` to spill x0-x3 to stack slots after prologue
+
 ---
 
 ## Completed Bugs
@@ -255,6 +280,8 @@ This is the ONLY way to achieve a stable self-hosting compiler.
 | BUG-020 | enum usage crashes cot0 | 2026-01-14 |
 | BUG-021 | switch expression returns wrong values | 2026-01-14 |
 | BUG-024 | cot0 crashes on `<` operator (same as BUG-022) | 2026-01-14 |
+| BUG-025 | Function calls produce infinite loops | 2026-01-14 |
+| BUG-026 | Function parameters not spilled to stack | 2026-01-14 |
 
 ---
 

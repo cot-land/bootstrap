@@ -114,6 +114,12 @@ struct BranchPatch {
     cond: int,            // Condition code (for conditional branches)
 }
 
+// Call relocation record for function calls
+struct CallRelocation {
+    offset: int,          // Offset of BL instruction in code buffer
+    func_name: string,    // Target function name (with _ prefix)
+}
+
 fn generateCodeFromIR(ir: IRProgram, output_path: string) bool {
     var num_funcs: int = len(ir.funcs)
     if num_funcs == 0 {
@@ -137,6 +143,9 @@ fn generateCodeFromIR(ir: IRProgram, output_path: string) bool {
         func_idx = func_idx + 1
     }
 
+    // Patch local function calls (BL instructions) before writing
+    applyLocalRelocations(&obj)
+
     var output: OutputBuffer = outputBufferNew()
     writeMachO64(obj, output)
     var result: int = @fileWriteListBytes(output_path, output.bytes)
@@ -147,9 +156,28 @@ fn generateFunctionFromIR(text_sec: *Section, func: IRFunc) void {
     var cg: FullCodeGen = fullCodeGenInit(func.frame_size)
     cgGenPrologue(&cg, func.frame_size)
 
+    // Spill parameter registers to their stack slots
+    // ARM64 ABI: first 8 args in x0-x7, stored to stack for uniform access
+    var num_params: int = len(func.params)
+    if num_params >= 1 {
+        // Param 0: x0 -> stack slot 0 (sp_offset = stack_size + 16 - 8)
+        cgSpillParamToStack(&cg, 0, 0)
+    }
+    if num_params >= 2 {
+        // Param 1: x1 -> stack slot 1 (sp_offset = stack_size + 16 - 16)
+        cgSpillParamToStack(&cg, 1, 1)
+    }
+    if num_params >= 3 {
+        cgSpillParamToStack(&cg, 2, 2)
+    }
+    if num_params >= 4 {
+        cgSpillParamToStack(&cg, 3, 3)
+    }
+
     // Track block offsets for branch patching
     var block_offsets: List<int> = new List<int>()
     var branch_patches: List<BranchPatch> = new List<BranchPatch>()
+    var call_relocs: List<CallRelocation> = new List<CallRelocation>()
 
     // Pass 1: Generate code for all blocks, emit branch placeholders
     var block_idx: int = 0
@@ -165,7 +193,7 @@ fn generateFunctionFromIR(text_sec: *Section, func: IRFunc) void {
         while node_idx < node_count {
             var ir_node_idx: IRNodeIndex = block.nodes.get(node_idx)
             var ir_node: IRNode = func.nodes.get(ir_node_idx)
-            generateNodeFromIREx(&cg, ir_node, ir_node_idx, func, &branch_patches)
+            generateNodeFromIREx(&cg, ir_node, ir_node_idx, func, &branch_patches, &call_relocs)
             node_idx = node_idx + 1
         }
         block_idx = block_idx + 1
@@ -180,6 +208,9 @@ fn generateFunctionFromIR(text_sec: *Section, func: IRFunc) void {
         patch_idx = patch_idx + 1
     }
 
+    // Get section start offset before copying code
+    var sec_start: int = sectionSize(text_sec.*)
+
     // Copy generated code to section
     var byte_count: int = len(cg.buf.bytes)
     var i: int = 0
@@ -187,6 +218,15 @@ fn generateFunctionFromIR(text_sec: *Section, func: IRFunc) void {
         var byte_val: int = cg.buf.bytes.get(i)
         sectionAppendByte(text_sec, byte_val)
         i = i + 1
+    }
+
+    // Add call relocations to section (adjusted for section offset)
+    var reloc_idx: int = 0
+    while reloc_idx < len(call_relocs) {
+        var call_rel: CallRelocation = call_relocs.get(reloc_idx)
+        var reloc: Relocation = relocationNew(sec_start + call_rel.offset, call_rel.func_name, RelocKind.pc_rel_32, 0)
+        sectionAddRelocation(text_sec, reloc)
+        reloc_idx = reloc_idx + 1
     }
 }
 
@@ -229,7 +269,7 @@ fn patchBranchToTarget(cg: *FullCodeGen, branch_offset: int, target_offset: int,
 }
 
 // Extended node generator with branch patch tracking
-fn generateNodeFromIREx(cg: *FullCodeGen, node: IRNode, node_idx: IRNodeIndex, func: IRFunc, patches: *List<BranchPatch>) void {
+fn generateNodeFromIREx(cg: *FullCodeGen, node: IRNode, node_idx: IRNodeIndex, func: IRFunc, patches: *List<BranchPatch>, call_relocs: *List<CallRelocation>) void {
     var op: Op = node.op
 
     if op == Op.const_int {
@@ -270,7 +310,7 @@ fn generateNodeFromIREx(cg: *FullCodeGen, node: IRNode, node_idx: IRNodeIndex, f
         generateJump(cg, node, patches)
     } else if op == Op.call {
         // Function call: aux_str=func_name, args=arguments
-        generateCall(cg, node, node_idx)
+        generateCall(cg, node, node_idx, call_relocs)
     } else if op == Op.select {
         // Select: cond ? then_val : else_val
         generateSelect(cg, node, node_idx)
@@ -400,7 +440,7 @@ fn generateJump(cg: *FullCodeGen, node: IRNode, patches: *List<BranchPatch>) voi
 }
 
 // Generate function call
-fn generateCall(cg: *FullCodeGen, node: IRNode, node_idx: IRNodeIndex) void {
+fn generateCall(cg: *FullCodeGen, node: IRNode, node_idx: IRNodeIndex, call_relocs: *List<CallRelocation>) void {
     // Spill caller-saved registers
     cgSpillCallerSaved(cg)
 
@@ -419,21 +459,28 @@ fn generateCall(cg: *FullCodeGen, node: IRNode, node_idx: IRNodeIndex) void {
         cgPrepareArg(cg, 3, irNodeGetArg(node, 3))
     }
 
-    // Emit BL instruction (will need relocation)
-    // For now, emit placeholder - the linker will handle symbol resolution
+    // Emit BL instruction and record relocation
     var func_name: string = "_" + node.aux_str
-    emitCallPlaceholder(&cg.*.buf, func_name)
+    var offset: int = emitCallPlaceholder(&cg.*.buf, func_name)
+
+    // Add call relocation for linker to patch
+    var call_rel: CallRelocation = CallRelocation{ .offset = offset, .func_name = func_name }
+    call_relocs.*.push(call_rel)
 
     // Mark return value in x0
     cgMarkReturnValue(cg, node_idx)
 }
 
 // Emit BL placeholder for function call
-fn emitCallPlaceholder(buf: *CodeBuffer, func_name: string) void {
-    // BL with 0 offset - linker will patch
+// Returns the offset of the BL instruction so caller can add relocation
+fn emitCallPlaceholder(buf: *CodeBuffer, func_name: string) int {
+    // Record offset before emitting - caller will add relocation to section
+    var offset: int = len(buf.*.bytes)
+    // BL with 0 offset - will be patched by applyLocalRelocations
     // BL encoding: 1001 01 [imm26]
     var inst: int = 37 * 67108864  // 0x94000000
     emit32(buf, inst)
+    return offset
 }
 
 // Generate select: cond ? then_val : else_val

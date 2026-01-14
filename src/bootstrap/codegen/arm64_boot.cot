@@ -1156,6 +1156,22 @@ fn cgGenStoreStack(cg: *FullCodeGen, src_id: int, offset: int, size: int) void {
     }
 }
 
+// Spill parameter register to its stack slot
+// reg_idx: parameter register (0=x0, 1=x1, etc.)
+// slot_idx: stack slot index (0, 1, 2, etc.)
+fn cgSpillParamToStack(cg: *FullCodeGen, reg_idx: int, slot_idx: int) void {
+    // Calculate stack offset for this parameter slot
+    // Slot 0 is at FP-relative offset -8, slot 1 at -16, etc.
+    var fp_offset: int = 0 - (slot_idx + 1) * 8
+    var sp_offset: int = cg.*.stack_size + 16 + fp_offset
+
+    // Map reg_idx to actual register
+    var src_reg: int = REG_X0 + reg_idx
+
+    // Store parameter register to stack slot
+    strRegImm(&cg.*.buf, src_reg, REG_SP, sp_offset)
+}
+
 // Load from pointer (base + offset)
 fn cgGenLoadPtr(cg: *FullCodeGen, value_id: int, base_id: int, offset: int, size: int) void {
     cgEnsureRegFree(cg, REG_X0)
