@@ -215,6 +215,20 @@ This is the ONLY way to achieve a stable self-hosting compiler.
   Actual: 0x0f0e0dc0 (unknown opcode - looks like ASCII garbage)
   ```
 
+### BUG-024: cot0 crashes on if statements (control flow corruption)
+- **Status:** OPEN
+- **Discovered:** 2026-01-14
+- **Location:** `driver_boot.cot` - comparison or branch codegen
+- **Description:** cot0 crashes when compiling files with if statements. Simple programs (return literal, var decl) work. PC jumps to invalid addresses like 0x15.
+- **Impact:** cot0 cannot compile any program with control flow (if, while, etc.)
+- **Test Cases:**
+  - `fn main() int { return 42 }` - WORKS
+  - `fn main() int { var i: int = 42; return i }` - WORKS
+  - `fn main() int { if 1 < 2 { return 42 } return 1 }` - CRASHES (exit 138/SIGBUS, PC=0x15)
+- **Root Cause:** Stack corruption or incorrect codegen for comparisons/branches. The program counter jumps to small addresses like 0x15 which could be enum values or struct field offsets being misinterpreted as code addresses.
+- **Note:** This is separate from BUG-023 (illegal branch opcodes) - here the instructions are valid but the data/control flow is corrupted.
+- **Previous Investigation:** Initially thought to be BUG-024 (list element size), but that was ruled out - the Zig compiler handles List<LargeStruct> correctly. The issue is in cot0's own codegen for control flow.
+
 ---
 
 ## Completed Bugs

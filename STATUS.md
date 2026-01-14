@@ -127,7 +127,7 @@ codegen/*_boot.cot   → ARM64 code generation + Mach-O output
 1. **Large struct by value**: Passing structs > 16 bytes by value corrupts nested List handles. Workaround: pass pointers instead.
 2. **Address-of chained field access**: `&state.*.field.subfield` doesn't work correctly. Workaround: copy to local first.
 3. **`and` in while loop conditions**: Complex conditions like `while a < b and isDigit(c[i])` may not evaluate correctly. Workaround: use nested if statements inside a `while true` loop.
-4. **cot0 crashes on complex input**: cot0 crashes when compiling files with `new List<...>()` or `while` statements. Investigation ongoing - appears to be stack corruption causing jumps to invalid addresses.
+4. **cot0 crashes on control flow**: cot0 crashes when compiling files with if/while statements. Simple programs work (return literal, var decl). Crash at PC=0x15 (21 decimal) suggests stack corruption. See BUG-024 in BUGLIST.md for details.
 
 ---
 

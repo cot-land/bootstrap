@@ -1,0 +1,44 @@
+// Test for BUG-024: List<LargeStruct> element size bug
+// This tests that lists of large structs work correctly.
+// When compiled by the Zig compiler, this should pass.
+// When compiled by cot0 (once it can compile this), it will fail
+// until BUG-024 is fixed.
+
+struct LargeStruct {
+    name: string,
+    data: string,
+    x: int,
+    y: int,
+    z: int,
+}
+
+fn main() int {
+    var list: List<LargeStruct> = new List<LargeStruct>()
+
+    var s: LargeStruct = LargeStruct{
+        .name = "test",
+        .data = "some data",
+        .x = 10,
+        .y = 20,
+        .z = 30,
+    }
+    list.push(s)
+
+    var got: LargeStruct = list.get(0)
+
+    // Verify all fields are correct
+    if len(got.name) != 4 {
+        return 1  // name corrupted
+    }
+    if got.x != 10 {
+        return 2  // x corrupted
+    }
+    if got.y != 20 {
+        return 3  // y corrupted
+    }
+    if got.z != 30 {
+        return 4  // z corrupted
+    }
+
+    return 42
+}
