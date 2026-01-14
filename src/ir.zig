@@ -1299,7 +1299,8 @@ pub const FuncBuilder = struct {
         frame_offset += @as(i32, @intCast(self.max_call_ret_size));
 
         // Round total frame size to 16-byte alignment (ABI requirement)
-        const frame_size: i32 = roundUp(frame_offset, 16);
+        // Add 96 bytes for saved registers: fp/lr (16) + x19-x28 (80)
+        const frame_size: i32 = roundUp(frame_offset + 96, 16);
 
         return Func{
             .name = self.name,

@@ -422,6 +422,8 @@ fn lowerMapSize(l: *Lowerer, fb: *IRFuncBuilder, map_handle: IRNodeIndex, span_s
 
 fn lowerListNew(l: *Lowerer, fb: *IRFuncBuilder, list_type: TypeIndex, span_start: int, span_end: int) IRNodeIndex {
     var n: IRNode = irNodeInit(Op.list_new, list_type, span_start, span_end)
+    // Set element size in aux (default to 8 bytes for int)
+    n = irNodeWithAux(n, 8)
     return irFuncBuilderEmit(fb, n)
 }
 
@@ -440,6 +442,12 @@ fn lowerListGet(l: *Lowerer, fb: *IRFuncBuilder, list_handle: IRNodeIndex, index
 fn lowerListLen(l: *Lowerer, fb: *IRFuncBuilder, list_handle: IRNodeIndex, span_start: int, span_end: int) IRNodeIndex {
     var n: IRNode = irNodeInit(Op.list_len, TYPE_INT, span_start, span_end)
     n = irNodeWithArg0(n, list_handle)
+    return irFuncBuilderEmit(fb, n)
+}
+
+fn lowerListSet(l: *Lowerer, fb: *IRFuncBuilder, list_handle: IRNodeIndex, index_node: IRNodeIndex, value_node: IRNodeIndex, span_start: int, span_end: int) IRNodeIndex {
+    var n: IRNode = irNodeInit(Op.list_set, TYPE_VOID, span_start, span_end)
+    n = irNodeWithArg012(n, list_handle, index_node, value_node)
     return irFuncBuilderEmit(fb, n)
 }
 
@@ -650,10 +658,75 @@ fn lowerExprNode(l: *Lowerer, fb: *IRFuncBuilder, node_idx: NodeIndex) NodeIndex
         // TODO: Implement struct init lowering
         // For now, struct init requires type info (field offsets)
         // Parser now captures field inits in node.args (BUG-005 fix)
-        println("DEBUG: struct_init lowering not yet implemented")
+        println("Warning: struct_init lowering not yet implemented")
         return null_node
     }
+    if tag == NodeTag.switch_expr {
+        return lowerSwitchExpr(l, fb, node, span_start, span_end)
+    }
+    if tag == NodeTag.new_expr {
+        // new List<T>() -> emit list_new with element size 8
+        return lowerListNew(l, fb, TYPE_INT, span_start, span_end)
+    }
     return null_node
+}
+
+fn lowerSwitchExpr(l: *Lowerer, fb: *IRFuncBuilder, node: Node, span_start: int, span_end: int) NodeIndex {
+    // Lower subject expression
+    var subj_ir: IRNodeIndex = lowerExprNode(l, fb, node.left)
+
+    // Get number of cases
+    var num_cases: int = len(node.args)
+    if num_cases == 0 {
+        return subj_ir  // No cases, return subject (fallback)
+    }
+
+    // Find else case (has left == null_node) and use it as base result
+    // Then build nested selects for other cases
+    var result: IRNodeIndex = 0
+    var found_else: bool = false
+
+    // First pass: find else case and lower its body
+    var i: int = 0
+    while i < num_cases {
+        var case_idx: NodeIndex = node.args.get(i)
+        var case_node: Node = l.*.nodes.get(case_idx)
+        if case_node.left == null_node {
+            // This is the else case
+            result = lowerExprNode(l, fb, case_node.right)
+            found_else = true
+        }
+        i = i + 1
+    }
+
+    // If no else case, use 0 as default
+    if found_else {
+        // else was found, result already set
+    } else {
+        result = irFuncBuilderEmitConstInt(fb, 0, TYPE_INT, span_start, span_end)
+    }
+
+    // Second pass: build nested selects for non-else cases
+    // Process in reverse order to build correct nesting
+    i = num_cases - 1
+    while i >= 0 {
+        var case_idx: NodeIndex = node.args.get(i)
+        var case_node: Node = l.*.nodes.get(case_idx)
+        if case_node.left != null_node {
+            // Non-else case: compare subject with case value
+            var case_val: IRNodeIndex = lowerExprNode(l, fb, case_node.left)
+            var case_body: IRNodeIndex = lowerExprNode(l, fb, case_node.right)
+
+            // Emit comparison: subj == case_val
+            var cmp: IRNodeIndex = irFuncBuilderEmitBinary(fb, Op.eq, subj_ir, case_val, TYPE_BOOL, span_start, span_end)
+
+            // Emit select: cmp ? case_body : result
+            result = lowerIfExpr(l, fb, cmp, case_body, result, TYPE_INT, span_start, span_end)
+        }
+        i = i - 1
+    }
+
+    return result
 }
 
 fn lowerIntLiteralExpr(l: *Lowerer, fb: *IRFuncBuilder, node: Node, span_start: int, span_end: int) NodeIndex {
@@ -781,6 +854,22 @@ fn lowerVarStmtAST(l: *Lowerer, fb: *IRFuncBuilder, node: Node, span_start: int,
 
 fn lowerAssignStmt(l: *Lowerer, fb: *IRFuncBuilder, node: Node, span_start: int, span_end: int) void {
     var target_node: Node = l.*.nodes.get(node.left)
+    var target_tag: NodeTag = target_node.tag
+
+    // Handle indexed assignment: list[idx] = value
+    if target_tag == NodeTag.index_expr {
+        // Lower base (list handle)
+        var list_handle: IRNodeIndex = lowerExprNode(l, fb, target_node.left)
+        // Lower index
+        var index_node: IRNodeIndex = lowerExprNode(l, fb, target_node.right)
+        // Lower value
+        var value_node: IRNodeIndex = lowerExprNode(l, fb, node.right)
+        // Emit list_set
+        lowerListSet(l, fb, list_handle, index_node, value_node, span_start, span_end)
+        return
+    }
+
+    // Handle simple variable assignment
     var local_idx: int = irFuncBuilderLookupLocal(fb.*, target_node.name)
     if local_idx >= 0 {
         var value: NodeIndex = lowerExprNode(l, fb, node.right)
@@ -854,6 +943,17 @@ fn lowerFnDeclNode(l: *Lowerer, node_idx: NodeIndex) void {
     // irFuncBuilderInit creates block 0 and sets current_block = 0
     // No need to create another entry block (BUG-006 fix)
     var fb: IRFuncBuilder = irFuncBuilderInit(node.name, 0, TYPE_INT, span_start, span_end)
+
+    // BUG-012 fix: Add function parameters to local_map
+    var param_idx: int = 0
+    var param_count: int = len(node.args)
+    while param_idx < param_count {
+        var param_node_idx: NodeIndex = node.args.get(param_idx)
+        var param_node: Node = l.*.nodes.get(param_node_idx)
+        // Add parameter as local (size 8 for int)
+        irFuncBuilderAddParam(&fb, param_node.name, TYPE_INT, 8)
+        param_idx = param_idx + 1
+    }
 
     if node.body != null_node {
         lowerStmtNode(l, &fb, node.body)

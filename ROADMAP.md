@@ -98,9 +98,13 @@ Every Zig source file needs a corresponding bootstrap .cot file that uses only s
 ### Remaining Work
 
 1. ✅ **File output** - `@fileWriteListBytes` now works, cot0 writes Mach-O object files
-2. **x86_64 bootstrap** - `amd64_boot.cot` and `x86_64_boot.cot` not created
-3. **Windows bootstrap** - `pe_coff_boot.cot` not created
-4. **Full self-hosting** - cot0 currently only compiles simple programs (return literals)
+2. ✅ **List operations in cot0** - `list_new`, `list_push`, `list_get`, `list_len` handlers added
+3. ✅ **Register clobbering** - Fixed `loadThreeArgs` in arm64_codegen.zig (BUG-017)
+4. ✅ **Branch codegen** - Fixed via list_set fix (BUG-023)
+5. **cot0 complex input crash** - cot0 crashes on files with `new List<...>()` or `while` (stack corruption?)
+6. **x86_64 bootstrap** - `amd64_boot.cot` and `x86_64_boot.cot` not created
+7. **Windows bootstrap** - `pe_coff_boot.cot` not created
+8. **Full self-hosting** - cot0 currently only compiles simple programs (return literals)
 
 ### Testing Command
 

@@ -113,6 +113,7 @@ enum Op: u8 {
     list_new,
     list_push,
     list_get,
+    list_set,
     list_len,
     list_free,
 
@@ -578,20 +579,14 @@ fn irFuncBuilderSetBlock(fb: *IRFuncBuilder, block: IRBlockIndex) void {
 }
 
 fn irFuncBuilderEmit(fb: *IRFuncBuilder, node: IRNode) IRNodeIndex {
-    println("DEBUG: irFuncBuilderEmit enter")
     var idx: IRNodeIndex = len(fb.*.nodes)
-    println("DEBUG: got idx")
     var n: IRNode = node
     n.block = fb.*.current_block
-    println("DEBUG: about to push to fb.*.nodes")
     fb.*.nodes.push(n)
-    println("DEBUG: pushed node")
 
     // Add to current block's node list
     var block: IRBlock = fb.*.blocks.get(fb.*.current_block)
-    println("DEBUG: got block")
     block.nodes.push(idx)
-    println("DEBUG: pushed to block.nodes")
 
     return idx
 }

@@ -2600,9 +2600,29 @@ pub const Lowerer = struct {
         }
 
         // Fallback for non-local bases (e.g., function call results) - use field_value (arg = IR node ref)
+        // BUG-009 fix: When base is non-local, get type from expr_types and resolve field properly
         log.debug("  field_access: fallback for .{s}", .{field.field});
+
+        // Get the type of the base expression from type checker
+        const base_type_idx = self.checker.expr_types.get(field.base) orelse TypeRegistry.VOID;
+        const base_type = self.type_reg.get(base_type_idx);
+
+        // Look up field in base type to get offset and type
+        var field_offset: u32 = 0;
+        var field_type: TypeIndex = TypeRegistry.VOID;
+
+        if (base_type == .struct_type) {
+            for (base_type.struct_type.fields) |f| {
+                if (std.mem.eql(u8, f.name, field.field)) {
+                    field_offset = f.offset;
+                    field_type = f.type_idx;
+                    break;
+                }
+            }
+        }
+
         const base = try self.lowerExpr(field.base);
-        return try fb.emitFieldValue(base, @intCast(chain_info.cumulative_offset), chain_info.field_type_idx, Span.fromPos(Pos.zero));
+        return try fb.emitFieldValue(base, @intCast(field_offset), field_type, Span.fromPos(Pos.zero));
     }
 
     /// Resolve a chain of field accesses to find the root local and cumulative offset.

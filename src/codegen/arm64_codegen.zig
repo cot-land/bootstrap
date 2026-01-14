@@ -474,24 +474,27 @@ pub const CodeGen = struct {
     }
 
     /// Safely load three values into x0, x1, x2, handling register clobbering.
-    /// Uses x9 as scratch to break cycles if needed.
+    /// Uses x9 and x10/x11 as scratch to break cycles if needed.
     pub fn loadThreeArgs(self: *CodeGen, arg0: MCValue, arg1: MCValue, arg2: MCValue) !void {
         // Check for conflicts and resolve them
-        // Worst case: arg2 in x0, arg0 in x2 (cycle) - use scratch x9
         const arg0_in_x1 = arg0 == .register and arg0.register == .x1;
         const arg0_in_x2 = arg0 == .register and arg0.register == .x2;
         const arg1_in_x0 = arg1 == .register and arg1.register == .x0;
         const arg1_in_x2 = arg1 == .register and arg1.register == .x2;
         const arg2_in_x0 = arg2 == .register and arg2.register == .x0;
         const arg2_in_x1 = arg2 == .register and arg2.register == .x1;
+        const arg2_in_x10 = arg2 == .register and arg2.register == .x10;
 
-        // Simple case: no conflicts
+        // Simple case: no conflicts with destination registers
         if (!arg0_in_x1 and !arg0_in_x2 and !arg1_in_x0 and !arg1_in_x2 and !arg2_in_x0 and !arg2_in_x1) {
             try self.loadToReg(.x0, arg0);
             try self.loadToReg(.x1, arg1);
             try self.loadToReg(.x2, arg2);
             return;
         }
+
+        // Choose scratch register for arg1: use x11 if arg2 is in x10, otherwise x10
+        const arg1_scratch: aarch64.Reg = if (arg2_in_x10) .x11 else .x10;
 
         // Save any conflicting values to scratch registers first
         if (arg2_in_x0) {
@@ -501,14 +504,14 @@ pub const CodeGen = struct {
             try aarch64.movRegReg(self.buf, .x9, .x1); // Save arg2 to x9
         }
         if (arg1_in_x0 and !arg2_in_x0) {
-            try aarch64.movRegReg(self.buf, .x10, .x0); // Save arg1 to x10
+            try aarch64.movRegReg(self.buf, arg1_scratch, .x0); // Save arg1 to scratch
         }
 
         // Now load in order
         try self.loadToReg(.x0, arg0);
 
         if (arg1_in_x0) {
-            try aarch64.movRegReg(self.buf, .x1, .x10);
+            try aarch64.movRegReg(self.buf, .x1, arg1_scratch);
         } else {
             try self.loadToReg(.x1, arg1);
         }
@@ -1094,22 +1097,13 @@ pub const CodeGen = struct {
         // Handle call results
         if (src_value.op == .call) {
             const ret_type = self.type_reg.get(src_value.type_idx);
-            const ret_size = self.type_reg.sizeOf(src_value.type_idx);
 
             if (ret_type == .struct_type) {
                 // Struct return: result is at stack offset, copy to destination
+                // Use field-aware copy to avoid corrupting adjacent memory with garbage
                 const src_mcv = self.getValue(src_id);
                 if (src_mcv == .stack) {
-                    const src_stack_offset = src_mcv.stack;
-                    var copied: u32 = 0;
-                    while (copied < ret_size) {
-                        // Load from result location
-                        try self.ldrSpOffset(scratch0, src_stack_offset + copied);
-                        // Store to destination local
-                        const dst_offset = convertOffset(total_offset + @as(i32, @intCast(copied)), self.stack_size);
-                        try self.strSpOffset(scratch0, dst_offset);
-                        copied += 8;
-                    }
+                    try self.copyStructStackToStack(src_value.type_idx, src_mcv.stack, total_offset);
                     return;
                 }
             }
@@ -1117,20 +1111,24 @@ pub const CodeGen = struct {
 
         // Handle list_get results with large elements (already copied to stack)
         if (src_value.op == .list_get) {
+            const elem_type = self.type_reg.get(src_value.type_idx);
             const elem_size = self.type_reg.sizeOf(src_value.type_idx);
             if (elem_size > 8) {
                 // list_get copied the element to a stack slot
                 const src_mcv = self.getValue(src_id);
                 if (src_mcv == .stack) {
-                    const src_stack_offset = src_mcv.stack;
-                    var copied: u32 = 0;
-                    while (copied < elem_size) {
-                        // Load from spill location
-                        try self.ldrSpOffset(scratch0, src_stack_offset + copied);
-                        // Store to destination local
-                        const dst_offset = convertOffset(total_offset + @as(i32, @intCast(copied)), self.stack_size);
-                        try self.strSpOffset(scratch0, dst_offset);
-                        copied += 8;
+                    // Use field-aware copy for structs
+                    if (elem_type == .struct_type) {
+                        try self.copyStructStackToStack(src_value.type_idx, src_mcv.stack, total_offset);
+                    } else {
+                        // Non-struct large value (rare) - use 8-byte chunks
+                        var copied: u32 = 0;
+                        while (copied < elem_size) {
+                            try self.ldrSpOffset(scratch0, src_mcv.stack + copied);
+                            const dst_offset = convertOffset(total_offset + @as(i32, @intCast(copied)), self.stack_size);
+                            try self.strSpOffset(scratch0, dst_offset);
+                            copied += 8;
+                        }
                     }
                     return;
                 }
@@ -1179,14 +1177,20 @@ pub const CodeGen = struct {
             .stack => |src_stack_offset| {
                 // Value is on stack - copy it (size-aware, like Go's decomposition)
                 if (size > 8) {
-                    // Large value: copy all bytes (8 bytes at a time)
-                    var copied: u32 = 0;
-                    while (copied < size) {
-                        const src_off = src_stack_offset + copied;
-                        const dst_off = convertOffset(total_offset + @as(i32, @intCast(copied)), self.stack_size);
-                        try self.ldrSpOffset(scratch0, src_off);
-                        try self.strSpOffset(scratch0, dst_off);
-                        copied += 8;
+                    // Large value: use field-aware copy for structs
+                    const dest_type = self.type_reg.get(dest_type_idx);
+                    if (dest_type == .struct_type) {
+                        try self.copyStructStackToStack(dest_type_idx, src_stack_offset, total_offset);
+                    } else {
+                        // Non-struct large value - use 8-byte chunks
+                        var copied: u32 = 0;
+                        while (copied < size) {
+                            const src_off = src_stack_offset + copied;
+                            const dst_off = convertOffset(total_offset + @as(i32, @intCast(copied)), self.stack_size);
+                            try self.ldrSpOffset(scratch0, src_off);
+                            try self.strSpOffset(scratch0, dst_off);
+                            copied += 8;
+                        }
                     }
                 } else {
                     // Small value: single load/store with correct width
@@ -1540,6 +1544,24 @@ pub const CodeGen = struct {
         const field_offset: i32 = @intCast(value.aux_int);
         const size = self.type_reg.sizeOf(value.type_idx);
 
+        // Check if source is a list_get with small struct result (BUG-009 fix)
+        // For small structs (≤8 bytes), list_get returns the VALUE directly in a register,
+        // not a pointer. We need to handle this case specially.
+        const src_val = &self.func.values.items[args[0]];
+        if (src_val.op == .list_get) {
+            const elem_size = self.type_reg.sizeOf(src_val.type_idx);
+            if (elem_size <= 8 and field_offset == 0) {
+                // Small struct, first field at offset 0 - value is directly in register
+                const base_mcv = self.getValue(args[0]);
+                const dest = try self.allocReg(value.id);
+                try self.loadToReg(dest, base_mcv);
+                try self.setResult(value.id, .{ .register = dest });
+                return;
+            }
+            // For fields at non-zero offset in small structs, fall through to pointer handling
+            // This case is rare (multi-field small structs) and would need bit extraction
+        }
+
         // Get the base value's location
         const base_mcv = self.getValue(args[0]);
 
@@ -1578,13 +1600,23 @@ pub const CodeGen = struct {
                 }
             },
             .stack => |stack_offset| {
-                // Base is on stack - load address first, then load field
-                try self.ldrSpOffset(.x8, stack_offset);
-                const field_scaled: u12 = @intCast(@divExact(@as(u32, @intCast(field_offset)), 8));
-                if (size == 1) {
-                    try aarch64.ldrbRegImm(self.buf, dest, .x8, @intCast(field_offset));
+                // Check if base is from list_get or field_value (data is directly on stack)
+                // vs from a local variable (stack contains a pointer)
+                const base_is_direct_data = src_val.op == .list_get or src_val.op == .field_value;
+
+                if (base_is_direct_data) {
+                    // Data is directly at stack location - load from [sp + stack_offset + field_offset]
+                    const data_offset: u32 = @intCast(@as(i64, stack_offset) + field_offset);
+                    try self.ldrSpOffset(dest, data_offset);
                 } else {
-                    try aarch64.ldrRegImm(self.buf, dest, .x8, field_scaled);
+                    // Stack contains a pointer - load pointer then dereference
+                    try self.ldrSpOffset(.x8, stack_offset);
+                    const field_scaled: u12 = @intCast(@divExact(@as(u32, @intCast(field_offset)), 8));
+                    if (size == 1) {
+                        try aarch64.ldrbRegImm(self.buf, dest, .x8, @intCast(field_offset));
+                    } else {
+                        try aarch64.ldrRegImm(self.buf, dest, .x8, field_scaled);
+                    }
                 }
             },
             else => {
@@ -1946,9 +1978,42 @@ pub const CodeGen = struct {
         const ptr_reg = try self.allocReg(0xFFFF);
         try self.loadToReg(ptr_reg, ptr_mcv);
 
-        // Load through the pointer
-        const dest = try self.allocReg(value.id);
         const size = self.type_reg.sizeOf(value.type_idx);
+
+        // BUG-010 fix: For large structs (>8 bytes), we can't load into a register.
+        // Instead, copy the entire struct to a stack slot and return that location.
+        if (size > 8) {
+            // Allocate temp stack slot for the full struct
+            const aligned_size = alignTo(size, 8);
+            const temp_offset = self.next_spill_offset;
+            self.next_spill_offset +|= aligned_size;
+
+            // Copy the struct from source pointer to stack slot, 8 bytes at a time
+            var copied: u32 = 0;
+            while (copied < size) {
+                // Load 8 bytes from [ptr_reg + copied]
+                if (copied == 0) {
+                    try aarch64.ldrRegImm(self.buf, scratch0, ptr_reg, 0);
+                } else if (copied <= 4095) {
+                    try aarch64.ldrRegImm(self.buf, scratch0, ptr_reg, @intCast(copied));
+                } else {
+                    // Large offset - use scratch register for address calculation
+                    try aarch64.movRegImm64(self.buf, scratch1, copied);
+                    try aarch64.addRegReg(self.buf, scratch1, ptr_reg, scratch1);
+                    try aarch64.ldrRegImm(self.buf, scratch0, scratch1, 0);
+                }
+                // Store to stack slot
+                try self.strSpOffset(scratch0, temp_offset + copied);
+                copied += 8;
+            }
+
+            // Result is the stack location containing the struct copy
+            try self.setResult(value.id, .{ .stack = temp_offset });
+            return;
+        }
+
+        // Small types: load directly to register
+        const dest = try self.allocReg(value.id);
 
         switch (size) {
             1 => {
@@ -3292,6 +3357,175 @@ pub const CodeGen = struct {
         }
     }
 
+    /// Helper to copy a struct field-by-field with correct sizes.
+    /// This avoids the bug where 8-byte copies pick up garbage from adjacent memory
+    /// when fields are smaller than 8 bytes (e.g., u8 Token fields).
+    /// Recursively handles nested structs.
+    fn copyStructToX19(self: *CodeGen, struct_type_idx: types.TypeIndex, src_base_offset: u32, from_local: bool, local_offset: i32) !void {
+        try self.copyStructToX19WithOffset(struct_type_idx, src_base_offset, from_local, local_offset, 0);
+    }
+
+    /// Internal helper that tracks the destination offset for nested struct fields.
+    fn copyStructToX19WithOffset(self: *CodeGen, type_idx: types.TypeIndex, src_base_offset: u32, from_local: bool, local_offset: i32, dest_offset: u32) !void {
+        const t = self.type_reg.get(type_idx);
+        switch (t) {
+            .struct_type => |st| {
+                // Recursively copy each field
+                for (st.fields) |field| {
+                    const field_type = self.type_reg.get(field.type_idx);
+                    const field_size = self.type_reg.sizeOf(field.type_idx);
+                    const field_src_offset = field.offset;
+                    const field_dest_offset = dest_offset + field.offset;
+
+                    // Check if this field is itself a struct - if so, recurse
+                    if (field_type == .struct_type) {
+                        try self.copyStructToX19WithOffset(
+                            field.type_idx,
+                            src_base_offset + field_src_offset,
+                            from_local,
+                            local_offset + @as(i32, @intCast(field_src_offset)),
+                            field_dest_offset,
+                        );
+                    } else {
+                        // Non-struct field - copy with correct size
+                        const src_offset = if (from_local)
+                            convertOffset(local_offset + @as(i32, @intCast(field_src_offset)), self.stack_size)
+                        else
+                            src_base_offset + field_src_offset;
+
+                        if (field_size <= 8) {
+                            // Small field - single load/store with correct width
+                            switch (field_size) {
+                                1 => {
+                                    try self.ldrbSpOffset(scratch0, src_offset);
+                                    try aarch64.strbRegImm(self.buf, scratch0, .x19, @intCast(field_dest_offset));
+                                },
+                                2 => {
+                                    try self.ldrhSpOffset(scratch0, src_offset);
+                                    try aarch64.strhRegImm(self.buf, scratch0, .x19, @intCast(field_dest_offset));
+                                },
+                                4 => {
+                                    try self.ldrwSpOffset(scratch0, src_offset);
+                                    try aarch64.strwRegImm(self.buf, scratch0, .x19, @intCast(field_dest_offset));
+                                },
+                                else => {
+                                    try self.ldrSpOffset(scratch0, src_offset);
+                                    try aarch64.strRegImm(self.buf, scratch0, .x19, @intCast(field_dest_offset));
+                                },
+                            }
+                        } else {
+                            // Large non-struct field (e.g., string = ptr+len, 16 bytes)
+                            // Copy in 8-byte chunks
+                            var copied: u32 = 0;
+                            while (copied < field_size) {
+                                const chunk_src = if (from_local)
+                                    convertOffset(local_offset + @as(i32, @intCast(field_src_offset + copied)), self.stack_size)
+                                else
+                                    src_base_offset + field_src_offset + copied;
+                                try self.ldrSpOffset(scratch0, chunk_src);
+                                try aarch64.strRegImm(self.buf, scratch0, .x19, @intCast(field_dest_offset + copied));
+                                copied += 8;
+                            }
+                        }
+                    }
+                }
+            },
+            else => {
+                // Not a struct - fall back to simple 8-byte copy
+                const size = self.type_reg.sizeOf(type_idx);
+                var copied: u32 = 0;
+                while (copied < size) {
+                    const src_offset = if (from_local)
+                        convertOffset(local_offset + @as(i32, @intCast(copied)), self.stack_size)
+                    else
+                        src_base_offset + copied;
+                    try self.ldrSpOffset(scratch0, src_offset);
+                    try aarch64.strRegImm(self.buf, scratch0, .x19, @intCast(dest_offset + copied));
+                    copied += 8;
+                }
+            },
+        }
+    }
+
+    /// Copy a struct from one stack location to another with field-aware sizes.
+    /// This avoids corrupting adjacent memory when fields are smaller than 8 bytes.
+    /// src_stack_offset: source offset already converted for sp
+    /// dst_local_offset: destination local offset (will be converted)
+    fn copyStructStackToStack(self: *CodeGen, type_idx: types.TypeIndex, src_stack_offset: u32, dst_local_offset: i32) !void {
+        try self.copyStructStackToStackInternal(type_idx, src_stack_offset, dst_local_offset, 0);
+    }
+
+    fn copyStructStackToStackInternal(self: *CodeGen, type_idx: types.TypeIndex, src_stack_offset: u32, dst_local_offset: i32, field_offset_in_struct: u32) !void {
+        const t = self.type_reg.get(type_idx);
+        switch (t) {
+            .struct_type => |st| {
+                // Recursively copy each field
+                for (st.fields) |field| {
+                    const field_type = self.type_reg.get(field.type_idx);
+                    const field_size = self.type_reg.sizeOf(field.type_idx);
+                    const src_field_off = src_stack_offset + field.offset;
+                    const dst_field_off = field_offset_in_struct + field.offset;
+
+                    // Check if this field is itself a struct - if so, recurse
+                    if (field_type == .struct_type) {
+                        try self.copyStructStackToStackInternal(
+                            field.type_idx,
+                            src_field_off,
+                            dst_local_offset,
+                            dst_field_off,
+                        );
+                    } else {
+                        // Non-struct field - copy with correct size
+                        const dst_sp_offset = convertOffset(dst_local_offset + @as(i32, @intCast(dst_field_off)), self.stack_size);
+
+                        if (field_size <= 8) {
+                            // Small field - single load/store with correct width
+                            switch (field_size) {
+                                1 => {
+                                    try self.ldrbSpOffset(scratch0, src_field_off);
+                                    try self.strbSpOffset(scratch0, dst_sp_offset);
+                                },
+                                2 => {
+                                    try self.ldrhSpOffset(scratch0, src_field_off);
+                                    try self.strhSpOffset(scratch0, dst_sp_offset);
+                                },
+                                4 => {
+                                    try self.ldrwSpOffset(scratch0, src_field_off);
+                                    try self.strwSpOffset(scratch0, dst_sp_offset);
+                                },
+                                else => {
+                                    try self.ldrSpOffset(scratch0, src_field_off);
+                                    try self.strSpOffset(scratch0, dst_sp_offset);
+                                },
+                            }
+                        } else {
+                            // Large non-struct field (e.g., string = ptr+len, 16 bytes)
+                            // Copy in 8-byte chunks
+                            var copied: u32 = 0;
+                            while (copied < field_size) {
+                                try self.ldrSpOffset(scratch0, src_field_off + copied);
+                                const dst_chunk_off = convertOffset(dst_local_offset + @as(i32, @intCast(dst_field_off + copied)), self.stack_size);
+                                try self.strSpOffset(scratch0, dst_chunk_off);
+                                copied += 8;
+                            }
+                        }
+                    }
+                }
+            },
+            else => {
+                // Not a struct - fall back to simple 8-byte copy
+                const size = self.type_reg.sizeOf(type_idx);
+                var copied: u32 = 0;
+                while (copied < size) {
+                    try self.ldrSpOffset(scratch0, src_stack_offset + copied);
+                    const dst_off = convertOffset(dst_local_offset + @as(i32, @intCast(field_offset_in_struct + copied)), self.stack_size);
+                    try self.strSpOffset(scratch0, dst_off);
+                    copied += 8;
+                }
+            },
+        }
+    }
+
     pub fn genReturn(self: *CodeGen, block: *ssa.Block) !void {
         const ret_class = classifyType(self.type_reg, self.func.return_type);
 
@@ -3301,31 +3535,19 @@ pub const CodeGen = struct {
             switch (ret_class) {
                 .by_pointer => {
                     // Large struct return: copy result to address in x19 (saved from x8 in prologue)
-                    const struct_size = self.type_reg.sizeOf(self.func.return_type);
+                    // Use field-aware copy to avoid corrupting adjacent memory with garbage
                     const ret_mcv = self.getValue(block.control);
 
                     if (ret_mcv == .stack) {
                         // Result is in a spill slot - copy from there
-                        var copied: u32 = 0;
-                        while (copied < struct_size) {
-                            const src_offset = ret_mcv.stack + copied;
-                            try self.ldrSpOffset(scratch0, src_offset);
-                            try aarch64.strRegImm(self.buf, scratch0, .x19, @intCast(copied));
-                            copied += 8;
-                        }
+                        try self.copyStructToX19(self.func.return_type, ret_mcv.stack, false, 0);
                     } else {
                         // Fallback: try to load from local if available
                         const args = ret_val.args();
                         if (args.len > 0 and args[0] < self.func.locals.len) {
                             const local_idx: u32 = @intCast(args[0]);
                             const local = self.func.locals[local_idx];
-                            var copied: u32 = 0;
-                            while (copied < struct_size) {
-                                const src_offset = convertOffset(local.offset + @as(i32, @intCast(copied)), self.stack_size);
-                                try self.ldrSpOffset(scratch0, src_offset);
-                                try aarch64.strRegImm(self.buf, scratch0, .x19, @intCast(copied));
-                                copied += 8;
-                            }
+                            try self.copyStructToX19(self.func.return_type, 0, true, local.offset);
                         }
                     }
                 },

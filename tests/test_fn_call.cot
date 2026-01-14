@@ -1,0 +1,10 @@
+// Test: Function call expression
+// BUG-009 test case
+
+fn add(a: int, b: int) int {
+    return a + b
+}
+
+fn main() int {
+    return add(10, 32)
+}

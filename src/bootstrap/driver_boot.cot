@@ -106,6 +106,14 @@ fn driverNew(opts: CompileOptions) Driver {
 // Code Generation (IR to Machine Code)
 // =============================================================================
 
+// Branch patch record for two-pass codegen
+struct BranchPatch {
+    offset: int,          // Offset of branch instruction in code buffer
+    target_block: int,    // Target block index
+    is_conditional: bool, // True for B.EQ (branch if condition false), false for B
+    cond: int,            // Condition code (for conditional branches)
+}
+
 fn generateCodeFromIR(ir: IRProgram, output_path: string) bool {
     var num_funcs: int = len(ir.funcs)
     if num_funcs == 0 {
@@ -116,20 +124,11 @@ fn generateCodeFromIR(ir: IRProgram, output_path: string) bool {
     var text_idx: int = objectAddSection(obj, "__text", SectionKind.text)
     var text_sec: Section = objectGetSection(obj, text_idx)
 
-    println("DEBUG: num funcs in IR")
     var n_funcs: int = len(ir.funcs)
-    if n_funcs == 0 {
-        println("DEBUG: 0 funcs")
-    } else if n_funcs == 1 {
-        println("DEBUG: 1 func")
-    } else {
-        println("DEBUG: multiple funcs")
-    }
 
     var func_idx: int = 0
     while func_idx < n_funcs {
         var func: IRFunc = ir.funcs.get(func_idx)
-        println("DEBUG: processing func")
 
         var sym_start: int = sectionSize(text_sec)
         var sym_name: string = "_" + func.name
@@ -148,10 +147,17 @@ fn generateFunctionFromIR(text_sec: *Section, func: IRFunc) void {
     var cg: FullCodeGen = fullCodeGenInit(func.frame_size)
     cgGenPrologue(&cg, func.frame_size)
 
-    println("DEBUG: generating blocks")
+    // Track block offsets for branch patching
+    var block_offsets: List<int> = new List<int>()
+    var branch_patches: List<BranchPatch> = new List<BranchPatch>()
+
+    // Pass 1: Generate code for all blocks, emit branch placeholders
     var block_idx: int = 0
     while block_idx < len(func.blocks) {
-        println("DEBUG: processing block")
+        // Record block starting offset
+        var block_start: int = codeBufferPos(&cg.buf)
+        block_offsets.push(block_start)
+
         var block: IRBlock = func.blocks.get(block_idx)
 
         var node_idx: int = 0
@@ -159,28 +165,74 @@ fn generateFunctionFromIR(text_sec: *Section, func: IRFunc) void {
         while node_idx < node_count {
             var ir_node_idx: IRNodeIndex = block.nodes.get(node_idx)
             var ir_node: IRNode = func.nodes.get(ir_node_idx)
-            generateNodeFromIR(&cg, ir_node, ir_node_idx)
+            generateNodeFromIREx(&cg, ir_node, ir_node_idx, func, &branch_patches)
             node_idx = node_idx + 1
         }
         block_idx = block_idx + 1
     }
 
+    // Pass 2: Patch all branch instructions with correct offsets
+    var patch_idx: int = 0
+    while patch_idx < len(branch_patches) {
+        var patch: BranchPatch = branch_patches.get(patch_idx)
+        var target_offset: int = block_offsets.get(patch.target_block)
+        patchBranchToTarget(&cg, patch.offset, target_offset, patch.is_conditional, patch.cond)
+        patch_idx = patch_idx + 1
+    }
+
+    // Copy generated code to section
     var byte_count: int = len(cg.buf.bytes)
-    println("DEBUG: generateFunction copying bytes")
     var i: int = 0
     while i < byte_count {
         var byte_val: int = cg.buf.bytes.get(i)
         sectionAppendByte(text_sec, byte_val)
         i = i + 1
     }
-    println("DEBUG: done copying")
 }
 
-fn generateNodeFromIR(cg: *FullCodeGen, node: IRNode, node_idx: IRNodeIndex) void {
-    println("DEBUG: generateNode called")
+// Patch a branch instruction to jump to a specific target offset
+fn patchBranchToTarget(cg: *FullCodeGen, branch_offset: int, target_offset: int, is_conditional: bool, cond: int) void {
+    var delta: int = target_offset - branch_offset
+    var inst: int = 0
+
+    if is_conditional {
+        // B.cond encoding: 01010100 imm19 0 cond
+        // Bits: 31-25=0101010, 24=0, 23-5=imm19, 4=0, 3-0=cond
+        var imm19: int = delta / 4
+        // Handle negative offsets: add 2^19 for negative values
+        if imm19 < 0 {
+            imm19 = imm19 + 524288
+        }
+        // 84 * 16777216 = 0x54000000
+        inst = (84 * 16777216) + (imm19 * 32) + cond
+    } else {
+        // B encoding: 000101 imm26
+        var imm26: int = delta / 4
+        // Handle negative offsets: add 2^26 for negative values
+        if imm26 < 0 {
+            imm26 = imm26 + 67108864
+        }
+        // 5 * 67108864 = 0x14000000
+        inst = (5 * 67108864) + imm26
+    }
+
+    // Write instruction bytes (little-endian)
+    var b0: int = inst % 256
+    var b1: int = (inst / 256) % 256
+    var b2: int = (inst / 65536) % 256
+    var b3: int = (inst / 16777216) % 256
+
+    cg.*.buf.bytes[branch_offset] = b0
+    cg.*.buf.bytes[branch_offset + 1] = b1
+    cg.*.buf.bytes[branch_offset + 2] = b2
+    cg.*.buf.bytes[branch_offset + 3] = b3
+}
+
+// Extended node generator with branch patch tracking
+fn generateNodeFromIREx(cg: *FullCodeGen, node: IRNode, node_idx: IRNodeIndex, func: IRFunc, patches: *List<BranchPatch>) void {
     var op: Op = node.op
+
     if op == Op.const_int {
-        println("DEBUG: generating const_int")
         cgGenConstInt(cg, node_idx, node.aux)
     } else if op == Op.add {
         cgGenAdd(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
@@ -209,10 +261,242 @@ fn generateNodeFromIR(cg: *FullCodeGen, node: IRNode, node_idx: IRNodeIndex) voi
     } else if op == Op.store {
         cgGenStoreStack(cg, irNodeGetArg(node, 0), 0 - (node.aux + 1) * 8, 8)
     } else if op == Op.ret {
-        println("DEBUG: generating ret")
         cgGenReturn(cg, irNodeGetArg(node, 0))
-    } else {
-        println("DEBUG: unknown op")
+    } else if op == Op.branch {
+        // Conditional branch: args0=condition, args1=true_block, args2=false_block
+        generateBranch(cg, node, patches)
+    } else if op == Op.jump {
+        // Unconditional branch: aux=target_block
+        generateJump(cg, node, patches)
+    } else if op == Op.call {
+        // Function call: aux_str=func_name, args=arguments
+        generateCall(cg, node, node_idx)
+    } else if op == Op.select {
+        // Select: cond ? then_val : else_val
+        generateSelect(cg, node, node_idx)
+    } else if op == Op.list_set {
+        // List index assignment: list_set(handle, index, value)
+        generateListSet(cg, node, node_idx)
+    } else if op == Op.list_new {
+        // Create new list: list_new(elem_size)
+        generateListNew(cg, node, node_idx)
+    } else if op == Op.list_push {
+        // Push to list: list_push(handle, value)
+        generateListPush(cg, node, node_idx)
+    } else if op == Op.list_get {
+        // Get from list: list_get(handle, index)
+        generateListGet(cg, node, node_idx)
+    } else if op == Op.list_len {
+        // Get list length: list_len(handle)
+        generateListLen(cg, node, node_idx)
+    }
+}
+
+// Generate list_set: args[0]=handle, args[1]=index, args[2]=value
+fn generateListSet(cg: *FullCodeGen, node: IRNode, node_idx: IRNodeIndex) void {
+    // Spill caller-saved registers
+    cgSpillCallerSaved(cg)
+
+    // Load arguments: x0=handle, x1=index, x2=value
+    cgPrepareArg(cg, 0, irNodeGetArg(node, 0))
+    cgPrepareArg(cg, 1, irNodeGetArg(node, 1))
+    cgPrepareArg(cg, 2, irNodeGetArg(node, 2))
+
+    // Call _cot_list_set
+    emitCallPlaceholder(&cg.*.buf, "_cot_list_set")
+}
+
+// Generate list_new: aux=elem_size, returns handle in x0
+fn generateListNew(cg: *FullCodeGen, node: IRNode, node_idx: IRNodeIndex) void {
+    cgSpillCallerSaved(cg)
+
+    // Load elem_size into x0
+    movRegImm64(&cg.*.buf, REG_X0, node.aux)
+
+    // Call _cot_list_new
+    emitCallPlaceholder(&cg.*.buf, "_cot_list_new")
+
+    // Result is in x0
+    cgMarkReturnValue(cg, node_idx)
+}
+
+// Generate list_push: args[0]=handle, args[1]=value
+fn generateListPush(cg: *FullCodeGen, node: IRNode, node_idx: IRNodeIndex) void {
+    cgSpillCallerSaved(cg)
+
+    cgPrepareArg(cg, 0, irNodeGetArg(node, 0))
+    cgPrepareArg(cg, 1, irNodeGetArg(node, 1))
+
+    emitCallPlaceholder(&cg.*.buf, "_cot_list_push")
+    cgMarkReturnValue(cg, node_idx)
+}
+
+// Generate list_get: args[0]=handle, args[1]=index
+fn generateListGet(cg: *FullCodeGen, node: IRNode, node_idx: IRNodeIndex) void {
+    cgSpillCallerSaved(cg)
+
+    cgPrepareArg(cg, 0, irNodeGetArg(node, 0))
+    cgPrepareArg(cg, 1, irNodeGetArg(node, 1))
+
+    emitCallPlaceholder(&cg.*.buf, "_cot_list_get")
+    cgMarkReturnValue(cg, node_idx)
+}
+
+// Generate list_len: args[0]=handle
+fn generateListLen(cg: *FullCodeGen, node: IRNode, node_idx: IRNodeIndex) void {
+    cgSpillCallerSaved(cg)
+
+    cgPrepareArg(cg, 0, irNodeGetArg(node, 0))
+
+    emitCallPlaceholder(&cg.*.buf, "_cot_list_len")
+    cgMarkReturnValue(cg, node_idx)
+}
+
+// Generate conditional branch
+fn generateBranch(cg: *FullCodeGen, node: IRNode, patches: *List<BranchPatch>) void {
+    var cond_id: int = irNodeGetArg(node, 0)
+    var true_block: int = irNodeGetArg(node, 1)
+    var false_block: int = irNodeGetArg(node, 2)
+
+    // Load condition and compare with 0
+    var cond_mcv: MCValue = cgGetValue(cg, cond_id)
+    cgLoadToReg(cg, SCRATCH0, cond_mcv)
+    cmpRegImm(&cg.*.buf, SCRATCH0, 0)
+
+    // B.EQ false_block (branch to false block if condition is zero)
+    var beq_offset: int = codeBufferPos(&cg.*.buf)
+    emit32(&cg.*.buf, 0)  // Placeholder for B.EQ
+    patches.*.push(BranchPatch{
+        .offset = beq_offset,
+        .target_block = false_block,
+        .is_conditional = true,
+        .cond = COND_EQ,  // Branch if equal to zero (condition false)
+    })
+
+    // B true_block (unconditional branch to true block)
+    var b_offset: int = codeBufferPos(&cg.*.buf)
+    emit32(&cg.*.buf, 0)  // Placeholder for B
+    patches.*.push(BranchPatch{
+        .offset = b_offset,
+        .target_block = true_block,
+        .is_conditional = false,
+        .cond = 0,
+    })
+}
+
+// Generate unconditional jump
+fn generateJump(cg: *FullCodeGen, node: IRNode, patches: *List<BranchPatch>) void {
+    var target_block: int = node.aux
+
+    // B target_block
+    var b_offset: int = codeBufferPos(&cg.*.buf)
+    emit32(&cg.*.buf, 0)  // Placeholder for B
+    patches.*.push(BranchPatch{
+        .offset = b_offset,
+        .target_block = target_block,
+        .is_conditional = false,
+        .cond = 0,
+    })
+}
+
+// Generate function call
+fn generateCall(cg: *FullCodeGen, node: IRNode, node_idx: IRNodeIndex) void {
+    // Spill caller-saved registers
+    cgSpillCallerSaved(cg)
+
+    // Load arguments into registers (x0-x7)
+    var num_args: int = node.args_len
+    if num_args >= 1 {
+        cgPrepareArg(cg, 0, irNodeGetArg(node, 0))
+    }
+    if num_args >= 2 {
+        cgPrepareArg(cg, 1, irNodeGetArg(node, 1))
+    }
+    if num_args >= 3 {
+        cgPrepareArg(cg, 2, irNodeGetArg(node, 2))
+    }
+    if num_args >= 4 {
+        cgPrepareArg(cg, 3, irNodeGetArg(node, 3))
+    }
+
+    // Emit BL instruction (will need relocation)
+    // For now, emit placeholder - the linker will handle symbol resolution
+    var func_name: string = "_" + node.aux_str
+    emitCallPlaceholder(&cg.*.buf, func_name)
+
+    // Mark return value in x0
+    cgMarkReturnValue(cg, node_idx)
+}
+
+// Emit BL placeholder for function call
+fn emitCallPlaceholder(buf: *CodeBuffer, func_name: string) void {
+    // BL with 0 offset - linker will patch
+    // BL encoding: 1001 01 [imm26]
+    var inst: int = 37 * 67108864  // 0x94000000
+    emit32(buf, inst)
+}
+
+// Generate select: cond ? then_val : else_val
+fn generateSelect(cg: *FullCodeGen, node: IRNode, node_idx: IRNodeIndex) void {
+    var cond_id: int = irNodeGetArg(node, 0)
+    var then_id: int = irNodeGetArg(node, 1)
+    var else_id: int = irNodeGetArg(node, 2)
+
+    cgEnsureRegFree(cg, REG_X0)
+
+    // Load condition and compare with 0
+    var cond_mcv: MCValue = cgGetValue(cg, cond_id)
+    cgLoadToReg(cg, SCRATCH0, cond_mcv)
+    cmpRegImm(&cg.*.buf, SCRATCH0, 0)
+
+    // Load then and else values
+    var then_mcv: MCValue = cgGetValue(cg, then_id)
+    var else_mcv: MCValue = cgGetValue(cg, else_id)
+    cgLoadToReg(cg, REG_X0, then_mcv)
+    cgLoadToReg(cg, SCRATCH1, else_mcv)
+
+    // CSEL x0, x0, x17, NE (select x0 if cond != 0, else x17)
+    var inst: int = encodeCondSelect(1, 0, SCRATCH1, COND_NE, REG_X0, REG_X0)
+    emit32(&cg.*.buf, inst)
+
+    regManagerMarkUsed(cg.*.reg_manager, REG_X0, node_idx)
+    cgSetResult(cg, node_idx, mcvRegister(REG_X0))
+}
+
+fn generateNodeFromIR(cg: *FullCodeGen, node: IRNode, node_idx: IRNodeIndex) void {
+    var op: Op = node.op
+    if op == Op.const_int {
+        cgGenConstInt(cg, node_idx, node.aux)
+    } else if op == Op.add {
+        cgGenAdd(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
+    } else if op == Op.sub {
+        cgGenSub(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
+    } else if op == Op.mul {
+        cgGenMul(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
+    } else if op == Op.div {
+        cgGenDiv(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
+    } else if op == Op.eq {
+        cgGenCmpEq(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
+    } else if op == Op.ne {
+        cgGenCmpNe(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
+    } else if op == Op.lt {
+        cgGenCmpLt(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
+    } else if op == Op.le {
+        cgGenCmpLe(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
+    } else if op == Op.gt {
+        cgGenCmpGt(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
+    } else if op == Op.ge {
+        cgGenCmpGe(cg, node_idx, irNodeGetArg(node, 0), irNodeGetArg(node, 1))
+    } else if op == Op.neg {
+        cgGenNeg(cg, node_idx, irNodeGetArg(node, 0))
+    } else if op == Op.local {
+        cgGenLoadStack(cg, node_idx, 0 - (node.aux + 1) * 8, 8)
+    } else if op == Op.store {
+        cgGenStoreStack(cg, irNodeGetArg(node, 0), 0 - (node.aux + 1) * 8, 8)
+    } else if op == Op.ret {
+        cgGenReturn(cg, irNodeGetArg(node, 0))
+    } else if op == Op.select {
+        generateSelect(cg, node, node_idx)
     }
 }
 

@@ -1,0 +1,23 @@
+// Test: Large struct return (>16 bytes)
+// BUG-018 test case - large struct returns may be broken in cot1
+
+struct LargeStruct {
+    a: int,
+    b: int,
+    c: int,
+    d: int,
+}
+
+fn makeLarge(x: int) LargeStruct {
+    return LargeStruct{
+        .a = x,
+        .b = x + 1,
+        .c = x + 2,
+        .d = x + 3,
+    }
+}
+
+fn main() int {
+    var s: LargeStruct = makeLarge(10)
+    return s.a + s.d  // 10 + 13 = 23
+}

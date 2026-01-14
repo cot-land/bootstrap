@@ -178,8 +178,7 @@ fn sectionSize(sec: Section) int {
 }
 
 fn sectionAddRelocation(sec: *Section, reloc: Relocation) void {
-    var s: Section = sec.*
-    s.relocations.push(reloc)
+    sec.*.relocations.push(reloc)
 }
 
 // =============================================================================
@@ -214,8 +213,8 @@ fn objectGetSection(obj: ObjectFile, idx: int) Section {
     return obj.sections.get(idx)
 }
 
-fn objectSetSection(obj: ObjectFile, idx: int, sec: Section) void {
-    obj.sections[idx] = sec
+fn objectSetSection(obj: *ObjectFile, idx: int, sec: Section) void {
+    obj.*.sections[idx] = sec
 }
 
 fn objectAddSymbol(obj: ObjectFile, sym: Symbol) int {
@@ -631,52 +630,74 @@ fn writeMachO64(obj: ObjectFile, buf: OutputBuffer) void {
 // Apply Local Relocations (patch BL instructions)
 // =============================================================================
 
-fn applyLocalRelocations(obj: ObjectFile) void {
+fn applyLocalRelocations(obj: *ObjectFile) void {
+    // Note: println call required due to BUG-017 - list index assignment
+    // works incorrectly without preceding function call
+    println("")
     var sec_idx: int = 0
-    while sec_idx < len(obj.sections) {
-        var sec: Section = obj.sections.get(sec_idx)
+    while sec_idx < len(obj.*.sections) {
+        var sec: Section = obj.*.sections.get(sec_idx)
 
         var reloc_idx: int = 0
-        while reloc_idx < len(sec.relocations) {
+        var num_relocs: int = len(sec.relocations)
+        while reloc_idx < num_relocs {
             var reloc: Relocation = sec.relocations.get(reloc_idx)
 
             // Only patch pc_rel_32 (BL instructions) for local functions
             if reloc.kind == RelocKind.pc_rel_32 {
-                var target_idx: int = objectFindSymbol(obj, reloc.symbol)
+                var target_idx: int = objectFindSymbol(obj.*, reloc.symbol)
                 if target_idx >= 0 {
-                    var target_sym: Symbol = obj.symbols.get(target_idx)
+                    var target_sym: Symbol = obj.*.symbols.get(target_idx)
 
                     // Compute relative offset for BL instruction
                     var reloc_offset: int = reloc.offset
                     var target_offset: int = target_sym.offset
-                    var signed_offset: int = target_offset - reloc_offset
-                    var inst_offset: int = signed_offset / 4
 
-                    // Read existing instruction
-                    var inst: int = sec.data.get(reloc_offset)
-                    inst = inst + (sec.data.get(reloc_offset + 1) * 256)
-                    inst = inst + (sec.data.get(reloc_offset + 2) * 65536)
-                    inst = inst + (sec.data.get(reloc_offset + 3) * 16777216)
-
-                    // Mask out old offset, insert new offset
-                    inst = inst / 67108864 * 67108864  // Keep opcode (top 6 bits)
-                    var masked_offset: int = inst_offset
-                    if masked_offset < 0 {
-                        masked_offset = masked_offset + 67108864  // Handle negative
+                    // Handle negative offsets explicitly to avoid cot0 division issues
+                    var is_backward: bool = target_offset < reloc_offset
+                    var abs_byte_offset: int = 0
+                    if is_backward {
+                        abs_byte_offset = reloc_offset - target_offset
+                    } else {
+                        abs_byte_offset = target_offset - reloc_offset
                     }
-                    masked_offset = masked_offset % 67108864  // 26 bits
-                    inst = inst + masked_offset
+                    var abs_inst_offset: int = abs_byte_offset / 4
+
+                    // Encode BL instruction byte-by-byte
+                    // For backward jump: use 2^26 - offset (two's complement)
+                    // For forward jump: use offset directly
+                    var unsigned_offset: int = 0
+                    if is_backward {
+                        // Two's complement: 2^26 - magnitude
+                        unsigned_offset = 67108864 - abs_inst_offset
+                    } else {
+                        unsigned_offset = abs_inst_offset
+                    }
+
+                    // Extract bytes by successive division
+                    var b0: int = unsigned_offset % 256
+                    var temp1: int = unsigned_offset / 256
+                    var b1: int = temp1 % 256
+                    var temp2: int = temp1 / 256
+                    var b2: int = temp2 % 256
+                    var temp3: int = temp2 / 256
+                    var b3_low: int = temp3 % 4
+
+                    // BL opcode: 100101 in bits 31-26, which is 0x94 in the high byte
+                    var b3: int = 148 + b3_low
 
                     // Write back
-                    sec.data[reloc_offset] = inst % 256
-                    sec.data[reloc_offset + 1] = (inst / 256) % 256
-                    sec.data[reloc_offset + 2] = (inst / 65536) % 256
-                    sec.data[reloc_offset + 3] = (inst / 16777216) % 256
+                    sec.data[reloc_offset] = b0
+                    sec.data[reloc_offset + 1] = b1
+                    sec.data[reloc_offset + 2] = b2
+                    sec.data[reloc_offset + 3] = b3
                 }
             }
 
             reloc_idx = reloc_idx + 1
         }
+        // Write modified section back to object
+        objectSetSection(obj, sec_idx, sec)
         sec_idx = sec_idx + 1
     }
 }

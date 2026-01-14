@@ -186,7 +186,7 @@ fn parserAdvance(state: ParserState) ParserState {
     var result: TokenResult = scanNext(scanState)
 
     // Direct slice in struct init - testing if BUG-007 is still present
-    return ParserState{
+    var ret: ParserState = ParserState{
         .content = state.content,
         .pos = result.end,
         .len = state.len,
@@ -197,6 +197,7 @@ fn parserAdvance(state: ParserState) ParserState {
         .nodes = state.nodes,
         .error_count = state.error_count,
     }
+    return ret
 }
 
 fn parserCheck(state: ParserState, tok: Token) bool {
@@ -786,8 +787,13 @@ fn parseSwitchExpr(state: ParserState) ParseResult {
 
     current = parserExpect(current, Token.lbrace)
 
+    var cases: List<NodeIndex> = new List<NodeIndex>()
+
     // Parse cases
     while current.tok != Token.rbrace and current.tok != Token.eof {
+        var case_start: Pos = parserPos(current)
+        var case_value: NodeIndex = null_node
+
         // Parse case value(s)
         if current.tok == Token.dot {
             current = parserAdvance(current)
@@ -805,11 +811,13 @@ fn parseSwitchExpr(state: ParserState) ParseResult {
             }
         } else if current.tok == Token.kw_else {
             current = parserAdvance(current)
+            // case_value stays null_node for else
         } else {
             // Integer case
             var case_result: ParseResult = parseExpr(current)
             if case_result.node_idx != null_node {
                 current = case_result.state
+                case_value = case_result.node_idx
             }
         }
 
@@ -821,6 +829,14 @@ fn parseSwitchExpr(state: ParserState) ParseResult {
             current = body_result.state
         }
 
+        // Create switch_case node: left=value, right=body
+        var case_span: Span = spanInit(case_start, parserPos(current))
+        var case_node: Node = makeNode(NodeTag.switch_case, case_span)
+        case_node.left = case_value
+        case_node.right = body_result.node_idx
+        var add_result: ParseResult = addNode(current, case_node)
+        cases.push(add_result.node_idx)
+
         if current.tok == Token.comma {
             current = parserAdvance(current)
         }
@@ -831,6 +847,7 @@ fn parseSwitchExpr(state: ParserState) ParseResult {
     var span: Span = spanInit(start, parserPos(current))
     var node: Node = makeNode(NodeTag.switch_expr, span)
     node.left = subj_result.node_idx
+    node.args = cases
     return addNode(current, node)
 }
 

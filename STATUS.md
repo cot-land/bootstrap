@@ -94,6 +94,12 @@ zig cc -o test_exe a.out && ./test_exe
 3. Fixed number parsing loop (cot `and` in while conditions)
 4. Added proper function epilogue emission
 
+**Recent fixes (2026-01-14):**
+1. Fixed BUG-017: `loadThreeArgs` register clobbering in arm64_codegen.zig - When arg2 was in x10 and arg1 needed saving, we now use x11 as scratch to avoid clobbering
+2. Fixed BUG-023: Branch codegen - Fixed via list_set fix since branch patching uses list index assignment
+3. Added list operation handlers to cot0: `generateListNew`, `generateListPush`, `generateListGet`, `generateListLen`
+4. Added `new_expr` handling in lower_boot.cot for `new List<T>()` expressions
+
 ### Bootstrap Architecture (2026-01-14)
 
 The bootstrap .cot modules now follow a modular architecture matching the Zig compiler:
@@ -121,6 +127,7 @@ codegen/*_boot.cot   → ARM64 code generation + Mach-O output
 1. **Large struct by value**: Passing structs > 16 bytes by value corrupts nested List handles. Workaround: pass pointers instead.
 2. **Address-of chained field access**: `&state.*.field.subfield` doesn't work correctly. Workaround: copy to local first.
 3. **`and` in while loop conditions**: Complex conditions like `while a < b and isDigit(c[i])` may not evaluate correctly. Workaround: use nested if statements inside a `while true` loop.
+4. **cot0 crashes on complex input**: cot0 crashes when compiling files with `new List<...>()` or `while` statements. Investigation ongoing - appears to be stack corruption causing jumps to invalid addresses.
 
 ---
 

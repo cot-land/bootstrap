@@ -1,0 +1,13 @@
+// Test: Nested function calls
+
+fn add(a: int, b: int) int {
+    return a + b
+}
+
+fn mul(a: int, b: int) int {
+    return a * b
+}
+
+fn main() int {
+    return add(mul(2, 3), mul(4, 5))  // 6 + 20 = 26
+}

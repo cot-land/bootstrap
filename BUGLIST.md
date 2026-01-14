@@ -82,6 +82,139 @@ This is the ONLY way to achieve a stable self-hosting compiler.
 - **Test:** `tests/test_chained_ptr_field.cot`
 - **Fix:** In `genPtrField`, for multi-word fields (>8 bytes), load both words to a temp stack slot instead of just one register. This allows `loadSliceToRegs` to find both ptr and len.
 
+### BUG-009: field_value type not resolved for non-local bases
+- **Status:** FIXED
+- **Discovered:** 2026-01-14
+- **Location:** `src/lower.zig:lowerFieldAccess`
+- **Description:** When accessing fields on non-local values (e.g., `list.get(0).field`), the type and offset were not resolved, causing size=0 in codegen. This led to incorrect code generation where stack data was treated as pointers.
+- **Impact:** Any code with `list.get().field` or similar patterns would crash
+- **Test:** `tests/test_list_get_field.cot`, `tests/test_fn_call.cot`
+- **Fix:** Modified fallback in lowerFieldAccess to get base type from expr_types and resolve field offset/type properly
+
+### BUG-010: cot0 local variable lookup uses invalid map handle
+- **Status:** FIXED
+- **Discovered:** 2026-01-14
+- **Location:** `arm64_codegen.zig:genPtrLoad`, `amd64_codegen.zig:genPtrLoad`
+- **Description:** When a pointer to a large struct (>8 bytes) was dereferenced (`ptr.*`) for use as a function argument, `genPtrLoad` only loaded the first 8 bytes into a register. When passing the address of this partial copy to a function expecting the full struct, the callee would read garbage data.
+- **Impact:** cot0 crashed when calling functions with large struct by-value parameters (like `irFuncBuilderLookupLocal(fb.*, name)`)
+- **Test:** `tests/test_fn_call.cot`
+- **Fix:** Modified `genPtrLoad` to copy the entire struct to a stack slot for types >8 bytes, then return that stack location as the MCValue. Applied to both ARM64 and AMD64 codegen.
+
+### BUG-011: cot0 codegen doesn't handle function calls
+- **Status:** FIXED
+- **Discovered:** 2026-01-14
+- **Location:** `driver_boot.cot:generateNodeFromIR`, `arm64_boot.cot`
+- **Description:** The `generateNodeFromIR` function didn't handle `Op.call`, and `cgGenCallDirect` was missing.
+- **Impact:** cot0 couldn't compile programs with function calls
+- **Test:** `tests/test_fn_call.cot`
+- **Fix:** Added `cgGenCallDirect` function and `Op.call` handling in driver
+
+### BUG-012: Function parameters not added to local_map in cot0 lowerer
+- **Status:** FIXED
+- **Discovered:** 2026-01-14
+- **Location:** `lower_boot.cot:lowerFnDeclNode`
+- **Description:** The function `lowerFnDeclNode` creates an IRFuncBuilder but doesn't add function parameters to the local_map. When the function body references parameters, they can't be found.
+- **Impact:** cot0 can't compile functions with parameters - identifiers like `a` and `b` are not found
+- **Test:** `tests/test_fn_call.cot`
+- **Fix:** Added parameter handling loop in `lowerFnDeclNode` to iterate over `fn_decl.args` and call `irFuncBuilderAddParam`
+
+### BUG-013: Call relocations not added to object file
+- **Status:** FIXED
+- **Discovered:** 2026-01-14
+- **Location:** `driver_boot.cot`, `object_boot.cot`
+- **Description:** Function call instructions (BL) were emitted but relocations weren't added to the object file, causing incorrect branch targets.
+- **Impact:** Function calls jumped to wrong addresses, causing crashes
+- **Test:** `tests/test_fn_call.cot`
+- **Fix:** Added call relocation tracking in codegen and `applyLocalRelocations` in object writer
+
+### BUG-016: String params overflow x0-x7 registers
+- **Status:** FIXED
+- **Discovered:** 2026-01-14
+- **Location:** `arm64_boot.cot:cgGenCallDirect`
+- **Description:** String parameters use 2 registers (ptr+len). With too many int params after a string, args overflowed x0-x7.
+- **Impact:** Function calls with string + multiple int params corrupted registers
+- **Test:** `tests/test_fn_call.cot`
+- **Fix:** Reordered `cgGenCallDirect` params to put string (func_name) first
+
+### BUG-017: List index assignment fails without preceding function call
+- **Status:** OPEN (workaround in place)
+- **Discovered:** 2026-01-14
+- **Location:** Zig compiler codegen for `list[idx] = value`
+- **Description:** In `applyLocalRelocations`, the `sec.data[reloc_offset] = b0` assignments produce incorrect values unless preceded by a function call (e.g., `println("")`).
+- **Impact:** BL instruction encoding was corrupted (0x97b0ffe3 instead of 0x97ffffe3)
+- **Test:** `tests/test_fn_call.cot`
+- **Workaround:** Added `println("")` at start of `applyLocalRelocations`
+- **Fix:** TBD - needs investigation in Zig compiler's list_set codegen
+
+### BUG-018: cot1 crashes in parserExpect when compiling main_boot.cot
+- **Status:** BLOCKED (depends on BUG-019, BUG-020, BUG-021)
+- **Discovered:** 2026-01-14
+- **Location:** `parser_boot.cot:parserExpect`
+- **Description:** cot1 (self-hosted compiler) crashes with SEGFAULT when compiling main_boot.cot.
+- **Impact:** cot1 cannot compile itself - blocks full self-hosting
+- **Root Cause:** More fundamental bugs (var declarations, enums, switch) need fixing first
+
+### BUG-019: var declarations crash cot0
+- **Status:** FIXED
+- **Discovered:** 2026-01-14
+- **Location:** `lower_boot.cot` or `driver_boot.cot`
+- **Description:** `var x: int = 10` causes cot0 to crash with SIGBUS (exit 138)
+- **Impact:** Cannot use local variables in cot0-compiled programs
+- **Test:** `tests/bootstrap/test_var_decl.cot`
+- **Fix:** Issue resolved - var declarations now work correctly in cot0
+
+### BUG-020: enum usage crashes cot0
+- **Status:** FIXED
+- **Discovered:** 2026-01-14
+- **Location:** Parser or lowerer
+- **Description:** Any enum declaration or usage causes cot0 to crash
+- **Impact:** Cannot use enums in cot0-compiled programs
+- **Test:** `tests/bootstrap/test_enum_usage.cot`
+- **Fix:** Issue resolved - enum declarations and usage now work correctly in cot0
+
+### BUG-021: switch expression returns wrong values
+- **Status:** FIXED
+- **Discovered:** 2026-01-14
+- **Location:** `parser_boot.cot:parseSwitchExpr`, `lower_boot.cot:lowerSwitchExpr`
+- **Description:** `switch x { 1 => 10, 2 => 20, else => 0 }` with x=2 returns 2 instead of 20
+- **Impact:** Switch expressions produce incorrect results
+- **Test:** `tests/bootstrap/test_switch_expr.cot`
+- **Fix:** Three-part fix:
+  1. Parser: Modified `parseSwitchExpr` to store case values and bodies using `switch_case` nodes in `node.args`
+  2. Lowerer: Added `lowerSwitchExpr` function that generates nested `select` operations
+  3. Codegen: Added `generateSelect` function and fixed `encodeCondSelect` (missing bit 23) and `cgLoadToReg` (scratch register clobbering)
+
+### BUG-022: Comparison operators `>`, `>=`, `<=` crash cot0
+- **Status:** WORKAROUND IN PLACE
+- **Discovered:** 2026-01-14
+- **Location:** `scanner_boot.cot` - Zig compiler codegen issue
+- **Description:** `if 10 > 5 { ... }` crashes with SIGBUS (exit 138). `<` and `==` work fine.
+- **Impact:** Cannot use `>`, `>=`, `<=` operators in cot0-compiled programs without workaround
+- **Test:** `tests/bootstrap/test_cmp_greater.cot`
+- **Pattern:**
+  - `if 5 < 10` - WORKS
+  - `if 5 == 5` - WORKS
+  - `if 10 > 5` - CRASHES (exit 138 SIGBUS) without workaround
+  - `if 10 >= 5` - CRASHES (exit 138 SIGBUS) without workaround
+  - `if 5 <= 10` - CRASHES (exit 139 SIGSEGV) without workaround
+- **Root Cause:** Suspected Zig compiler codegen bug when handling `>` character (code 62) in scanner
+- **Workaround:** Added `println(" ")` in scanner_boot.cot line 413. This prevents the crash by changing stack layout or timing.
+- **Proper Fix:** Investigate Zig compiler's codegen for scanner_boot.cot
+
+### BUG-023: cot0 branch codegen produces illegal opcodes
+- **Status:** OPEN
+- **Discovered:** 2026-01-14
+- **Location:** `driver_boot.cot` generateBranch/generateFunctionFromIR
+- **Description:** cot0 generates garbage opcodes (e.g., 0x0f0e0dc0) instead of proper ARM64 branch instructions. Also fails to load condition values before comparisons.
+- **Impact:** Any if statement in cot0-compiled programs produces illegal instructions (SIGILL exit 132)
+- **Test:** `fn main() int { if true { return 42 } return 1 }` returns SIGILL
+- **Root Cause:** Branch patching or instruction encoding bugs in driver_boot.cot
+- **Debug Info:**
+  ```
+  Expected: B.cond or B instruction
+  Actual: 0x0f0e0dc0 (unknown opcode - looks like ASCII garbage)
+  ```
+
 ---
 
 ## Completed Bugs
@@ -94,6 +227,15 @@ This is the ONLY way to achieve a stable self-hosting compiler.
 | BUG-006 | Duplicate entry block in IR | 2026-01-14 |
 | BUG-007 | Slice in struct init (was not reproducible) | 2026-01-14 |
 | BUG-008 | Chained pointer field access for strings | 2026-01-14 |
+| BUG-009 | field_value type not resolved for non-local bases | 2026-01-14 |
+| BUG-010 | genPtrLoad only loaded 8 bytes for large structs | 2026-01-14 |
+| BUG-011 | cot0 codegen doesn't handle function calls | 2026-01-14 |
+| BUG-012 | Function parameters not in local_map | 2026-01-14 |
+| BUG-013 | Call relocations not added to object file | 2026-01-14 |
+| BUG-016 | String params overflow x0-x7 registers | 2026-01-14 |
+| BUG-019 | var declarations crash cot0 | 2026-01-14 |
+| BUG-020 | enum usage crashes cot0 | 2026-01-14 |
+| BUG-021 | switch expression returns wrong values | 2026-01-14 |
 
 ---
 

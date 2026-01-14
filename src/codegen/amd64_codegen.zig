@@ -1678,9 +1678,33 @@ pub const CodeGen = struct {
         const ptr_reg = try self.allocReg(0xFFFF);
         try self.loadToReg(ptr_reg, ptr_mcv);
 
-        // Load through the pointer
-        const dest = try self.allocReg(value.id);
         const size = self.type_reg.sizeOf(value.type_idx);
+
+        // BUG-010 fix: For large structs (>8 bytes), we can't load into a register.
+        // Instead, copy the entire struct to a stack slot and return that location.
+        if (size > 8) {
+            // Allocate temp stack slot for the full struct (grows negative in AMD64)
+            const aligned_size: i32 = @intCast(alignTo(size, 8));
+            self.next_spill_offset -= aligned_size;
+            const temp_offset = self.next_spill_offset;
+
+            // Copy the struct from source pointer to stack slot, 8 bytes at a time
+            var copied: i32 = 0;
+            while (copied < aligned_size) {
+                // Load 8 bytes from [ptr_reg + copied]
+                try x86.movRegMem(self.buf, scratch0, ptr_reg, copied);
+                // Store to stack slot [rbp + temp_offset + copied]
+                try x86.movMemReg(self.buf, .rbp, temp_offset + copied, scratch0);
+                copied += 8;
+            }
+
+            // Result is the stack location containing the struct copy
+            try self.setResult(value.id, .{ .stack = temp_offset });
+            return;
+        }
+
+        // Small types: load directly to register
+        const dest = try self.allocReg(value.id);
 
         switch (size) {
             1 => {

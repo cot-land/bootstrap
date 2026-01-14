@@ -184,7 +184,9 @@ EOF
 run_test "ir_boot.cot" "$TESTS_DIR/test_ir.cot"
 
 # Test 9: lower_boot.cot
+# lower_boot requires parser_boot to be imported first (for Node, Token types)
 cat > "$TESTS_DIR/test_lower.cot" << 'EOF'
+import "../../src/bootstrap/parser_boot.cot"
 import "../../src/bootstrap/lower_boot.cot"
 
 fn main() int {
@@ -318,7 +320,12 @@ EOF
 run_test "type_context_boot.cot" "$TESTS_DIR/test_type_context.cot"
 
 # Test 18: driver_boot.cot
+# driver_boot requires parser, lower, and codegen modules to be imported first
 cat > "$TESTS_DIR/test_driver.cot" << 'EOF'
+import "../../src/bootstrap/parser_boot.cot"
+import "../../src/bootstrap/lower_boot.cot"
+import "../../src/bootstrap/codegen/arm64_boot.cot"
+import "../../src/bootstrap/codegen/object_boot.cot"
 import "../../src/bootstrap/driver_boot.cot"
 
 fn main() int {

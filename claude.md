@@ -1,5 +1,20 @@
 # Cot 0.2 Development Guidelines
 
+## BUG TRACKING PROCESS - MANDATORY
+
+**When you encounter a bug during bootstrap development, follow this process:**
+
+1. **Discover** - Identify the bug through testing or code analysis
+2. **Document** - Add to `BUGLIST.md` with location, description, and impact
+3. **Test** - Create a test case in `tests/` that exposes the bug
+4. **Fix** - Implement the fix
+5. **Verify** - Run the test to confirm the fix works
+6. **Complete** - Mark the bug as FIXED in `BUGLIST.md`
+
+This is the ONLY way to achieve a stable self-hosting compiler. See `BUGLIST.md` for the current bug list and template.
+
+---
+
 ## CODEGEN ARCHITECTURE - MANDATORY READING
 
 **Before implementing new SSA operations or debugging codegen bugs, you MUST read `CODEGEN.md`.**

@@ -280,28 +280,14 @@ fn codeBufferEmit8(buf: *CodeBuffer, b: int) void {
 }
 
 fn emit32(buf: *CodeBuffer, inst: int) void {
-    println("DEBUG: emit32 enter")
-    var buf_len: int = len(buf.*.bytes)
-    if buf_len < 0 {
-        println("DEBUG: buf len is NEGATIVE - CORRUPT!")
-    } else if buf_len < 100 {
-        println("DEBUG: buf len ok 0-99")
-    } else if buf_len < 1000 {
-        println("DEBUG: buf len 100-999")
-    } else {
-        println("DEBUG: buf len >= 1000 - SUSPECT")
-    }
     var b0: int = inst % 256
     var b1: int = (inst / 256) % 256
     var b2: int = (inst / 65536) % 256
     var b3: int = (inst / 16777216) % 256
-    println("DEBUG: about to call codeBufferEmit8")
     codeBufferEmit8(buf, b0)
-    println("DEBUG: emit32 done first byte")
     codeBufferEmit8(buf, b1)
     codeBufferEmit8(buf, b2)
     codeBufferEmit8(buf, b3)
-    println("DEBUG: emit32 done")
 }
 
 // =============================================================================
@@ -503,9 +489,9 @@ fn cgLoadToReg(cg: *FullCodeGen, dest: int, mcv: MCValue) void {
     } else if mcv.kind == MCValueKind.immediate {
         movRegImm64(&cg.*.buf, dest, mcv.imm)
     } else if mcv.kind == MCValueKind.stack {
-        // Load from [SP + offset]
-        addRegImm12(&cg.*.buf, SCRATCH0, REG_SP, mcv.stack_offset)
-        ldrRegImm(&cg.*.buf, dest, SCRATCH0, 0)
+        // Load from [SP + offset] directly using SP as base
+        // This avoids clobbering scratch registers used by caller
+        ldrRegImm(&cg.*.buf, dest, REG_SP, mcv.stack_offset)
     }
 }
 
@@ -660,10 +646,14 @@ fn encodeCallBranch(imm26: int) int {
 
 fn encodeCondSelect(sf: int, op: int, rm: int, cond: int, rn: int, rd: int) int {
     // CSEL, CSINC, CSET etc.
+    // Encoding: sf op S=0 11010100 Rm cond op2=00 Rn Rd
+    // Bits 28-21 = 11010100, but 26 * 16777216 only sets bits 28-24
+    // Need to add bit 23 = 8388608
     var inst: int = 0
     inst = inst + (sf * 2147483648)
     inst = inst + (op * 1073741824)
     inst = inst + (26 * 16777216)
+    inst = inst + 8388608              // bit 23 = 1 for CSEL/CSINC
     inst = inst + (rm * 65536)
     inst = inst + (cond * 4096)
     inst = inst + (rn * 32)
@@ -993,14 +983,11 @@ fn encodeLoadPairPost(opc: int, imm7: int, rt2: int, rn: int, rt: int) int {
 
 // STP x29, x30, [sp, #imm]! (pre-index)
 fn stpPreFpLr(buf: *CodeBuffer, imm: int) void {
-    println("DEBUG: stpPreFpLr enter")
     var imm7: int = imm / 8
     if imm7 < 0 {
         imm7 = imm7 + 128  // Sign-extend for negative
     }
-    println("DEBUG: about to emit32")
     emit32(buf, encodeStorePairPre(2, imm7, REG_LR, REG_SP, REG_FP))
-    println("DEBUG: stpPreFpLr done")
 }
 
 // LDP x29, x30, [sp], #imm (post-index)
@@ -1126,17 +1113,22 @@ fn cgGenEpilogue(cg: *FullCodeGen, frame_size: int) void {
 // =============================================================================
 
 // Load from stack offset into register
+// offset is FP-relative (negative), convert to SP-relative (positive)
 fn cgGenLoadStack(cg: *FullCodeGen, value_id: int, offset: int, size: int) void {
     cgEnsureRegFree(cg, REG_X0)
 
+    // Convert FP-relative (negative) to SP-relative (positive)
+    // Add 16 for saved fp/lr which are at sp+0 and sp+8
+    var sp_offset: int = cg.*.stack_size + 16 + offset
+
     if size == 1 {
-        ldrbRegImm(&cg.*.buf, REG_X0, REG_SP, offset)
+        ldrbRegImm(&cg.*.buf, REG_X0, REG_SP, sp_offset)
     } else if size == 2 {
-        ldrhRegImm(&cg.*.buf, REG_X0, REG_SP, offset)
+        ldrhRegImm(&cg.*.buf, REG_X0, REG_SP, sp_offset)
     } else if size == 4 {
-        ldrwRegImm(&cg.*.buf, REG_X0, REG_SP, offset)
+        ldrwRegImm(&cg.*.buf, REG_X0, REG_SP, sp_offset)
     } else {
-        ldrRegImm(&cg.*.buf, REG_X0, REG_SP, offset)
+        ldrRegImm(&cg.*.buf, REG_X0, REG_SP, sp_offset)
     }
 
     regManagerMarkUsed(cg.*.reg_manager, REG_X0, value_id)
@@ -1144,18 +1136,23 @@ fn cgGenLoadStack(cg: *FullCodeGen, value_id: int, offset: int, size: int) void 
 }
 
 // Store value to stack offset
+// offset is FP-relative (negative), convert to SP-relative (positive)
 fn cgGenStoreStack(cg: *FullCodeGen, src_id: int, offset: int, size: int) void {
     var src_mcv: MCValue = cgGetValue(cg, src_id)
     cgLoadToReg(cg, SCRATCH0, src_mcv)
 
+    // Convert FP-relative (negative) to SP-relative (positive)
+    // Add 16 for saved fp/lr which are at sp+0 and sp+8
+    var sp_offset: int = cg.*.stack_size + 16 + offset
+
     if size == 1 {
-        strbRegImm(&cg.*.buf, SCRATCH0, REG_SP, offset)
+        strbRegImm(&cg.*.buf, SCRATCH0, REG_SP, sp_offset)
     } else if size == 2 {
-        strhRegImm(&cg.*.buf, SCRATCH0, REG_SP, offset)
+        strhRegImm(&cg.*.buf, SCRATCH0, REG_SP, sp_offset)
     } else if size == 4 {
-        strwRegImm(&cg.*.buf, SCRATCH0, REG_SP, offset)
+        strwRegImm(&cg.*.buf, SCRATCH0, REG_SP, sp_offset)
     } else {
-        strRegImm(&cg.*.buf, SCRATCH0, REG_SP, offset)
+        strRegImm(&cg.*.buf, SCRATCH0, REG_SP, sp_offset)
     }
 }
 
@@ -1371,9 +1368,13 @@ fn cgGenNeg(cg: *FullCodeGen, value_id: int, operand_id: int) void {
 // =============================================================================
 
 // Get address of stack slot
+// offset is FP-relative (negative), convert to SP-relative (positive)
 fn cgGenStackAddr(cg: *FullCodeGen, value_id: int, offset: int) void {
     cgEnsureRegFree(cg, REG_X0)
-    addRegImm12(&cg.*.buf, REG_X0, REG_SP, offset)
+    // Convert FP-relative (negative) to SP-relative (positive)
+    // Add 16 for saved fp/lr which are at sp+0 and sp+8
+    var sp_offset: int = cg.*.stack_size + 16 + offset
+    addRegImm12(&cg.*.buf, REG_X0, REG_SP, sp_offset)
     regManagerMarkUsed(cg.*.reg_manager, REG_X0, value_id)
     cgSetResult(cg, value_id, mcvRegister(REG_X0))
 }
